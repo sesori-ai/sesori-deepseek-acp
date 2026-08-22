@@ -1,10 +1,10 @@
-import { cp, mkdir, mkdtemp, readdir, readFile, realpath, rm } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, relative, sep } from "node:path";
 import { PassThrough } from "node:stream";
 import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
 import { defaultDshHome, resolveDshHome } from "@deepseek-ai/dsh-home-paths";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   bootRuntime,
   checkRuntimeComposition,
@@ -73,6 +73,18 @@ describe("DeepSeek runtime composition", () => {
     expect(await readFile(join(home, "settings.yaml"), "utf8")).toContain("synthetic.invalid");
   });
 
+  it("rejects a dangling configuration symlink", async () => {
+    const root = await tempRoot();
+    const home = join(root, "home");
+    await mkdir(home);
+    await symlink(join(root, "missing-settings.yaml"), join(home, "settings.yaml"));
+    process.env.DSH_HOME = home;
+
+    await expect(checkRuntimeComposition({ stateDir: join(root, "state") })).rejects.toThrow(
+      "DeepSeek configuration is not readable",
+    );
+  });
+
   it("boots the full profile without network or normal-home writes", async () => {
     const root = await tempRoot();
     const home = join(root, "home");
@@ -86,8 +98,11 @@ describe("DeepSeek runtime composition", () => {
 
     const before = await readdir(home);
     const settingsBefore = await readFile(join(home, "settings.yaml"), "utf8");
-    const context = await bootRuntime({ stateDir, workspaceRoot: projectA });
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("network disabled"));
+    let context: Awaited<ReturnType<typeof bootRuntime>> | undefined;
     try {
+      context = await bootRuntime({ stateDir, workspaceRoot: projectA });
+      expect(fetchSpy).not.toHaveBeenCalled();
       const credentials = context.get("credentials") as {
         resolve(ref: string): Promise<{ source: string; value: string } | undefined>;
       };
@@ -103,7 +118,11 @@ describe("DeepSeek runtime composition", () => {
 
       expect(context.get("sessions")).toBeDefined();
       expect(persistence.root).toBe(join(stateDir, "sessions"));
-      expect(attachments.root).toBe(join(stateDir, "attachments-home", "attachments", "v1"));
+      const attachmentRelativePath = relative(join(stateDir, "attachments-home"), attachments.root);
+      expect(isAbsolute(attachmentRelativePath)).toBe(false);
+      expect(
+        attachmentRelativePath === ".." || attachmentRelativePath.startsWith(`..${sep}`),
+      ).toBe(false);
       expect(query.config).toMatchObject({
         path: join(stateDir, "query", "sessions.sqlite"),
         openAt: "never",
@@ -123,7 +142,8 @@ describe("DeepSeek runtime composition", () => {
       ).toBe(await realpath(projectB));
       expect(approval.config.policy).toBe("ask");
     } finally {
-      await context.fiber.dispose();
+      await context?.fiber.dispose();
+      fetchSpy.mockRestore();
     }
 
     expect(await readdir(home)).toEqual(before);

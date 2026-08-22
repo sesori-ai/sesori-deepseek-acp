@@ -1,5 +1,5 @@
 import { constants } from "node:fs";
-import { access, stat } from "node:fs/promises";
+import { access, lstat, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Context } from "@deepseek-ai/cordis";
@@ -182,11 +182,21 @@ function inheritedEnvironment(): Record<string, string> {
 
 async function assertReadableIfPresent(args: { path: string }): Promise<void> {
   try {
+    await lstat(args.path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException | null)?.code === "ENOENT") return;
+    throw new AdapterError({
+      code: AdapterErrorCode.Readiness,
+      message: `DeepSeek configuration is not readable: ${args.path}`,
+      cause: error,
+    });
+  }
+
+  try {
     const state = await stat(args.path);
     if (!state.isFile()) throw new Error("expected a regular file");
     await access(args.path, constants.R_OK);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException | null)?.code === "ENOENT") return;
     throw new AdapterError({
       code: AdapterErrorCode.Readiness,
       message: `DeepSeek configuration is not readable: ${args.path}`,

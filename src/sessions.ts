@@ -394,7 +394,7 @@ export class DurableSessionAgent implements AcpAgent {
     void creationDone.promise.catch(() => undefined);
     this.#creations.add(creationDone.promise);
     let handle: AgentHandle | undefined;
-    let cleanupFailure: unknown;
+    let cleanupFailure: { error: unknown } | undefined;
     try {
       handle = await this.#context.agents.create({ sessionId, meta: { cwd: params.cwd } });
       if (this.#closed) throw new Error("adapter disposed during session creation");
@@ -405,7 +405,7 @@ export class DurableSessionAgent implements AcpAgent {
       return { sessionId: String(sessionId), configOptions: [] };
     } catch (error) {
       await handle?.dispose().catch((disposeError: unknown) => {
-        cleanupFailure = disposeError;
+        cleanupFailure = { error: disposeError };
         this.#diagnose("session/new cleanup", sessionId, disposeError);
       });
       this.#diagnose("session/new", sessionId, error);
@@ -414,7 +414,7 @@ export class DurableSessionAgent implements AcpAgent {
     } finally {
       this.#creations.delete(creationDone.promise);
       if (cleanupFailure === undefined) creationDone.resolve();
-      else creationDone.reject(cleanupFailure);
+      else creationDone.reject(cleanupFailure.error);
     }
   }
 
@@ -429,10 +429,12 @@ export class DurableSessionAgent implements AcpAgent {
     }
     if (this.#loads.has(sessionId)) throw invalidParams("session load is already in progress");
     const loadDone = Promise.withResolvers<void>();
+    void loadDone.promise.catch(() => undefined);
     this.#loads.set(sessionId, loadDone.promise);
     let adopted = false;
     let resumed = false;
     let handle: AgentHandle | undefined;
+    let cleanupFailure: { error: unknown } | undefined;
     try {
       const inspection = await this.#inspect(sessionId);
       if (inspection.meta.cwd !== params.cwd) {
@@ -467,6 +469,7 @@ export class DurableSessionAgent implements AcpAgent {
       if ((adopted || resumed) && handle !== undefined) {
         if (adopted) this.#sessions.delete(sessionId);
         await handle.dispose().catch((disposeError: unknown) => {
+          cleanupFailure = { error: disposeError };
           this.#diagnose("session/load cleanup", sessionId, disposeError);
         });
       }
@@ -475,7 +478,8 @@ export class DurableSessionAgent implements AcpAgent {
       throw internalError("unable to load DeepSeek session");
     } finally {
       this.#loads.delete(sessionId);
-      loadDone.resolve();
+      if (cleanupFailure === undefined) loadDone.resolve();
+      else loadDone.reject(cleanupFailure.error);
     }
   }
 

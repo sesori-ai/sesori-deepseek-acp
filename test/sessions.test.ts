@@ -372,6 +372,41 @@ describe("durable ACP sessions", () => {
     expect(state.live.has("raced")).toBe(false);
   });
 
+  it("reports failed resumed-handle cleanup through owner disposal", async () => {
+    const state = services();
+    const meta = header({ id: "failed-cleanup", cwd: "/project" });
+    state.headers.push(meta);
+    state.inspections.set("failed-cleanup", { meta, events: [] });
+    const resumed = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const dispose = vi.fn(async () => {
+      throw new Error("synthetic load cleanup failure");
+    });
+    const handle = {
+      agent: { session: { id: meta.id, header: meta, events: [] } },
+      dispose,
+    } as unknown as AgentHandle;
+    state.resume.mockImplementationOnce(async () => {
+      resumed.resolve();
+      await release.promise;
+      state.live.set("failed-cleanup", handle);
+      return handle;
+    });
+
+    const loading = state.agent.loadSession({
+      sessionId: "failed-cleanup",
+      cwd: "/project",
+      mcpServers: [],
+    });
+    await resumed.promise;
+    const ownerDisposal = state.agent.dispose();
+    release.resolve();
+
+    await expect(loading).rejects.toThrow("unable to load DeepSeek session");
+    await expect(ownerDisposal).rejects.toThrow("synthetic load cleanup failure");
+    expect(state.diagnostics.join("\n")).toContain("synthetic load cleanup failure");
+  });
+
   it("makes close wait for an in-flight load ownership transition", async () => {
     const state = services();
     const meta = header({ id: "closing-load", cwd: "/project" });

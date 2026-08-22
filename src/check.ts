@@ -1,5 +1,5 @@
 import { constants } from "node:fs";
-import { access, stat } from "node:fs/promises";
+import { access, lstat, stat } from "node:fs/promises";
 import { dirname, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import acpPackage from "@agentclientprotocol/sdk/package.json" with { type: "json" };
@@ -31,11 +31,25 @@ async function nearestExistingPath(args: { path: string }): Promise<string> {
       return candidate;
     } catch (error) {
       if (!isMissingPathError({ error })) throw error;
+      await rejectDanglingSymlink({ path: candidate });
       const parent = dirname(candidate);
       if (parent === candidate) throw error;
       candidate = parent;
     }
   }
+}
+
+async function rejectDanglingSymlink(args: { path: string }): Promise<void> {
+  try {
+    await lstat(args.path);
+  } catch (error) {
+    if (isMissingPathError({ error })) return;
+    throw error;
+  }
+  throw new AdapterError({
+    code: AdapterErrorCode.StatePath,
+    message: `State path contains a dangling symbolic link: ${args.path}`,
+  });
 }
 
 async function validateStateDirectory(args: { stateDir: string }): Promise<boolean> {
@@ -65,6 +79,7 @@ async function validateStateDirectory(args: { stateDir: string }): Promise<boole
         cause: error,
       });
     }
+    await rejectDanglingSymlink({ path: args.stateDir });
   }
 
   try {
@@ -73,7 +88,7 @@ async function validateStateDirectory(args: { stateDir: string }): Promise<boole
     if (!parentState.isDirectory()) {
       throw new Error(`Existing state-path ancestor is not a directory: ${parent}`);
     }
-    await access(parent, constants.R_OK | constants.W_OK | constants.X_OK);
+    await access(parent, constants.W_OK | constants.X_OK);
     return false;
   } catch (error) {
     throw new AdapterError({

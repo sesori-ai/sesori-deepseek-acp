@@ -28,7 +28,7 @@
     "ajv": "8.20.0"
   },
   "devDependencies": {
-    "@types/node": "24.13.3",
+    "@types/node": "22.19.0",
     "oxlint": "1.79.0",
     "typescript": "6.0.3",
     "vitest": "4.1.11"

@@ -15,14 +15,9 @@ async function fixture(args: { path: URL }): Promise<FixtureEntry[]> {
 
 describe("DeepSeek extension schema", () => {
   it("accepts every valid fixture", async () => {
-    expect(validateFixtureCorpus({ corpus: await fixture({ path: validPath }) })).toEqual(
-      expect.arrayContaining([{ valid: true }]),
-    );
-    expect(
-      validateFixtureCorpus({ corpus: await fixture({ path: validPath }) }).every(
-        (result) => result.valid,
-      ),
-    ).toBe(true);
+    const results = validateFixtureCorpus({ corpus: await fixture({ path: validPath }) });
+    expect(results).not.toHaveLength(0);
+    expect(results.every((result) => result.valid)).toBe(true);
   });
 
   it("rejects every invalid fixture", async () => {
@@ -38,6 +33,15 @@ describe("DeepSeek extension schema", () => {
       validateProtocolValue({
         definition: "sessionStatusNotification",
         value: { sessionId: "session-1", kind: "future_status" },
+      }).valid,
+    ).toBe(false);
+  });
+
+  it("rejects history updates without the standard ACP envelope", () => {
+    expect(
+      validateProtocolValue({
+        definition: "historyResponse",
+        value: { updates: [{}], hasMore: false },
       }).valid,
     ).toBe(false);
   });

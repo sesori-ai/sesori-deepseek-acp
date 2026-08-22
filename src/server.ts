@@ -93,13 +93,14 @@ export async function serveStdio(args: {
   const stream = ndJsonStream(Writable.toWeb(args.output), input);
   const signalSource = args.signalSource ?? process;
   let context: Context | undefined;
+  let server: AcpServer | undefined;
   const closeInput = (): void => {
     args.input.destroy();
+    if (server === undefined) void context?.fiber.dispose();
   };
   signalSource.once("SIGINT", closeInput);
   signalSource.once("SIGTERM", closeInput);
   let connection: AgentSideConnection | undefined;
-  let server: AcpServer | undefined;
   let transportFiber: Fiber | undefined;
   let operationFailure: unknown;
   try {

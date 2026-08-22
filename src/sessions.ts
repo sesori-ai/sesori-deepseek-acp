@@ -397,6 +397,7 @@ export class DurableSessionAgent implements AcpAgent {
     validateSetup(params);
     const sessionId = parseSessionId(params.sessionId);
     let adopted = false;
+    let resumed = false;
     let handle: AgentHandle | undefined;
     try {
       const inspection = await this.#inspect(sessionId);
@@ -417,6 +418,7 @@ export class DurableSessionAgent implements AcpAgent {
           throw new Error("session is already owned outside this ACP connection");
         }
         handle = await this.#context.agents.resume({ resumeSessionId: sessionId });
+        resumed = true;
         if (this.#closed || this.#sessions.has(sessionId)) {
           throw new Error("adapter ownership changed during session load");
         }
@@ -426,9 +428,11 @@ export class DurableSessionAgent implements AcpAgent {
       for (const update of updates) await this.#connection.sessionUpdate(update);
       return { configOptions: [] };
     } catch (error) {
-      if (adopted && handle !== undefined) {
-        this.#sessions.delete(sessionId);
-        await handle.dispose().catch(() => undefined);
+      if ((adopted || resumed) && handle !== undefined) {
+        if (adopted) this.#sessions.delete(sessionId);
+        await handle.dispose().catch((disposeError: unknown) => {
+          this.#diagnose("session/load cleanup", sessionId, disposeError);
+        });
       }
       this.#diagnose("session/load", sessionId, error);
       if (error instanceof RequestError) throw error;

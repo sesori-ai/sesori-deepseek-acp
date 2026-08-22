@@ -2,7 +2,7 @@ import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
 import { Context } from "@deepseek-ai/cordis";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   ADAPTER_NAME,
   ADAPTER_TITLE,
@@ -36,7 +36,10 @@ function capture(args: { stream: PassThrough }): () => string {
   return () => content;
 }
 
-function startHarness(args: { signalSource?: SignalSource } = {}): ServerHarness {
+function startHarness(args: {
+  signalSource?: SignalSource;
+  runtimeBoot?: RuntimeBoot;
+} = {}): ServerHarness {
   const input = new PassThrough();
   const output = new PassThrough();
   const diagnostics = new PassThrough();
@@ -49,7 +52,7 @@ function startHarness(args: { signalSource?: SignalSource } = {}): ServerHarness
       input,
       output,
       diagnostics,
-      runtimeBoot: testRuntimeBoot,
+      runtimeBoot: args.runtimeBoot ?? testRuntimeBoot,
       ...(args.signalSource === undefined ? {} : { signalSource: args.signalSource }),
     }),
   };
@@ -196,6 +199,33 @@ describe("ACP server", () => {
     expect(emitter.listenerCount(signal)).toBe(1);
 
     emitter.emit(signal);
+    await harness.completion;
+    expect(emitter.listenerCount("SIGINT")).toBe(0);
+    expect(emitter.listenerCount("SIGTERM")).toBe(0);
+  });
+
+  it("cancels runtime startup when a termination signal arrives before transport mount", async () => {
+    const emitter = new EventEmitter();
+    const signalSource: SignalSource = {
+      once: (event, listener) => emitter.once(event, listener),
+      off: (event, listener) => emitter.off(event, listener),
+    };
+    const started = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const context = new Context();
+    const dispose = vi.spyOn(context.fiber, "dispose");
+    const runtimeBoot: RuntimeBoot = async (args) => {
+      await args.prepare(context);
+      started.resolve();
+      await release.promise;
+      return context;
+    };
+    const harness = startHarness({ signalSource, runtimeBoot });
+    await started.promise;
+
+    emitter.emit("SIGTERM");
+    await expect.poll(() => dispose.mock.calls.length).toBe(1);
+    release.resolve();
     await harness.completion;
     expect(emitter.listenerCount("SIGINT")).toBe(0);
     expect(emitter.listenerCount("SIGTERM")).toBe(0);

@@ -262,6 +262,41 @@ describe("durable ACP sessions", () => {
     expect(state.resume).toHaveBeenCalledOnce();
   });
 
+  it("disposes a resumed handle when shutdown wins the load race", async () => {
+    const state = services();
+    const meta = header({ id: "raced", cwd: "/project" });
+    state.headers.push(meta);
+    state.inspections.set("raced", { meta, events: [] });
+    const resumed = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const dispose = vi.fn(async () => {
+      state.live.delete("raced");
+    });
+    const handle = {
+      agent: { session: { id: meta.id, header: meta, events: [] } },
+      dispose,
+    } as unknown as AgentHandle;
+    state.resume.mockImplementationOnce(async () => {
+      resumed.resolve();
+      await release.promise;
+      state.live.set("raced", handle);
+      return handle;
+    });
+
+    const loading = state.agent.loadSession({
+      sessionId: "raced",
+      cwd: "/project",
+      mcpServers: [],
+    });
+    await resumed.promise;
+    await state.agent.dispose();
+    release.resolve();
+
+    await expect(loading).rejects.toThrow("unable to load DeepSeek session");
+    expect(dispose).toHaveBeenCalledOnce();
+    expect(state.live.has("raced")).toBe(false);
+  });
+
   it("reads paginated detached history without creating or resuming an agent", async () => {
     const state = services();
     const meta = header({ id: "history", cwd: "/project" });

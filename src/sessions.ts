@@ -326,6 +326,7 @@ export class DurableSessionAgent implements AcpAgent {
   readonly #connection: AgentSideConnection;
   readonly #diagnostics: { write(message: string): unknown };
   readonly #sessions = new Map<SessionId, SessionRecord>();
+  readonly #creations = new Set<Promise<void>>();
   readonly #loads = new Map<SessionId, Promise<void>>();
   readonly #closes = new Map<SessionId, Promise<CloseSessionResponse>>();
   #closed = false;
@@ -389,7 +390,11 @@ export class DurableSessionAgent implements AcpAgent {
     this.#assertOpen();
     validateSetup(params);
     const sessionId = SessionId(randomUUID());
+    const creationDone = Promise.withResolvers<void>();
+    void creationDone.promise.catch(() => undefined);
+    this.#creations.add(creationDone.promise);
     let handle: AgentHandle | undefined;
+    let cleanupFailure: unknown;
     try {
       handle = await this.#context.agents.create({ sessionId, meta: { cwd: params.cwd } });
       if (this.#closed) throw new Error("adapter disposed during session creation");
@@ -400,11 +405,16 @@ export class DurableSessionAgent implements AcpAgent {
       return { sessionId: String(sessionId), configOptions: [] };
     } catch (error) {
       await handle?.dispose().catch((disposeError: unknown) => {
+        cleanupFailure = disposeError;
         this.#diagnose("session/new cleanup", sessionId, disposeError);
       });
       this.#diagnose("session/new", sessionId, error);
       if (error instanceof RequestError) throw error;
       throw internalError("unable to create DeepSeek session");
+    } finally {
+      this.#creations.delete(creationDone.promise);
+      if (cleanupFailure === undefined) creationDone.resolve();
+      else creationDone.reject(cleanupFailure);
     }
   }
 
@@ -470,6 +480,7 @@ export class DurableSessionAgent implements AcpAgent {
   }
 
   closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
+    this.#assertOpen();
     const sessionId = parseSessionId(params.sessionId);
     const existing = this.#closes.get(sessionId);
     if (existing !== undefined) return existing;
@@ -567,6 +578,7 @@ export class DurableSessionAgent implements AcpAgent {
   async #dispose(): Promise<void> {
     this.#closed = true;
     const transitionOutcomes = await Promise.allSettled([
+      ...this.#creations,
       ...this.#loads.values(),
       ...this.#closes.values(),
     ]);

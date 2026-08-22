@@ -149,6 +149,20 @@ describe("durable ACP sessions", () => {
     expect(state.live.has(created.sessionId)).toBe(false);
   });
 
+  it("rejects close after owner disposal", async () => {
+    const state = services();
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const handle = state.live.get(created.sessionId);
+    if (handle === undefined) throw new Error("test handle was not created");
+
+    await state.agent.dispose();
+
+    expect(() => state.agent.closeSession({ sessionId: created.sessionId })).toThrow(
+      "the ACP session owner has been disposed",
+    );
+    expect(handle.dispose).toHaveBeenCalledOnce();
+  });
+
   it("rejects unsupported setup before creating an agent", async () => {
     const state = services();
 
@@ -166,6 +180,39 @@ describe("durable ACP sessions", () => {
       }),
     ).rejects.toThrow("additional directories are not supported");
     expect(state.create).not.toHaveBeenCalled();
+  });
+
+  it("makes owner disposal wait for pending session creation cleanup", async () => {
+    const state = services();
+    const createStarted = Promise.withResolvers<void>();
+    const releaseCreate = Promise.withResolvers<void>();
+    const dispose = vi.fn(async () => {
+      throw new Error("synthetic creation cleanup failure");
+    });
+    state.create.mockImplementationOnce(async (options: { sessionId: string; meta: { cwd: string } }) => {
+      createStarted.resolve();
+      await releaseCreate.promise;
+      return {
+        agent: { session: { id: SessionId(options.sessionId) } },
+        dispose,
+      } as unknown as AgentHandle;
+    });
+
+    const creating = state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    await createStarted.promise;
+    let disposalCompleted = false;
+    const ownerDisposal = state.agent.dispose().then(() => {
+      disposalCompleted = true;
+    });
+    await new Promise<void>((resolve) => {
+      setImmediate(resolve);
+    });
+    expect(disposalCompleted).toBe(false);
+
+    releaseCreate.resolve();
+    await expect(creating).rejects.toThrow("unable to create DeepSeek session");
+    await expect(ownerDisposal).rejects.toThrow("synthetic creation cleanup failure");
+    expect(dispose).toHaveBeenCalledOnce();
   });
 
   it("lists cold materialized sessions without resuming them", async () => {

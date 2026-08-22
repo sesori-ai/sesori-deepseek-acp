@@ -59,6 +59,8 @@ const testRuntimeBoot: RuntimeBoot = async (args) => {
   const context = new Context();
   const prepared = args.prepare(context);
   if (prepared !== undefined) await prepared;
+  context.provide("agents", {} as never);
+  context.provide("sessionPersistence", {} as never);
   context.provide(RUNTIME_READY_KEY, true);
   return context;
 };
@@ -96,7 +98,7 @@ async function finish(args: { harness: ServerHarness }): Promise<void> {
   await args.harness.completion;
 }
 
-describe("initialize-only ACP server", () => {
+describe("ACP server", () => {
   it("frames responses, preserves request ids, and publishes exact metadata", async () => {
     const harness = startHarness();
     writeMessage({ harness, message: initializeRequest({ id: "request-a" }) });
@@ -108,7 +110,10 @@ describe("initialize-only ACP server", () => {
     expect(byId.get(42)?.jsonrpc).toBe("2.0");
     expect(result).toMatchObject({
       protocolVersion: PROTOCOL_VERSION,
-      agentCapabilities: { loadSession: false },
+      agentCapabilities: {
+        loadSession: true,
+        sessionCapabilities: { list: {}, close: {} },
+      },
       agentInfo: { name: ADAPTER_NAME, title: ADAPTER_TITLE, version: ADAPTER_VERSION },
       authMethods: [],
       _meta: {

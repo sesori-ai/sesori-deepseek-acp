@@ -1,24 +1,12 @@
 import { Readable, Writable } from "node:stream";
 import {
-  AGENT_METHODS,
   AgentSideConnection,
-  RequestError,
   ndJsonStream,
-  type Agent,
-  type AuthenticateRequest,
-  type AuthenticateResponse,
-  type CancelNotification,
-  type InitializeRequest,
-  type InitializeResponse,
-  type NewSessionRequest,
-  type NewSessionResponse,
-  type PromptRequest,
-  type PromptResponse,
   type Stream,
 } from "@agentclientprotocol/sdk";
 import type { Context, Fiber } from "@deepseek-ai/cordis";
-import { createInitializeResponse } from "./protocol.js";
 import { bootRuntime, RUNTIME_READY_KEY } from "./runtime.js";
+import { DurableSessionAgent } from "./sessions.js";
 
 export interface DiagnosticWriter {
   write(message: string): unknown;
@@ -61,35 +49,32 @@ function installAcpDiagnosticSanitizer(args: { diagnostics: DiagnosticWriter }):
   };
 }
 
-class InitializeOnlyAgent implements Agent {
-  async initialize(_params: InitializeRequest): Promise<InitializeResponse> {
-    return createInitializeResponse();
-  }
-
-  async authenticate(_params: AuthenticateRequest): Promise<AuthenticateResponse> {
-    return {};
-  }
-
-  async newSession(_params: NewSessionRequest): Promise<NewSessionResponse> {
-    throw RequestError.methodNotFound(AGENT_METHODS.session_new);
-  }
-
-  async prompt(_params: PromptRequest): Promise<PromptResponse> {
-    throw RequestError.methodNotFound(AGENT_METHODS.session_prompt);
-  }
-
-  async cancel(_params: CancelNotification): Promise<void> {}
+export interface AcpServer {
+  connection: AgentSideConnection;
+  dispose(): Promise<void>;
 }
 
 export function startAcpServer(args: {
   stream: Stream;
   diagnostics: DiagnosticWriter;
-}): AgentSideConnection {
+  context: Context;
+}): AcpServer {
   const restoreDiagnostics = installAcpDiagnosticSanitizer({ diagnostics: args.diagnostics });
   try {
-    const connection = new AgentSideConnection(() => new InitializeOnlyAgent(), args.stream);
+    let agent: DurableSessionAgent | undefined;
+    const connection = new AgentSideConnection((activeConnection) => {
+      agent = new DurableSessionAgent({
+        context: args.context,
+        connection: activeConnection,
+        diagnostics: args.diagnostics,
+      });
+      return agent;
+    }, args.stream);
     void connection.closed.then(restoreDiagnostics, restoreDiagnostics);
-    return connection;
+    return {
+      connection,
+      dispose: () => agent?.dispose() ?? Promise.resolve(),
+    };
   } catch (error) {
     restoreDiagnostics();
     throw error;
@@ -110,45 +95,71 @@ export async function serveStdio(args: {
   let context: Context | undefined;
   const closeInput = (): void => {
     args.input.destroy();
-    void context?.fiber.dispose();
   };
   signalSource.once("SIGINT", closeInput);
   signalSource.once("SIGTERM", closeInput);
   let connection: AgentSideConnection | undefined;
+  let server: AcpServer | undefined;
   let transportFiber: Fiber | undefined;
+  let operationFailure: unknown;
   try {
     const runRuntime = args.runtimeBoot ?? bootRuntime;
     context = await runRuntime({
       stateDir: args.stateDir,
       prepare: (bootContext) => {
         context = bootContext;
-        transportFiber = bootContext.inject([RUNTIME_READY_KEY], (transportContext) => {
-          connection = startAcpServer({ stream, diagnostics: args.diagnostics });
-          const activeConnection = connection;
-          transportContext.effect(
-            () => async () => {
-              args.input.destroy();
-              await activeConnection.closed.catch(() => undefined);
-            },
-            "sesori.acp",
-          );
-          void activeConnection.closed.then(
-            () => transportContext.root.fiber.dispose(),
-            () => transportContext.root.fiber.dispose(),
-          );
-        });
+        transportFiber = bootContext.inject(
+          [RUNTIME_READY_KEY, "agents", "sessionPersistence"],
+          (transportContext) => {
+            server = startAcpServer({
+              stream,
+              diagnostics: args.diagnostics,
+              context: transportContext,
+            });
+            connection = server.connection;
+            const activeServer = server;
+            const activeConnection = connection;
+            transportContext.effect(
+              () => async () => {
+                args.input.destroy();
+                await activeConnection.closed.catch(() => undefined);
+                await activeServer.dispose();
+              },
+              "sesori.acp",
+            );
+            void activeConnection.closed
+              .then(() => activeServer.dispose(), () => activeServer.dispose())
+              .then(
+                () => transportContext.root.fiber.dispose(),
+                () => transportContext.root.fiber.dispose(),
+              );
+          },
+        );
       },
     });
     await transportFiber?.await();
     if (connection === undefined) {
-      if (args.input.destroyed) return;
-      throw new Error("ACP transport did not mount");
+      if (!args.input.destroyed) throw new Error("ACP transport did not mount");
+    } else {
+      await connection.closed;
     }
-    await connection.closed;
-  } finally {
-    args.input.destroy();
-    await context?.fiber.dispose();
-    signalSource.off("SIGINT", closeInput);
-    signalSource.off("SIGTERM", closeInput);
+  } catch (error) {
+    operationFailure = error;
   }
+  args.input.destroy();
+  const failures: unknown[] = operationFailure === undefined ? [] : [operationFailure];
+  try {
+    await server?.dispose();
+  } catch (error) {
+    failures.push(error);
+  }
+  try {
+    await context?.fiber.dispose();
+  } catch (error) {
+    failures.push(error);
+  }
+  signalSource.off("SIGINT", closeInput);
+  signalSource.off("SIGTERM", closeInput);
+  if (failures.length === 1) throw failures[0];
+  if (failures.length > 1) throw new AggregateError(failures, "ACP shutdown failed");
 }

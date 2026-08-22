@@ -230,4 +230,35 @@ describe("ACP server", () => {
     expect(emitter.listenerCount("SIGINT")).toBe(0);
     expect(emitter.listenerCount("SIGTERM")).toBe(0);
   });
+
+  it("cancels runtime startup when a signal arrives before prepare", async () => {
+    const emitter = new EventEmitter();
+    const signalSource: SignalSource = {
+      once: (event, listener) => emitter.once(event, listener),
+      off: (event, listener) => emitter.off(event, listener),
+    };
+    const started = Promise.withResolvers<void>();
+    const releasePrepare = Promise.withResolvers<void>();
+    const prepared = Promise.withResolvers<void>();
+    const releaseBoot = Promise.withResolvers<void>();
+    const context = new Context();
+    const dispose = vi.spyOn(context.fiber, "dispose");
+    const runtimeBoot: RuntimeBoot = async (args) => {
+      started.resolve();
+      await releasePrepare.promise;
+      await args.prepare(context);
+      prepared.resolve();
+      await releaseBoot.promise;
+      return context;
+    };
+    const harness = startHarness({ signalSource, runtimeBoot });
+    await started.promise;
+
+    emitter.emit("SIGTERM");
+    releasePrepare.resolve();
+    await prepared.promise;
+    await expect.poll(() => dispose.mock.calls.length).toBe(1);
+    releaseBoot.resolve();
+    await harness.completion;
+  });
 });

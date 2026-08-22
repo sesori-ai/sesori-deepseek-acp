@@ -297,6 +297,56 @@ describe("durable ACP sessions", () => {
     expect(state.live.has("raced")).toBe(false);
   });
 
+  it("makes close wait for an in-flight load ownership transition", async () => {
+    const state = services();
+    const meta = header({ id: "closing-load", cwd: "/project" });
+    state.headers.push(meta);
+    state.inspections.set("closing-load", { meta, events: [] });
+    const resumed = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const dispose = vi.fn(async () => {
+      state.live.delete("closing-load");
+    });
+    const handle = {
+      agent: { session: { id: meta.id, header: meta, events: [] } },
+      dispose,
+    } as unknown as AgentHandle;
+    state.resume.mockImplementationOnce(async () => {
+      resumed.resolve();
+      await release.promise;
+      state.live.set("closing-load", handle);
+      return handle;
+    });
+
+    const loading = state.agent.loadSession({
+      sessionId: "closing-load",
+      cwd: "/project",
+      mcpServers: [],
+    });
+    await resumed.promise;
+    let closeCompleted = false;
+    const closing = state.agent.closeSession({ sessionId: "closing-load" }).then(() => {
+      closeCompleted = true;
+    });
+    await Promise.resolve();
+    expect(closeCompleted).toBe(false);
+
+    release.resolve();
+    await loading;
+    await closing;
+    expect(dispose).toHaveBeenCalledOnce();
+    expect(state.live.has("closing-load")).toBe(false);
+  });
+
+  it("rejects control characters in session ids before diagnostics", async () => {
+    const state = services();
+
+    await expect(
+      state.agent.loadSession({ sessionId: "forged\nlog", cwd: "/project", mcpServers: [] }),
+    ).rejects.toThrow("invalid session id");
+    expect(state.diagnostics).toEqual([]);
+  });
+
   it("reads paginated detached history without creating or resuming an agent", async () => {
     const state = services();
     const meta = header({ id: "history", cwd: "/project" });

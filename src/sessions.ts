@@ -73,7 +73,15 @@ function internalError(detail: string): RequestError {
 }
 
 function parseSessionId(value: string): SessionId {
-  if (value.length === 0 || value.length > MAX_SESSION_ID_LENGTH || !/\S/u.test(value)) {
+  if (
+    value.length === 0 ||
+    value.length > MAX_SESSION_ID_LENGTH ||
+    !/\S/u.test(value) ||
+    [...value].some((character) => {
+      const code = character.codePointAt(0) as number;
+      return code <= 0x1f || code === 0x7f;
+    })
+  ) {
     throw invalidParams("invalid session id");
   }
   return SessionId(value);
@@ -314,6 +322,7 @@ export class DurableSessionAgent implements AcpAgent {
   readonly #connection: AgentSideConnection;
   readonly #diagnostics: { write(message: string): unknown };
   readonly #sessions = new Map<SessionId, SessionRecord>();
+  readonly #loads = new Map<SessionId, Promise<void>>();
   #closed = false;
   #disposal: Promise<void> | undefined;
 
@@ -396,12 +405,17 @@ export class DurableSessionAgent implements AcpAgent {
     this.#assertOpen();
     validateSetup(params);
     const sessionId = parseSessionId(params.sessionId);
+    if (this.#loads.has(sessionId)) throw invalidParams("session load is already in progress");
+    const loadDone = Promise.withResolvers<void>();
+    this.#loads.set(sessionId, loadDone.promise);
     let adopted = false;
     let resumed = false;
     let handle: AgentHandle | undefined;
     try {
       const inspection = await this.#inspect(sessionId);
-      if (inspection.meta.cwd !== params.cwd) throw invalidParams("cwd does not match persisted session");
+      if (inspection.meta.cwd !== params.cwd) {
+        throw invalidParams("cwd does not match persisted session");
+      }
       const updates = await replayUpdates({
         context: this.#context,
         sessionId: String(sessionId),
@@ -437,11 +451,16 @@ export class DurableSessionAgent implements AcpAgent {
       this.#diagnose("session/load", sessionId, error);
       if (error instanceof RequestError) throw error;
       throw internalError("unable to load DeepSeek session");
+    } finally {
+      this.#loads.delete(sessionId);
+      loadDone.resolve();
     }
   }
 
   async closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
     const sessionId = parseSessionId(params.sessionId);
+    const loading = this.#loads.get(sessionId);
+    if (loading !== undefined) await loading;
     const record = this.#sessions.get(sessionId);
     if (record === undefined) return {};
     this.#sessions.delete(sessionId);

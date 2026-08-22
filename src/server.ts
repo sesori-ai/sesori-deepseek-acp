@@ -94,9 +94,11 @@ export async function serveStdio(args: {
   const signalSource = args.signalSource ?? process;
   let context: Context | undefined;
   let server: AcpServer | undefined;
+  let shutdownRequested = false;
   const closeInput = (): void => {
+    shutdownRequested = true;
     args.input.destroy();
-    if (server === undefined) void context?.fiber.dispose();
+    if (server === undefined) void context?.fiber.dispose().catch(() => undefined);
   };
   signalSource.once("SIGINT", closeInput);
   signalSource.once("SIGTERM", closeInput);
@@ -109,6 +111,10 @@ export async function serveStdio(args: {
       stateDir: args.stateDir,
       prepare: (bootContext) => {
         context = bootContext;
+        if (shutdownRequested) {
+          void bootContext.fiber.dispose().catch(() => undefined);
+          return;
+        }
         transportFiber = bootContext.inject(
           [RUNTIME_READY_KEY, "agents", "sessionPersistence"],
           (transportContext) => {

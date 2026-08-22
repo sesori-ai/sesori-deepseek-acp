@@ -257,6 +257,28 @@
       },
       "additionalProperties": false
     },
+    "sessionUpdateEnvelope": {
+      "type": "object",
+      "required": [
+        "sessionId",
+        "update"
+      ],
+      "properties": {
+        "_meta": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "sessionId": {
+          "$ref": "#/$defs/sessionId"
+        },
+        "update": {
+          "type": "object"
+        }
+      },
+      "additionalProperties": false
+    },
     "historyResponse": {
       "type": "object",
       "required": [
@@ -268,7 +290,7 @@
           "type": "array",
           "maxItems": 10000,
           "items": {
-            "type": "object"
+            "$ref": "#/$defs/sessionUpdateEnvelope"
           }
         },
         "nextBeforeSeq": {

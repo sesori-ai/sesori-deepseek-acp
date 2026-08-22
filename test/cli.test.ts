@@ -1,4 +1,4 @@
-import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -84,6 +84,21 @@ describe("adapter CLI", () => {
       const result = await invoke({ argv: ["check", "--state-dir", stateFile] });
       expect(result.exitCode).toBe(AdapterExitCode.Failure);
       expect(result.stderr).toContain("State path is not a directory");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects dangling symlinks in a missing-looking state path", async () => {
+    const root = await mkdtemp(join(tmpdir(), "sesori-deepseek-acp-"));
+    const dangling = join(root, "dangling");
+    try {
+      await symlink(join(root, "missing-target"), dangling, "dir");
+      for (const stateDir of [dangling, join(dangling, "state")]) {
+        const result = await invoke({ argv: ["check", "--state-dir", stateDir] });
+        expect(result.exitCode).toBe(AdapterExitCode.Failure);
+        expect(result.stderr).toContain("dangling symbolic link");
+      }
     } finally {
       await rm(root, { recursive: true, force: true });
     }

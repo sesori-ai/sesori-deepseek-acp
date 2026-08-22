@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
+import { Context } from "@deepseek-ai/cordis";
 import { describe, expect, it } from "vitest";
 import {
   ADAPTER_NAME,
@@ -9,7 +10,8 @@ import {
   DEEPSEEK_HARNESS_VERSION,
   INITIALIZE_METADATA_KEY,
 } from "../src/protocol.ts";
-import { serveStdio, type SignalSource } from "../src/server.ts";
+import { serveStdio, type RuntimeBoot, type SignalSource } from "../src/server.ts";
+import { RUNTIME_READY_KEY } from "../src/runtime.ts";
 
 interface JsonRpcResponse {
   jsonrpc: "2.0";
@@ -43,13 +45,23 @@ function startHarness(args: { signalSource?: SignalSource } = {}): ServerHarness
     stdout: capture({ stream: output }),
     stderr: capture({ stream: diagnostics }),
     completion: serveStdio({
+      stateDir: "/synthetic-state",
       input,
       output,
       diagnostics,
+      runtimeBoot: testRuntimeBoot,
       ...(args.signalSource === undefined ? {} : { signalSource: args.signalSource }),
     }),
   };
 }
+
+const testRuntimeBoot: RuntimeBoot = async (args) => {
+  const context = new Context();
+  const prepared = args.prepare(context);
+  if (prepared !== undefined) await prepared;
+  context.provide(RUNTIME_READY_KEY, true);
+  return context;
+};
 
 function initializeRequest(args: {
   id: number | string;

@@ -1,4 +1,4 @@
-import { mkdtemp, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -85,6 +85,19 @@ describe("adapter CLI", () => {
       expect(result.exitCode).toBe(AdapterExitCode.Failure);
       expect(result.stderr).toContain("State path is not a directory");
     } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.runIf(process.platform !== "win32")("rejects an unwritable state parent", async () => {
+    const root = await mkdtemp(join(tmpdir(), "sesori-deepseek-acp-"));
+    try {
+      await chmod(root, 0o500);
+      const result = await invoke({ argv: ["check", "--state-dir", join(root, "state")] });
+      expect(result.exitCode).toBe(AdapterExitCode.Failure);
+      expect(result.stderr).toContain("cannot be created below an accessible parent");
+    } finally {
+      await chmod(root, 0o700);
       await rm(root, { recursive: true, force: true });
     }
   });

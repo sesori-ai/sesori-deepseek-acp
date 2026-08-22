@@ -79,7 +79,12 @@ export async function runCli(args: {
       }
       case CliMode.Serve:
         await checkReadiness({ stateDir: invocation.stateDir });
-        await serveStdio({ input: args.input, output: args.output, diagnostics: args.diagnostics });
+        await serveStdio({
+          stateDir: invocation.stateDir,
+          input: args.input,
+          output: args.output,
+          diagnostics: args.diagnostics,
+        });
         return AdapterExitCode.Success;
     }
   } catch (error) {

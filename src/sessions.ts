@@ -412,6 +412,11 @@ export class DurableSessionAgent implements AcpAgent {
     this.#assertOpen();
     validateSetup(params);
     const sessionId = parseSessionId(params.sessionId);
+    const closing = this.#closes.get(sessionId);
+    if (closing !== undefined) {
+      await closing;
+      this.#assertOpen();
+    }
     if (this.#loads.has(sessionId)) throw invalidParams("session load is already in progress");
     const loadDone = Promise.withResolvers<void>();
     this.#loads.set(sessionId, loadDone.promise);
@@ -561,11 +566,16 @@ export class DurableSessionAgent implements AcpAgent {
 
   async #dispose(): Promise<void> {
     this.#closed = true;
-    await Promise.allSettled([...this.#loads.values(), ...this.#closes.values()]);
+    const transitionOutcomes = await Promise.allSettled([
+      ...this.#loads.values(),
+      ...this.#closes.values(),
+    ]);
     const records = [...this.#sessions.values()];
     this.#sessions.clear();
     const outcomes = await Promise.allSettled(records.map((record) => record.handle.dispose()));
-    const failures = outcomes.flatMap((outcome) => (outcome.status === "rejected" ? [outcome.reason] : []));
+    const failures = [...transitionOutcomes, ...outcomes].flatMap((outcome) =>
+      outcome.status === "rejected" ? [outcome.reason] : [],
+    );
     if (failures.length === 1) throw failures[0];
     if (failures.length > 1) throw new AggregateError(failures, "failed to dispose DeepSeek sessions");
   }

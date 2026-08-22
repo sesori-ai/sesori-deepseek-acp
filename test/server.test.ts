@@ -260,5 +260,7 @@ describe("ACP server", () => {
     await expect.poll(() => dispose.mock.calls.length).toBe(1);
     releaseBoot.resolve();
     await harness.completion;
+    expect(emitter.listenerCount("SIGINT")).toBe(0);
+    expect(emitter.listenerCount("SIGTERM")).toBe(0);
   });
 });

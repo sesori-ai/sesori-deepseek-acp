@@ -341,9 +341,11 @@ describe("durable ACP sessions", () => {
   it("rejects control characters in session ids before diagnostics", async () => {
     const state = services();
 
-    await expect(
-      state.agent.loadSession({ sessionId: "forged\nlog", cwd: "/project", mcpServers: [] }),
-    ).rejects.toThrow("invalid session id");
+    for (const sessionId of ["forged\nlog", "forged\u0085log"]) {
+      await expect(
+        state.agent.loadSession({ sessionId, cwd: "/project", mcpServers: [] }),
+      ).rejects.toThrow("invalid session id");
+    }
     expect(state.diagnostics).toEqual([]);
   });
 

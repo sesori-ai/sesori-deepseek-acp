@@ -567,6 +567,33 @@ describe("durable ACP sessions", () => {
     expect(state.diagnostics.join("\n")).toContain("synthetic load cleanup failure");
   });
 
+  it("retains an adopted load record when command delivery fails and cleanup disposal fails", async () => {
+    const state = services();
+    const meta = header({ id: "load-cleanup", cwd: "/project" });
+    state.headers.push(meta);
+    state.inspections.set("load-cleanup", { meta, events: [] });
+    state.contextServices.set("commands", {
+      list: () => {
+        throw new Error("synthetic command failure");
+      },
+    });
+    const originalResume = state.resume.getMockImplementation() as (...args: unknown[]) => Promise<AgentHandle>;
+    state.resume.mockImplementationOnce(async (...args: unknown[]) => {
+      const handle = await originalResume(...args);
+      vi.mocked(handle.dispose).mockRejectedValueOnce(new Error("synthetic load cleanup failure"));
+      return handle;
+    });
+
+    await expect(
+      state.agent.loadSession({ sessionId: "load-cleanup", cwd: "/project", mcpServers: [] }),
+    ).rejects.toThrow("unable to load DeepSeek session");
+    const handle = state.live.get("load-cleanup")!;
+
+    await expect(state.agent.closeSession({ sessionId: "load-cleanup" })).resolves.toEqual({});
+    expect(handle.dispose).toHaveBeenCalledTimes(2);
+    expect(state.live.has("load-cleanup")).toBe(false);
+  });
+
   it("makes close wait for an in-flight load ownership transition", async () => {
     const state = services();
     const meta = header({ id: "closing-load", cwd: "/project" });
@@ -976,10 +1003,10 @@ describe("durable ACP sessions", () => {
     state.contextServices.set("llm", {
       listProviders: () => [
         { id: "gateway/東京", name: "Gateway 東京" },
-        { id: "broken", name: "Broken" },
+        { id: "broken\ninjected", name: "Broken" },
       ],
       listModels: async (provider: string) => {
-        if (provider === "broken") throw new Error(secret);
+        if (provider === "broken\ninjected") throw new Error(secret);
         return [
           { provider, id: "models/code/pro", name: "Code / Pro" },
           { provider, id: "模型/vision", name: "Vision 模型" },
@@ -1017,10 +1044,12 @@ describe("durable ACP sessions", () => {
     expect(providers[0]?.models.every((model) => model.id.startsWith("v1") && !model.id.includes("/"))).toBe(true);
     expect(providers[0]?.models[1]?.supportsImages).toBe(true);
     expect(catalog.failures).toEqual([
-      { providerId: "broken", category: "unavailable", message: "Provider catalog unavailable" },
+      { providerId: "broken\ninjected", category: "unavailable", message: "Provider catalog unavailable" },
     ]);
     expect(JSON.stringify(catalog)).not.toContain(secret);
-    expect(state.diagnostics.join("\n")).toContain("provider=broken category=unavailable");
+    expect(state.diagnostics).toContain(
+      "sesori-deepseek-acp: deepseek/catalog provider provider=\"broken\\ninjected\" category=unavailable\n",
+    );
     expect(state.diagnostics.join("\n")).not.toContain(secret);
 
     const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });

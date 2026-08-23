@@ -983,8 +983,9 @@ export class DurableSessionAgent implements AcpAgent {
       return { configOptions: await this.#configOptions(record) };
     } catch (error) {
       if ((adopted || resumed) && handle !== undefined) {
-        if (adopted) this.#sessions.delete(sessionId);
-        await handle.dispose().catch((disposeError: unknown) => {
+        await handle.dispose().then(() => {
+          if (adopted) this.#sessions.delete(sessionId);
+        }).catch((disposeError: unknown) => {
           cleanupFailure = { error: disposeError };
           this.#diagnose("session/load cleanup", sessionId, disposeError);
         });
@@ -1111,7 +1112,7 @@ export class DurableSessionAgent implements AcpAgent {
           return { provider: { id: provider.id, name: provider.name, models: entries } };
         } catch {
           this.#diagnostics.write(
-            `sesori-deepseek-acp: deepseek/catalog provider provider=${provider.id} category=unavailable\n`,
+            `sesori-deepseek-acp: deepseek/catalog provider provider=${JSON.stringify(provider.id)} category=unavailable\n`,
           );
           return {
             failure: {

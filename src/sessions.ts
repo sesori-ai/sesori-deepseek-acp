@@ -73,7 +73,15 @@ function internalError(detail: string): RequestError {
 }
 
 function parseSessionId(value: string): SessionId {
-  if (value.length === 0 || value.length > MAX_SESSION_ID_LENGTH || !/\S/u.test(value)) {
+  if (
+    value.length === 0 ||
+    value.length > MAX_SESSION_ID_LENGTH ||
+    !/\S/u.test(value) ||
+    [...value].some((character) => {
+      const code = character.codePointAt(0) as number;
+      return code <= 0x1f || (code >= 0x7f && code <= 0x9f);
+    })
+  ) {
     throw invalidParams("invalid session id");
   }
   return SessionId(value);
@@ -94,7 +102,11 @@ function validateSetup(args: {
 }
 
 function compareHeaders(left: SessionHeader, right: SessionHeader): number {
-  return right.createdAt - left.createdAt || String(left.id).localeCompare(String(right.id));
+  return right.createdAt - left.createdAt || compareSessionIds(String(left.id), String(right.id));
+}
+
+function compareSessionIds(left: string, right: string): number {
+  return Buffer.compare(Buffer.from(left), Buffer.from(right));
 }
 
 function encodeCursor(header: SessionHeader): string {
@@ -131,7 +143,7 @@ function decodeCursor(value: string): ListCursor {
 function afterCursor(header: SessionHeader, cursor: ListCursor): boolean {
   return (
     header.createdAt < cursor.createdAt ||
-    (header.createdAt === cursor.createdAt && String(header.id).localeCompare(cursor.id) > 0)
+    (header.createdAt === cursor.createdAt && compareSessionIds(String(header.id), cursor.id) > 0)
   );
 }
 
@@ -314,6 +326,9 @@ export class DurableSessionAgent implements AcpAgent {
   readonly #connection: AgentSideConnection;
   readonly #diagnostics: { write(message: string): unknown };
   readonly #sessions = new Map<SessionId, SessionRecord>();
+  readonly #creations = new Set<Promise<void>>();
+  readonly #loads = new Map<SessionId, Promise<void>>();
+  readonly #closes = new Map<SessionId, Promise<CloseSessionResponse>>();
   #closed = false;
   #disposal: Promise<void> | undefined;
 
@@ -375,7 +390,11 @@ export class DurableSessionAgent implements AcpAgent {
     this.#assertOpen();
     validateSetup(params);
     const sessionId = SessionId(randomUUID());
+    const creationDone = Promise.withResolvers<void>();
+    void creationDone.promise.catch(() => undefined);
+    this.#creations.add(creationDone.promise);
     let handle: AgentHandle | undefined;
+    let cleanupFailure: { error: unknown } | undefined;
     try {
       handle = await this.#context.agents.create({ sessionId, meta: { cwd: params.cwd } });
       if (this.#closed) throw new Error("adapter disposed during session creation");
@@ -385,10 +404,17 @@ export class DurableSessionAgent implements AcpAgent {
       this.#sessions.set(sessionId, { handle });
       return { sessionId: String(sessionId), configOptions: [] };
     } catch (error) {
-      await handle?.dispose().catch(() => undefined);
+      await handle?.dispose().catch((disposeError: unknown) => {
+        cleanupFailure = { error: disposeError };
+        this.#diagnose("session/new cleanup", sessionId, disposeError);
+      });
       this.#diagnose("session/new", sessionId, error);
       if (error instanceof RequestError) throw error;
       throw internalError("unable to create DeepSeek session");
+    } finally {
+      this.#creations.delete(creationDone.promise);
+      if (cleanupFailure === undefined) creationDone.resolve();
+      else creationDone.reject(cleanupFailure.error);
     }
   }
 
@@ -396,12 +422,24 @@ export class DurableSessionAgent implements AcpAgent {
     this.#assertOpen();
     validateSetup(params);
     const sessionId = parseSessionId(params.sessionId);
+    const closing = this.#closes.get(sessionId);
+    if (closing !== undefined) {
+      await closing;
+      this.#assertOpen();
+    }
+    if (this.#loads.has(sessionId)) throw invalidParams("session load is already in progress");
+    const loadDone = Promise.withResolvers<void>();
+    void loadDone.promise.catch(() => undefined);
+    this.#loads.set(sessionId, loadDone.promise);
     let adopted = false;
     let resumed = false;
     let handle: AgentHandle | undefined;
+    let cleanupFailure: { error: unknown } | undefined;
     try {
       const inspection = await this.#inspect(sessionId);
-      if (inspection.meta.cwd !== params.cwd) throw invalidParams("cwd does not match persisted session");
+      if (inspection.meta.cwd !== params.cwd) {
+        throw invalidParams("cwd does not match persisted session");
+      }
       const updates = await replayUpdates({
         context: this.#context,
         sessionId: String(sessionId),
@@ -431,17 +469,37 @@ export class DurableSessionAgent implements AcpAgent {
       if ((adopted || resumed) && handle !== undefined) {
         if (adopted) this.#sessions.delete(sessionId);
         await handle.dispose().catch((disposeError: unknown) => {
+          cleanupFailure = { error: disposeError };
           this.#diagnose("session/load cleanup", sessionId, disposeError);
         });
       }
       this.#diagnose("session/load", sessionId, error);
       if (error instanceof RequestError) throw error;
       throw internalError("unable to load DeepSeek session");
+    } finally {
+      this.#loads.delete(sessionId);
+      if (cleanupFailure === undefined) loadDone.resolve();
+      else loadDone.reject(cleanupFailure.error);
     }
   }
 
-  async closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
+  closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
+    this.#assertOpen();
     const sessionId = parseSessionId(params.sessionId);
+    const existing = this.#closes.get(sessionId);
+    if (existing !== undefined) return existing;
+    const closing = this.#closeSession(sessionId);
+    this.#closes.set(sessionId, closing);
+    void closing.then(
+      () => this.#closes.delete(sessionId),
+      () => this.#closes.delete(sessionId),
+    );
+    return closing;
+  }
+
+  async #closeSession(sessionId: SessionId): Promise<CloseSessionResponse> {
+    const loading = this.#loads.get(sessionId);
+    if (loading !== undefined) await loading;
     const record = this.#sessions.get(sessionId);
     if (record === undefined) return {};
     this.#sessions.delete(sessionId);
@@ -523,10 +581,17 @@ export class DurableSessionAgent implements AcpAgent {
 
   async #dispose(): Promise<void> {
     this.#closed = true;
+    const transitionOutcomes = await Promise.allSettled([
+      ...this.#creations,
+      ...this.#loads.values(),
+      ...this.#closes.values(),
+    ]);
     const records = [...this.#sessions.values()];
     this.#sessions.clear();
     const outcomes = await Promise.allSettled(records.map((record) => record.handle.dispose()));
-    const failures = outcomes.flatMap((outcome) => (outcome.status === "rejected" ? [outcome.reason] : []));
+    const failures = [...transitionOutcomes, ...outcomes].flatMap((outcome) =>
+      outcome.status === "rejected" ? [outcome.reason] : [],
+    );
     if (failures.length === 1) throw failures[0];
     if (failures.length > 1) throw new AggregateError(failures, "failed to dispose DeepSeek sessions");
   }

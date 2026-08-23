@@ -149,6 +149,20 @@ describe("durable ACP sessions", () => {
     expect(state.live.has(created.sessionId)).toBe(false);
   });
 
+  it("rejects close after owner disposal", async () => {
+    const state = services();
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const handle = state.live.get(created.sessionId);
+    if (handle === undefined) throw new Error("test handle was not created");
+
+    await state.agent.dispose();
+
+    expect(() => state.agent.closeSession({ sessionId: created.sessionId })).toThrow(
+      "the ACP session owner has been disposed",
+    );
+    expect(handle.dispose).toHaveBeenCalledOnce();
+  });
+
   it("rejects unsupported setup before creating an agent", async () => {
     const state = services();
 
@@ -166,6 +180,39 @@ describe("durable ACP sessions", () => {
       }),
     ).rejects.toThrow("additional directories are not supported");
     expect(state.create).not.toHaveBeenCalled();
+  });
+
+  it("makes owner disposal wait for pending session creation cleanup", async () => {
+    const state = services();
+    const createStarted = Promise.withResolvers<void>();
+    const releaseCreate = Promise.withResolvers<void>();
+    const dispose = vi.fn(async () => {
+      throw new Error("synthetic creation cleanup failure");
+    });
+    state.create.mockImplementationOnce(async (options: { sessionId: string; meta: { cwd: string } }) => {
+      createStarted.resolve();
+      await releaseCreate.promise;
+      return {
+        agent: { session: { id: SessionId(options.sessionId) } },
+        dispose,
+      } as unknown as AgentHandle;
+    });
+
+    const creating = state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    await createStarted.promise;
+    let disposalCompleted = false;
+    const ownerDisposal = state.agent.dispose().then(() => {
+      disposalCompleted = true;
+    });
+    await new Promise<void>((resolve) => {
+      setImmediate(resolve);
+    });
+    expect(disposalCompleted).toBe(false);
+
+    releaseCreate.resolve();
+    await expect(creating).rejects.toThrow("unable to create DeepSeek session");
+    await expect(ownerDisposal).rejects.toThrow("synthetic creation cleanup failure");
+    expect(dispose).toHaveBeenCalledOnce();
   });
 
   it("lists cold materialized sessions without resuming them", async () => {
@@ -202,6 +249,26 @@ describe("durable ACP sessions", () => {
     await expect(state.agent.listSessions({ cursor: "not-a-cursor" })).rejects.toThrow(
       "invalid session list cursor",
     );
+  });
+
+  it("paginates canonically equivalent but distinct Unicode session ids", async () => {
+    const state = services();
+    for (let index = 0; index < 99; index += 1) {
+      state.headers.push(
+        header({ id: `a-${String(index).padStart(3, "0")}`, cwd: "/project", createdAt: 1 }),
+      );
+    }
+    state.headers.push(
+      header({ id: "\u00e9", cwd: "/project", createdAt: 1 }),
+      header({ id: "e\u0301", cwd: "/project", createdAt: 1 }),
+    );
+
+    const first = await state.agent.listSessions({});
+    const second = await state.agent.listSessions({ cursor: first.nextCursor as string });
+    const ids = [...first.sessions, ...second.sessions].map((session) => session.sessionId);
+
+    expect(ids).toHaveLength(101);
+    expect(new Set(ids).size).toBe(101);
   });
 
   it("fails loudly when persistence reports duplicate session identities", async () => {
@@ -289,12 +356,218 @@ describe("durable ACP sessions", () => {
       mcpServers: [],
     });
     await resumed.promise;
-    await state.agent.dispose();
+    let disposalCompleted = false;
+    const disposal = state.agent.dispose().then(() => {
+      disposalCompleted = true;
+    });
+    await new Promise<void>((resolve) => {
+      setImmediate(resolve);
+    });
+    expect(disposalCompleted).toBe(false);
     release.resolve();
 
     await expect(loading).rejects.toThrow("unable to load DeepSeek session");
+    await disposal;
     expect(dispose).toHaveBeenCalledOnce();
     expect(state.live.has("raced")).toBe(false);
+  });
+
+  it("reports failed resumed-handle cleanup through owner disposal", async () => {
+    const state = services();
+    const meta = header({ id: "failed-cleanup", cwd: "/project" });
+    state.headers.push(meta);
+    state.inspections.set("failed-cleanup", { meta, events: [] });
+    const resumed = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const dispose = vi.fn(async () => {
+      throw new Error("synthetic load cleanup failure");
+    });
+    const handle = {
+      agent: { session: { id: meta.id, header: meta, events: [] } },
+      dispose,
+    } as unknown as AgentHandle;
+    state.resume.mockImplementationOnce(async () => {
+      resumed.resolve();
+      await release.promise;
+      state.live.set("failed-cleanup", handle);
+      return handle;
+    });
+
+    const loading = state.agent.loadSession({
+      sessionId: "failed-cleanup",
+      cwd: "/project",
+      mcpServers: [],
+    });
+    await resumed.promise;
+    const ownerDisposal = state.agent.dispose();
+    release.resolve();
+
+    await expect(loading).rejects.toThrow("unable to load DeepSeek session");
+    await expect(ownerDisposal).rejects.toThrow("synthetic load cleanup failure");
+    expect(state.diagnostics.join("\n")).toContain("synthetic load cleanup failure");
+  });
+
+  it("makes close wait for an in-flight load ownership transition", async () => {
+    const state = services();
+    const meta = header({ id: "closing-load", cwd: "/project" });
+    state.headers.push(meta);
+    state.inspections.set("closing-load", { meta, events: [] });
+    const resumed = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const dispose = vi.fn(async () => {
+      state.live.delete("closing-load");
+    });
+    const handle = {
+      agent: { session: { id: meta.id, header: meta, events: [] } },
+      dispose,
+    } as unknown as AgentHandle;
+    state.resume.mockImplementationOnce(async () => {
+      resumed.resolve();
+      await release.promise;
+      state.live.set("closing-load", handle);
+      return handle;
+    });
+
+    const loading = state.agent.loadSession({
+      sessionId: "closing-load",
+      cwd: "/project",
+      mcpServers: [],
+    });
+    await resumed.promise;
+    let closeCompleted = false;
+    const closing = state.agent.closeSession({ sessionId: "closing-load" }).then(() => {
+      closeCompleted = true;
+    });
+    await Promise.resolve();
+    expect(closeCompleted).toBe(false);
+
+    release.resolve();
+    await loading;
+    await closing;
+    expect(dispose).toHaveBeenCalledOnce();
+    expect(state.live.has("closing-load")).toBe(false);
+  });
+
+  it("shares an in-flight close transition between concurrent callers", async () => {
+    const state = services();
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const handle = state.live.get(created.sessionId);
+    if (handle === undefined) throw new Error("test handle was not created");
+    const disposeStarted = Promise.withResolvers<void>();
+    const releaseDispose = Promise.withResolvers<void>();
+    vi.mocked(handle.dispose).mockImplementationOnce(async () => {
+      disposeStarted.resolve();
+      await releaseDispose.promise;
+      state.live.delete(created.sessionId);
+    });
+
+    const first = state.agent.closeSession({ sessionId: created.sessionId });
+    await disposeStarted.promise;
+    let secondCompleted = false;
+    const second = state.agent.closeSession({ sessionId: created.sessionId }).then(() => {
+      secondCompleted = true;
+    });
+    await Promise.resolve();
+    expect(secondCompleted).toBe(false);
+
+    releaseDispose.resolve();
+    await Promise.all([first, second]);
+    expect(handle.dispose).toHaveBeenCalledOnce();
+  });
+
+  it("reports an in-flight close failure through owner disposal", async () => {
+    const state = services();
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const handle = state.live.get(created.sessionId);
+    if (handle === undefined) throw new Error("test handle was not created");
+    const disposeStarted = Promise.withResolvers<void>();
+    const releaseDispose = Promise.withResolvers<void>();
+    vi.mocked(handle.dispose).mockImplementationOnce(async () => {
+      disposeStarted.resolve();
+      await releaseDispose.promise;
+      throw new Error("synthetic close failure");
+    });
+
+    const closing = state.agent.closeSession({ sessionId: created.sessionId });
+    await disposeStarted.promise;
+    const ownerDisposal = state.agent.dispose();
+    releaseDispose.resolve();
+
+    await expect(closing).rejects.toThrow("unable to close DeepSeek session");
+    await expect(ownerDisposal).rejects.toThrow("unable to close DeepSeek session");
+    expect(state.diagnostics.join("\n")).toContain("synthetic close failure");
+  });
+
+  it("makes load wait for an in-flight close transition", async () => {
+    const state = services();
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const handle = state.live.get(created.sessionId);
+    if (handle === undefined) throw new Error("test handle was not created");
+    const meta = header({ id: created.sessionId, cwd: "/project" });
+    state.headers.push(meta);
+    state.inspections.set(created.sessionId, { meta, events: [] });
+    const disposeStarted = Promise.withResolvers<void>();
+    const releaseDispose = Promise.withResolvers<void>();
+    vi.mocked(handle.dispose).mockImplementationOnce(async () => {
+      disposeStarted.resolve();
+      await releaseDispose.promise;
+      state.live.delete(created.sessionId);
+    });
+
+    const closing = state.agent.closeSession({ sessionId: created.sessionId });
+    await disposeStarted.promise;
+    const loading = state.agent.loadSession({
+      sessionId: created.sessionId,
+      cwd: "/project",
+      mcpServers: [],
+    });
+    let loadSettled = false;
+    void loading.then(
+      () => {
+        loadSettled = true;
+      },
+      () => {
+        loadSettled = true;
+      },
+    );
+    await new Promise<void>((resolve) => {
+      setImmediate(resolve);
+    });
+    expect(loadSettled).toBe(false);
+
+    releaseDispose.resolve();
+    await closing;
+    await expect(loading).resolves.toEqual({ configOptions: [] });
+    expect(state.resume).toHaveBeenCalledOnce();
+  });
+
+  it("diagnoses cleanup failure when a newly created handle cannot be adopted", async () => {
+    const state = services();
+    const dispose = vi.fn(async () => {
+      throw new Error("synthetic cleanup failure");
+    });
+    state.create.mockResolvedValueOnce({
+      agent: { session: { id: SessionId("mismatched") } },
+      dispose,
+    } as unknown as AgentHandle);
+
+    await expect(state.agent.newSession({ cwd: "/project", mcpServers: [] })).rejects.toThrow(
+      "unable to create DeepSeek session",
+    );
+    expect(dispose).toHaveBeenCalledOnce();
+    expect(state.diagnostics.join("\n")).toContain("session/new cleanup");
+    expect(state.diagnostics.join("\n")).toContain("synthetic cleanup failure");
+  });
+
+  it("rejects control characters in session ids before diagnostics", async () => {
+    const state = services();
+
+    for (const sessionId of ["forged\nlog", "forged\u0085log"]) {
+      await expect(
+        state.agent.loadSession({ sessionId, cwd: "/project", mcpServers: [] }),
+      ).rejects.toThrow("invalid session id");
+    }
+    expect(state.diagnostics).toEqual([]);
   });
 
   it("reads paginated detached history without creating or resuming an agent", async () => {

@@ -94,14 +94,17 @@ export async function serveStdio(args: {
   const signalSource = args.signalSource ?? process;
   let context: Context | undefined;
   let server: AcpServer | undefined;
+  let shutdownRequested = false;
   const closeInput = (): void => {
+    shutdownRequested = true;
     args.input.destroy();
-    if (server === undefined) void context?.fiber.dispose();
+    if (server === undefined) void context?.fiber.dispose().catch(() => undefined);
   };
   signalSource.once("SIGINT", closeInput);
   signalSource.once("SIGTERM", closeInput);
   let connection: AgentSideConnection | undefined;
   let transportFiber: Fiber | undefined;
+  let transportShutdown: Promise<void> | undefined;
   let operationFailure: unknown;
   try {
     const runRuntime = args.runtimeBoot ?? bootRuntime;
@@ -109,6 +112,10 @@ export async function serveStdio(args: {
       stateDir: args.stateDir,
       prepare: (bootContext) => {
         context = bootContext;
+        if (shutdownRequested) {
+          void bootContext.fiber.dispose().catch(() => undefined);
+          return;
+        }
         transportFiber = bootContext.inject(
           [RUNTIME_READY_KEY, "agents", "sessionPersistence"],
           (transportContext) => {
@@ -128,12 +135,13 @@ export async function serveStdio(args: {
               },
               "sesori.acp",
             );
-            void activeConnection.closed
+            transportShutdown = activeConnection.closed
               .then(() => activeServer.dispose(), () => activeServer.dispose())
               .then(
                 () => transportContext.root.fiber.dispose(),
                 () => transportContext.root.fiber.dispose(),
               );
+            void transportShutdown.catch(() => undefined);
           },
         );
       },
@@ -149,15 +157,23 @@ export async function serveStdio(args: {
   }
   args.input.destroy();
   const failures: unknown[] = operationFailure === undefined ? [] : [operationFailure];
+  const recordFailure = (error: unknown): void => {
+    if (!failures.includes(error)) failures.push(error);
+  };
+  try {
+    await transportShutdown;
+  } catch (error) {
+    recordFailure(error);
+  }
   try {
     await server?.dispose();
   } catch (error) {
-    failures.push(error);
+    recordFailure(error);
   }
   try {
     await context?.fiber.dispose();
   } catch (error) {
-    failures.push(error);
+    recordFailure(error);
   }
   signalSource.off("SIGINT", closeInput);
   signalSource.off("SIGTERM", closeInput);

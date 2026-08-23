@@ -29,6 +29,7 @@ export function createInitializeResponse(): InitializeResponse {
     protocolVersion: PROTOCOL_VERSION,
     agentCapabilities: {
       loadSession: true,
+      promptCapabilities: { image: true },
       sessionCapabilities: { list: {}, close: {} },
     },
     agentInfo: {

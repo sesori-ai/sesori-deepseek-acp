@@ -115,6 +115,7 @@ describe("ACP server", () => {
       protocolVersion: PROTOCOL_VERSION,
       agentCapabilities: {
         loadSession: true,
+        promptCapabilities: { image: true },
         sessionCapabilities: { list: {}, close: {} },
       },
       agentInfo: { name: ADAPTER_NAME, title: ADAPTER_TITLE, version: ADAPTER_VERSION },

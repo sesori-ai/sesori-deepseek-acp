@@ -385,6 +385,9 @@
             "question",
             "plan_review"
           ]
+        },
+        "approveLabel": {
+          "$ref": "#/$defs/nonblank"
         }
       },
       "additionalProperties": false
@@ -456,8 +459,7 @@
       "required": [
         "sessionId",
         "kind",
-        "attempt",
-        "limit"
+        "attempt"
       ],
       "properties": {
         "sessionId": {

@@ -1328,6 +1328,47 @@ describe("durable ACP sessions", () => {
     answer.resolve({ answers: [{ questionId: "q1", selectedLabels: [], customAnswer: "Later" }] });
   });
 
+  it("does not send pre-aborted questions and orders questions after prior output", async () => {
+    const state = services();
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const handle = state.live.get(created.sessionId)!;
+    const alreadyAborted = new AbortController();
+    alreadyAborted.abort(new Error("question already withdrawn"));
+    await expect(
+      state.askQuestion({
+        agent: handle.agent,
+        signal: alreadyAborted.signal,
+        questions: [{ id: "q1", question: "Obsolete?" }],
+      }),
+    ).rejects.toThrow("question already withdrawn");
+    expect(state.extensionRequest).not.toHaveBeenCalled();
+
+    const output = Promise.withResolvers<void>();
+    state.sessionUpdate.mockImplementationOnce(async (notification: SessionNotification) => {
+      state.updates.push(notification);
+      await output.promise;
+    });
+    state.invoke("session/event", handle.agent.session, {
+      type: "assistant/chunk",
+      data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "Context first" } },
+    });
+    await expect.poll(() => state.sessionUpdate.mock.calls.length).toBe(1);
+    state.extensionRequest.mockResolvedValueOnce({
+      answers: [{ questionId: "q2", selectedLabels: [], customAnswer: "Answer" }],
+    });
+    const asking = state.askQuestion({
+      agent: handle.agent,
+      questions: [{ id: "q2", question: "Then ask?" }],
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(state.extensionRequest).not.toHaveBeenCalled();
+
+    output.resolve();
+    await expect(asking).resolves.toEqual({
+      answers: [{ id: "q2", selected: [], custom: "Answer" }],
+    });
+  });
+
   it("waits for tool presentation and aborts an obsolete permission request", async () => {
     const state = services();
     const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
@@ -1396,6 +1437,46 @@ describe("durable ACP sessions", () => {
     await expect.poll(() => state.sessionUpdate.mock.calls.length).toBe(1);
 
     expect(state.diagnostics.join("\n")).toContain("tool arguments are not valid JSON");
+    expect(state.diagnostics.join("\n")).not.toContain(secret);
+  });
+
+  it("does not log payloads included in tool presenter errors", async () => {
+    const state = services();
+    const secret = "SENTINEL_PRESENTER_PAYLOAD";
+    state.contextServices.set("tools", {
+      get: () => ({
+        presentCall: () => {
+          throw new Error(secret);
+        },
+        presentResult: () => {
+          throw new Error(secret);
+        },
+      }),
+    });
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const handle = state.live.get(created.sessionId)!;
+    state.invoke("session/event", handle.agent.session, {
+      type: "tool/call",
+      data: { turn: 1, step: 1, callId: "call-secret", name: "edit", arguments: "{}" },
+    });
+    state.invoke("session/event", handle.agent.session, {
+      type: "tool/result",
+      surfaceOp: "append",
+      data: {
+        turn: 1,
+        step: 1,
+        message: {
+          id: "result-secret",
+          role: "user",
+          source: { kind: "tool", callId: "call-secret", tool: "edit" },
+          content: [{ type: "tool-result", toolCallId: "call-secret", content: [{ type: "text", text: secret }] }],
+        },
+      },
+    });
+    await expect.poll(() => state.sessionUpdate.mock.calls.length).toBe(2);
+
+    expect(state.diagnostics.join("\n")).toContain("tool call presenter failed");
+    expect(state.diagnostics.join("\n")).toContain("tool result presenter failed");
     expect(state.diagnostics.join("\n")).not.toContain(secret);
   });
 

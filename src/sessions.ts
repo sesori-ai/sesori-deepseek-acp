@@ -233,12 +233,22 @@ function decodeCursor(value: string): ListCursor {
   }
 }
 
+class ToolArgumentsParseError extends Error {
+  constructor(cause: unknown) {
+    super("tool arguments are not valid JSON", { cause });
+  }
+}
+
 function parseToolArguments(value: string): unknown {
   try {
     return JSON.parse(value);
   } catch (error) {
-    throw new Error("tool arguments are not valid JSON", { cause: error });
+    throw new ToolArgumentsParseError(error);
   }
+}
+
+function toolPresentationError(error: unknown, message: string): Error {
+  return error instanceof ToolArgumentsParseError ? error : new Error(message, { cause: error });
 }
 
 function afterCursor(header: SessionHeader, cursor: ListCursor): boolean {
@@ -497,7 +507,7 @@ async function projectSessionEvent(args: EventProjection, event: SessionEvent): 
         if (view.locations !== undefined) update.locations = view.locations;
       }
     } catch (error) {
-      args.diagnose("tool/call presentation", error);
+      args.diagnose("tool/call presentation", toolPresentationError(error, "tool call presenter failed"));
     }
     await args.emitUpdate(update);
     return;
@@ -543,7 +553,7 @@ async function projectSessionEvent(args: EventProjection, event: SessionEvent): 
           update.content = await toolContent({ context: args.context, blocks: view.content });
         }
       } catch (error) {
-        args.diagnose("tool/result presentation", error);
+        args.diagnose("tool/result presentation", toolPresentationError(error, "tool result presenter failed"));
       }
     }
     await args.emitUpdate(update);
@@ -1054,9 +1064,11 @@ export class DurableSessionAgent implements AcpAgent {
 
   async #askQuestion(value: unknown): Promise<unknown> {
     const request = value as { agent?: Agent; signal?: AbortSignal; questions?: unknown[] };
-    if (request.agent === undefined || this.#ownedRecord(request.agent) === undefined) {
+    if (request.agent === undefined) {
       throw new Error("question caller is not an owned root session");
     }
+    const record = this.#ownedRecord(request.agent);
+    if (record === undefined) throw new Error("question caller is not an owned root session");
     const questionIds = new Set<string>();
     const questions = (request.questions ?? []).map((question) => {
       const item = question as Record<string, unknown>;
@@ -1088,10 +1100,11 @@ export class DurableSessionAgent implements AcpAgent {
     if (!validateProtocolValue({ definition: "askUserQuestionRequest", value: params }).valid) {
       throw new Error("invalid DeepSeek question request");
     }
-    const response = await withAbort(
-      this.#connection.extMethod("deepseek/ask_user_question", params),
-      request.signal,
-    );
+    request.signal?.throwIfAborted();
+    const response = await withAbort(record.outputTail.then(() => {
+      request.signal?.throwIfAborted();
+      return this.#connection.extMethod("deepseek/ask_user_question", params);
+    }), request.signal);
     if (!validateProtocolValue({ definition: "askUserQuestionResponse", value: response }).valid) {
       throw new Error("invalid DeepSeek question response");
     }

@@ -1358,6 +1358,45 @@ describe("durable ACP sessions", () => {
     controller.abort(new Error("synthetic approval abort"));
     await expect(approval).resolves.toBe("unavailable");
     answer.resolve({ outcome: { outcome: "cancelled" } });
+
+    const laterOutput = Promise.withResolvers<void>();
+    state.sessionUpdate.mockImplementationOnce(async (notification: SessionNotification) => {
+      state.updates.push(notification);
+      await laterOutput.promise;
+    });
+    state.invoke("session/event", handle.agent.session, {
+      type: "tool/call",
+      data: { turn: 1, step: 2, callId: "call-2", name: "edit", arguments: "{}" },
+    });
+    await expect.poll(() => state.sessionUpdate.mock.calls.length).toBe(2);
+    const earlyAbort = new AbortController();
+    const obsolete = state.invoke(
+      "approval/request",
+      { agent: handle.agent, callId: "call-2", toolName: "edit", signal: earlyAbort.signal },
+      async () => "unavailable",
+    ) as Promise<unknown>;
+    earlyAbort.abort(new Error("approval withdrawn before presentation"));
+    await expect(obsolete).resolves.toBe("unavailable");
+    laterOutput.resolve();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(state.requestPermission).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not log malformed raw tool arguments", async () => {
+    const state = services();
+    state.contextServices.set("tools", { get: () => ({ presentCall: () => undefined }) });
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const handle = state.live.get(created.sessionId)!;
+    const secret = "SENTINEL_RAW_TOOL_ARGUMENT";
+
+    state.invoke("session/event", handle.agent.session, {
+      type: "tool/call",
+      data: { turn: 1, step: 1, callId: "call-secret", name: "edit", arguments: secret },
+    });
+    await expect.poll(() => state.sessionUpdate.mock.calls.length).toBe(1);
+
+    expect(state.diagnostics.join("\n")).toContain("tool arguments are not valid JSON");
+    expect(state.diagnostics.join("\n")).not.toContain(secret);
   });
 
   it("makes close drain pending prompt output and unregisters the question provider", async () => {

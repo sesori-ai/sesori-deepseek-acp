@@ -233,6 +233,14 @@ function decodeCursor(value: string): ListCursor {
   }
 }
 
+function parseToolArguments(value: string): unknown {
+  try {
+    return JSON.parse(value);
+  } catch (error) {
+    throw new Error("tool arguments are not valid JSON", { cause: error });
+  }
+}
+
 function afterCursor(header: SessionHeader, cursor: ListCursor): boolean {
   return (
     header.createdAt < cursor.createdAt ||
@@ -461,7 +469,7 @@ async function projectSessionEvent(args: EventProjection, event: SessionEvent): 
       const tools = args.context.get("tools") as
         | { get(name: string, agent?: Agent): { presentCall?(value: unknown): unknown } | undefined }
         | undefined;
-      const view = tools?.get(event.data.name, args.agent)?.presentCall?.(JSON.parse(event.data.arguments)) as
+      const view = tools?.get(event.data.name, args.agent)?.presentCall?.(parseToolArguments(event.data.arguments)) as
         | {
             card: string;
             title: string;
@@ -513,7 +521,7 @@ async function projectSessionEvent(args: EventProjection, event: SessionEvent): 
                 | undefined;
             }
           | undefined;
-        const view = tools?.get(call.name, args.agent)?.presentResult?.(JSON.parse(call.arguments), {
+        const view = tools?.get(call.name, args.agent)?.presentResult?.(parseToolArguments(call.arguments), {
           content: result.content,
           isError: result.isError === true,
           ...(event.data.meta === undefined ? {} : { meta: event.data.meta }),
@@ -648,16 +656,17 @@ export class DurableSessionAgent implements AcpAgent {
       const record = this.#ownedRecord(request.agent);
       if (record === undefined || request.callId === undefined) return next();
       return withAbort(
-        record.outputTail.then(() =>
-          this.#connection.requestPermission({
+        record.outputTail.then(() => {
+          request.signal?.throwIfAborted();
+          return this.#connection.requestPermission({
             sessionId: String(request.agent.id),
             toolCall: { toolCallId: String(request.callId) },
             options: [
               { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
               { optionId: "reject-once", name: "Reject", kind: "reject_once" },
             ],
-          }),
-        ),
+          });
+        }),
         request.signal,
       )
         .then(({ outcome }) =>

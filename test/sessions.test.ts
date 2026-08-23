@@ -414,6 +414,43 @@ describe("durable ACP sessions", () => {
     await expect(prompt).resolves.toEqual({ stopReason: "cancelled" });
   });
 
+  it("rejects prompt admission while resident replay is active", async () => {
+    const state = services();
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const handle = state.live.get(created.sessionId)!;
+    const residentEvents = handle.agent.session.events as SessionEvent[];
+    residentEvents.push({
+      type: "user/message",
+      seq: 0,
+      time: 1,
+      surfaceOp: "append",
+      data: {
+        id: "user-1",
+        role: "user",
+        source: { kind: "user" },
+        content: [{ type: "text", text: "question" }],
+      },
+    } as SessionEvent);
+    const replayOutput = Promise.withResolvers<void>();
+    state.sessionUpdate.mockImplementationOnce(async (notification: SessionNotification) => {
+      state.updates.push(notification);
+      await replayOutput.promise;
+    });
+    const loading = state.agent.loadSession({
+      sessionId: created.sessionId,
+      cwd: "/project",
+      mcpServers: [],
+    });
+    await expect.poll(() => state.sessionUpdate.mock.calls.length).toBe(1);
+
+    await expect(
+      state.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "too soon" }] }),
+    ).rejects.toThrow("session load is in progress");
+
+    replayOutput.resolve();
+    await loading;
+  });
+
   it("disposes a resumed handle when shutdown wins the load race", async () => {
     const state = services();
     const meta = header({ id: "raced", cwd: "/project" });

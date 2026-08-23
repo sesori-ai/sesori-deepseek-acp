@@ -898,7 +898,9 @@ export class DurableSessionAgent implements AcpAgent {
 
   async prompt(params: PromptRequest): Promise<PromptResponse> {
     this.#assertOpen();
-    const record = this.#sessions.get(parseSessionId(params.sessionId));
+    const sessionId = parseSessionId(params.sessionId);
+    if (this.#loads.has(sessionId)) throw invalidParams("session load is in progress");
+    const record = this.#sessions.get(sessionId);
     if (record === undefined) throw invalidParams("unknown session");
     if (record.inflight !== undefined) throw invalidParams("a prompt is already in flight for this session");
     const inflight: InflightPrompt = {

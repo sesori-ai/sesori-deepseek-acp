@@ -396,6 +396,24 @@ describe("durable ACP sessions", () => {
     expect(state.resume).toHaveBeenCalledOnce();
   });
 
+  it("rejects resident replay while a prompt is active", async () => {
+    const state = services();
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const handle = state.live.get(created.sessionId)!;
+    const prompt = state.agent.prompt({
+      sessionId: created.sessionId,
+      prompt: [{ type: "text", text: "question" }],
+    });
+    await expect.poll(() => vi.mocked(handle.agent.followup).mock.calls.length).toBe(1);
+
+    await expect(
+      state.agent.loadSession({ sessionId: created.sessionId, cwd: "/project", mcpServers: [] }),
+    ).rejects.toThrow("cannot load a session while its prompt is active");
+
+    await state.agent.cancel({ sessionId: created.sessionId });
+    await expect(prompt).resolves.toEqual({ stopReason: "cancelled" });
+  });
+
   it("disposes a resumed handle when shutdown wins the load race", async () => {
     const state = services();
     const meta = header({ id: "raced", cwd: "/project" });
@@ -805,7 +823,7 @@ describe("durable ACP sessions", () => {
         outputTokens: 4,
         cachedReadTokens: 2,
         thoughtTokens: 1,
-        totalTokens: 17,
+        totalTokens: 16,
       },
     });
   });
@@ -1083,6 +1101,38 @@ describe("durable ACP sessions", () => {
     answer.resolve({ answers: [{ questionId: "q1", selectedLabels: [], customAnswer: "Later" }] });
   });
 
+  it("waits for tool presentation and aborts an obsolete permission request", async () => {
+    const state = services();
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const handle = state.live.get(created.sessionId)!;
+    const output = Promise.withResolvers<void>();
+    state.sessionUpdate.mockImplementationOnce(async (notification: SessionNotification) => {
+      state.updates.push(notification);
+      await output.promise;
+    });
+    const answer = Promise.withResolvers<{ outcome: { outcome: "cancelled" } }>();
+    state.requestPermission.mockReturnValueOnce(answer.promise);
+    state.invoke("session/event", handle.agent.session, {
+      type: "tool/call",
+      data: { turn: 1, step: 1, callId: "call-1", name: "edit", arguments: "{}" },
+    });
+    await expect.poll(() => state.sessionUpdate.mock.calls.length).toBe(1);
+    const controller = new AbortController();
+    const approval = state.invoke(
+      "approval/request",
+      { agent: handle.agent, callId: "call-1", toolName: "edit", signal: controller.signal },
+      async () => "unavailable",
+    ) as Promise<unknown>;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(state.requestPermission).not.toHaveBeenCalled();
+
+    output.resolve();
+    await expect.poll(() => state.requestPermission.mock.calls.length).toBe(1);
+    controller.abort(new Error("synthetic approval abort"));
+    await expect(approval).resolves.toBe("unavailable");
+    answer.resolve({ outcome: { outcome: "cancelled" } });
+  });
+
   it("makes close drain pending prompt output and unregisters the question provider", async () => {
     const state = services();
     const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
@@ -1147,10 +1197,9 @@ describe("durable ACP sessions", () => {
     await expect.poll(() => saveImages.mock.calls.length).toBe(1);
 
     await state.agent.cancel({ sessionId: created.sessionId });
-    saved.resolve([{ id: "saved-image" }]);
-
     await expect(pending).resolves.toEqual({ stopReason: "cancelled" });
     expect(handle.agent.followup).not.toHaveBeenCalled();
+    saved.resolve([{ id: "saved-image" }]);
   });
 
   it.each([

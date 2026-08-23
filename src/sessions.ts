@@ -112,7 +112,7 @@ function promptUsage(usages: Iterable<TokenUsage>): PromptResponse["usage"] {
     cachedWriteTokens += usage.cacheWriteTokens ?? 0;
     thoughtTokens += usage.reasoningTokens ?? 0;
   }
-  const totalTokens = inputTokens + outputTokens + cachedReadTokens + cachedWriteTokens + thoughtTokens;
+  const totalTokens = inputTokens + outputTokens + cachedReadTokens + cachedWriteTokens;
   if (totalTokens === 0) return undefined;
   return {
     inputTokens,
@@ -295,7 +295,7 @@ async function admitPrompt(args: {
     return { data: Buffer.from(image.data, "base64"), mediaType: image.mimeType };
   });
   args.signal.throwIfAborted();
-  const refs = inputs.length === 0 ? [] : await attachments!.saveImages(inputs);
+  const refs = inputs.length === 0 ? [] : await withAbort(attachments!.saveImages(inputs), args.signal);
   args.signal.throwIfAborted();
   let imageIndex = 0;
   return args.prompt.map((block) => {
@@ -647,15 +647,19 @@ export class DurableSessionAgent implements AcpAgent {
     this.#hooks.push(this.#context.on("approval/request", (request: ApprovalRequest, next: () => Promise<ApprovalOutcome>) => {
       const record = this.#ownedRecord(request.agent);
       if (record === undefined || request.callId === undefined) return next();
-      return this.#connection
-        .requestPermission({
-          sessionId: String(request.agent.id),
-          toolCall: { toolCallId: String(request.callId) },
-          options: [
-            { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
-            { optionId: "reject-once", name: "Reject", kind: "reject_once" },
-          ],
-        })
+      return withAbort(
+        record.outputTail.then(() =>
+          this.#connection.requestPermission({
+            sessionId: String(request.agent.id),
+            toolCall: { toolCallId: String(request.callId) },
+            options: [
+              { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
+              { optionId: "reject-once", name: "Reject", kind: "reject_once" },
+            ],
+          }),
+        ),
+        request.signal,
+      )
         .then(({ outcome }) =>
           outcome.outcome === "cancelled"
             ? "cancelled"
@@ -775,13 +779,16 @@ export class DurableSessionAgent implements AcpAgent {
       if (inspection.meta.cwd !== params.cwd) {
         throw invalidParams("cwd does not match persisted session");
       }
+      const resident = this.#sessions.get(sessionId);
+      if (resident?.inflight !== undefined) {
+        throw invalidParams("cannot load a session while its prompt is active");
+      }
       const updates = await replayUpdates({
         context: this.#context,
         sessionId: String(sessionId),
         events: inspection.events,
         diagnose: (operation, error) => this.#diagnose(operation, sessionId, error),
       });
-      const resident = this.#sessions.get(sessionId);
       if (resident !== undefined) {
         if (this.#context.agents.get(sessionId) !== resident.handle.agent) {
           throw new Error("owned session is no longer registered");

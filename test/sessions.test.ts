@@ -720,6 +720,25 @@ describe("durable ACP sessions", () => {
     expect(state.diagnostics.join("\n")).toContain("synthetic cleanup failure");
   });
 
+  it("removes a failed new session record after cleaning up its handle", async () => {
+    const state = services();
+    state.contextServices.set("llm", {
+      listProviders: () => {
+        throw new Error("synthetic catalog failure");
+      },
+    });
+
+    await expect(state.agent.newSession({ cwd: "/project", mcpServers: [] })).rejects.toThrow(
+      "unable to create DeepSeek session",
+    );
+    const sessionId = state.create.mock.calls[0]![0].sessionId as string;
+    const handle = await state.create.mock.results[0]!.value as AgentHandle;
+    expect(state.live.has(sessionId)).toBe(false);
+
+    await expect(state.agent.closeSession({ sessionId })).resolves.toEqual({});
+    expect(handle.dispose).toHaveBeenCalledOnce();
+  });
+
   it("rejects control characters in session ids before diagnostics", async () => {
     const state = services();
 
@@ -754,6 +773,35 @@ describe("durable ACP sessions", () => {
     });
     expect(previous).toMatchObject({ hasMore: false });
     expect(previous.updates).toHaveLength(1);
+  });
+
+  it("counts command results as history message boundaries", async () => {
+    const state = services();
+    const meta = header({ id: "command-history", cwd: "/project" });
+    state.headers.push(meta);
+    state.inspections.set("command-history", {
+      meta,
+      events: [
+        ...events(),
+        {
+          type: "command/done",
+          seq: 2,
+          time: 30,
+          data: { commandId: CommandId("command-1"), kind: "success", text: "Compacted" },
+        } as SessionEvent,
+      ],
+    });
+
+    const page = await state.agent.extMethod("deepseek/session/history", {
+      sessionId: "command-history",
+      maxMessages: 1,
+    });
+
+    expect(page.hasMore).toBe(true);
+    expect(page.nextBeforeSeq).toBe(2);
+    expect(page.updates).toEqual([
+      expect.objectContaining({ update: expect.objectContaining({ content: { type: "text", text: "Compacted" } }) }),
+    ]);
   });
 
   it("rejects cwd conflicts and unknown required history events", async () => {
@@ -983,6 +1031,49 @@ describe("durable ACP sessions", () => {
     ).rejects.toThrow("unknown DeepSeek reasoning effort");
   });
 
+  it("keeps config options usable when selected model is absent from a partial catalog", async () => {
+    const state = services();
+    state.contextServices.set("llm", {
+      listProviders: () => [{ id: "surviving", name: "Surviving" }],
+      listModels: async () => [{ id: "available", name: "Available" }],
+      resolveModelInfo: async () => ({ reasoning: { efforts: [{ id: "low" }], defaultEffort: "low" } }),
+    });
+    state.contextServices.set("agentDefaultModel", {
+      currentSelection: () => ({ provider: "missing", model: "selected", reasoningEffort: "high" }),
+    });
+
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+
+    expect(created.configOptions).toEqual([
+      expect.objectContaining({ id: "deepseek.model", currentValue: expect.any(String) }),
+    ]);
+  });
+
+  it("reuses the fetched catalog when returning a changed config selection", async () => {
+    const state = services();
+    const listProviders = vi.fn(() => [{ id: "provider", name: "Provider" }]);
+    state.contextServices.set("llm", {
+      listProviders,
+      listModels: async () => [{ id: "first", name: "First" }, { id: "second", name: "Second" }],
+      resolveModelInfo: async () => ({}),
+    });
+    state.contextServices.set("agentDefaultModel", {
+      currentSelection: () => ({ provider: "provider", model: "first" }),
+    });
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const catalog = await state.agent.extMethod("deepseek/catalog", { cwd: "/project" });
+    const nextModel = (catalog.providers as { models: { id: string }[] }[])[0]!.models[1]!.id;
+    listProviders.mockClear();
+
+    await state.agent.setSessionConfigOption!({
+      sessionId: created.sessionId,
+      configId: "deepseek.model",
+      value: nextModel,
+    });
+
+    expect(listProviders).toHaveBeenCalledOnce();
+  });
+
   it("routes only exact advertised slash commands away from the model", async () => {
     const state = services();
     const execute = vi.fn(async (agent: Agent, _line: string) => {
@@ -1001,6 +1092,17 @@ describe("durable ACP sessions", () => {
     const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
     const handle = state.live.get(created.sessionId)!;
     state.updates.length = 0;
+
+    await expect(
+      state.agent.prompt({
+        sessionId: created.sessionId,
+        prompt: [
+          { type: "text", text: "/compact now" },
+          { type: "image", data: "not-base64", mimeType: "image/png" },
+        ],
+      }),
+    ).rejects.toThrow("invalid image base64");
+    expect(execute).not.toHaveBeenCalled();
 
     await expect(
       state.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "/compact now" }] }),
@@ -1053,6 +1155,45 @@ describe("durable ACP sessions", () => {
     ).resolves.toEqual({ title: "Cold title" });
     expect(state.resume).toHaveBeenCalledWith(expect.objectContaining({ resumeSessionId: "cold-rename" }));
     expect(state.live.has("cold-rename")).toBe(false);
+  });
+
+  it("validates cold rename persistence before resuming", async () => {
+    const state = services();
+    const meta = header({ id: "unlisted-rename", cwd: "/project" });
+    state.inspections.set("unlisted-rename", { meta, events: [] });
+
+    await expect(
+      state.agent.extMethod("deepseek/session/rename", {
+        sessionId: "unlisted-rename",
+        title: "Cold title",
+      }),
+    ).rejects.toThrow("unknown session");
+    expect(state.resume).not.toHaveBeenCalled();
+  });
+
+  it("retains a cold rename handle when disposal fails so close can retry", async () => {
+    const state = services();
+    const meta = header({ id: "rename-cleanup", cwd: "/project" });
+    state.headers.push(meta);
+    state.inspections.set("rename-cleanup", { meta, events: [] });
+    const originalResume = state.resume.getMockImplementation() as (...args: unknown[]) => Promise<AgentHandle>;
+    state.resume.mockImplementationOnce(async (...args: unknown[]) => {
+      const handle = await originalResume(...args);
+      vi.mocked(handle.dispose).mockRejectedValueOnce(new Error("synthetic rename cleanup failure"));
+      return handle;
+    });
+
+    await expect(
+      state.agent.extMethod("deepseek/session/rename", {
+        sessionId: "rename-cleanup",
+        title: "Cold title",
+      }),
+    ).rejects.toThrow("unable to release renamed DeepSeek session");
+    const handle = state.live.get("rename-cleanup")!;
+
+    await expect(state.agent.closeSession({ sessionId: "rename-cleanup" })).resolves.toEqual({});
+    expect(handle.dispose).toHaveBeenCalledTimes(2);
+    expect(state.live.has("rename-cleanup")).toBe(false);
   });
 
   it("keeps later output moving after one client update fails", async () => {

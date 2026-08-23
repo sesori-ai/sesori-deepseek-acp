@@ -393,17 +393,8 @@ function historyRequest(params: Record<string, unknown>): HistoryRequest {
   return params as unknown as HistoryRequest;
 }
 
-async function admitPrompt(args: {
-  context: Context;
-  prompt: PromptRequest["prompt"];
-  signal: AbortSignal;
-}): Promise<UserMessage["content"]> {
-  const images = args.prompt.filter((block) => block.type === "image");
-  const attachments = args.context.get("attachments") as
-    | { saveImages(inputs: readonly { data: Uint8Array; mediaType: string }[]): Promise<readonly unknown[]> }
-    | undefined;
-  if (images.length > 0 && attachments === undefined) throw invalidParams("image prompts are unavailable");
-  const inputs = images.map((image) => {
+function promptImages(prompt: PromptRequest["prompt"]): EncodedImageAttachment[] {
+  return prompt.filter((block) => block.type === "image").map((image) => {
     if (image.uri !== undefined && image.uri !== null) throw invalidParams("image URLs are not supported");
     if (!["image/png", "image/jpeg", "image/webp", "image/gif"].includes(image.mimeType)) {
       throw invalidParams("unsupported image media type");
@@ -411,8 +402,21 @@ async function admitPrompt(args: {
     if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(image.data)) {
       throw invalidParams("invalid image base64");
     }
-    return { data: Buffer.from(image.data, "base64"), mediaType: image.mimeType };
+    return { data: image.data, mediaType: image.mimeType as EncodedImageAttachment["mediaType"] };
   });
+}
+
+async function admitPrompt(args: {
+  context: Context;
+  prompt: PromptRequest["prompt"];
+  signal: AbortSignal;
+}): Promise<UserMessage["content"]> {
+  const images = promptImages(args.prompt);
+  const attachments = args.context.get("attachments") as
+    | { saveImages(inputs: readonly { data: Uint8Array; mediaType: string }[]): Promise<readonly unknown[]> }
+    | undefined;
+  if (images.length > 0 && attachments === undefined) throw invalidParams("image prompts are unavailable");
+  const inputs = images.map((image) => ({ data: Buffer.from(image.data, "base64"), mediaType: image.mediaType }));
   args.signal.throwIfAborted();
   const refs = inputs.length === 0 ? [] : await withAbort(attachments!.saveImages(inputs), args.signal);
   args.signal.throwIfAborted();
@@ -425,10 +429,10 @@ async function admitPrompt(args: {
 }
 
 function messageBoundary(event: SessionEvent): boolean {
+  if (event.type === "command/done") return event.data.text !== undefined;
   return (
     isAppendSurfaceEvent(event) &&
-    ((event.type === "user/message" && event.data.source.kind === "user") ||
-      event.type === "assistant/message")
+    ((event.type === "user/message" && event.data.source.kind === "user") || event.type === "assistant/message")
   );
 }
 
@@ -892,6 +896,7 @@ export class DurableSessionAgent implements AcpAgent {
       await this.#sendCommands(record);
       return { sessionId: String(sessionId), configOptions: await this.#configOptions(record) };
     } catch (error) {
+      if (this.#sessions.get(sessionId)?.handle === handle) this.#sessions.delete(sessionId);
       await handle?.dispose().catch((disposeError: unknown) => {
         cleanupFailure = { error: disposeError };
         this.#diagnose("session/new cleanup", sessionId, disposeError);
@@ -1129,8 +1134,8 @@ export class DurableSessionAgent implements AcpAgent {
     return response;
   }
 
-  async #configOptions(record: SessionRecord): Promise<SessionConfigOption[]> {
-    const catalog = await this.#catalog();
+  async #configOptions(record: SessionRecord, catalog?: CatalogResponse): Promise<SessionConfigOption[]> {
+    catalog ??= await this.#catalog();
     if (catalog.providers.length === 0) return [];
     const current = record.selection.current;
     if (current === undefined) throw new Error("session has no model selection");
@@ -1138,7 +1143,6 @@ export class DurableSessionAgent implements AcpAgent {
     const selectedModel = catalog.providers
       .flatMap((provider) => provider.models)
       .find((model) => model.id === selectedId);
-    if (selectedModel === undefined) throw new Error("selected model is unavailable from the current catalog");
     const options: SessionConfigOption[] = [
       {
         type: "select",
@@ -1153,8 +1157,8 @@ export class DurableSessionAgent implements AcpAgent {
         })),
       },
     ];
-    const currentEffort = current.reasoningEffort ?? selectedModel.defaultReasoningEffort;
-    if (currentEffort !== null && selectedModel.reasoningEfforts.length > 0) {
+    const currentEffort = current.reasoningEffort ?? selectedModel?.defaultReasoningEffort;
+    if (selectedModel !== undefined && currentEffort != null && selectedModel.reasoningEfforts.length > 0) {
       options.push({
         type: "select",
         id: REASONING_CONFIG_ID,
@@ -1196,7 +1200,7 @@ export class DurableSessionAgent implements AcpAgent {
     } else {
       throw invalidParams("unknown DeepSeek config option");
     }
-    return { configOptions: await this.#configOptions(record) };
+    return { configOptions: await this.#configOptions(record, catalog) };
   }
 
   async extMethod(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -1270,15 +1274,22 @@ export class DurableSessionAgent implements AcpAgent {
     if (this.#context.agents.get(sessionId) !== undefined) {
       throw invalidParams("session is already being used outside this ACP connection");
     }
+    await this.#inspect(sessionId);
     const transition = Promise.withResolvers<void>();
     void transition.promise.catch(() => undefined);
     this.#loads.set(sessionId, transition.promise);
     let handle: AgentHandle | undefined;
+    let selection: ModelSelectionRef | undefined;
     let cleanupFailure: unknown;
     let operationFailure: RequestError | undefined;
     let response: Record<string, unknown> | undefined;
     try {
-      handle = await this.#context.agents.resume({ resumeSessionId: sessionId });
+      handle = await this.#context.agents.resume({
+        resumeSessionId: sessionId,
+        setup: (agentContext) => {
+          selection = this.#installSelection(agentContext);
+        },
+      });
       if (this.#closed || this.#sessions.has(sessionId)) {
         throw new Error("adapter ownership changed during session rename");
       }
@@ -1301,6 +1312,15 @@ export class DurableSessionAgent implements AcpAgent {
     await handle?.dispose().catch((error: unknown) => {
       cleanupFailure = error;
       this.#diagnose("deepseek/session/rename cleanup", sessionId, error);
+      if (selection !== undefined && !this.#closed && !this.#sessions.has(sessionId)) {
+        this.#sessions.set(sessionId, {
+          handle: handle!,
+          selection,
+          toolCalls: new Map(),
+          outputTail: Promise.resolve(),
+          inflight: undefined,
+        });
+      }
     });
     this.#loads.delete(sessionId);
     if (cleanupFailure === undefined) transition.resolve();
@@ -1341,6 +1361,7 @@ export class DurableSessionAgent implements AcpAgent {
     try {
       const candidate = commandPrompt(params.prompt);
       const parsed = candidate === undefined ? undefined : parseCommand(candidate.line);
+      if (parsed !== undefined) candidate!.images = promptImages(params.prompt);
       const commands = this.#context.get("commands") as
         | {
             find(agent: Agent, name: string): unknown;

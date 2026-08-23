@@ -1122,6 +1122,31 @@ describe("durable ACP sessions", () => {
     expect(listProviders).toHaveBeenCalledOnce();
   });
 
+  it("rejects config mutation while session load starts during catalog lookup", async () => {
+    const state = services();
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const lookup = Promise.withResolvers<unknown>();
+    state.contextServices.set("llm", {
+      listProviders: () => [{ id: "provider", name: "Provider" }],
+      listModels: () => lookup.promise,
+      resolveModelInfo: async () => ({}),
+    });
+    const changing = state.agent.setSessionConfigOption!({
+      sessionId: created.sessionId,
+      configId: "deepseek.model",
+      value: "unknown",
+    });
+    await Promise.resolve();
+    const inspection = Promise.withResolvers<{ meta: SessionHeader; events: readonly SessionEvent[] }>();
+    vi.mocked(state.context.sessionPersistence.inspect).mockReturnValueOnce(inspection.promise);
+    const loading = state.agent.loadSession({ sessionId: created.sessionId, cwd: "/project", mcpServers: [] });
+    lookup.resolve([]);
+
+    await expect(changing).rejects.toThrow("session load is in progress");
+    inspection.resolve({ meta: header({ id: created.sessionId, cwd: "/project" }), events: [] });
+    await loading;
+  });
+
   it("rejects config mutation when ownership changes during catalog lookup", async () => {
     const state = services();
     state.contextServices.set("llm", {
@@ -1302,6 +1327,24 @@ describe("durable ACP sessions", () => {
       }),
     ).rejects.toThrow("unknown session");
     expect(state.resume).not.toHaveBeenCalled();
+  });
+
+  it("returns a persisted cold rename when update delivery fails", async () => {
+    const state = services();
+    const meta = header({ id: "rename-update-failure", cwd: "/project" });
+    state.headers.push(meta);
+    state.inspections.set("rename-update-failure", { meta, events: [] });
+    state.sessionUpdate.mockRejectedValueOnce(new Error("synthetic rename update failure"));
+
+    await expect(
+      state.agent.extMethod("deepseek/session/rename", {
+        sessionId: "rename-update-failure",
+        title: "Persisted title",
+      }),
+    ).resolves.toEqual({ title: "Persisted title" });
+    expect(state.live.has("rename-update-failure")).toBe(false);
+    expect(state.diagnostics.join("\n")).toContain("deepseek/session/rename update session=rename-update-failure");
+    expect(state.diagnostics.join("\n")).toContain("synthetic rename update failure");
   });
 
   it("retains a cold rename handle when disposal fails so close can retry", async () => {

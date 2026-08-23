@@ -1016,9 +1016,17 @@ export class DurableSessionAgent implements AcpAgent {
 
   async #closeSession(sessionId: SessionId): Promise<CloseSessionResponse> {
     const loading = this.#loads.get(sessionId);
-    if (loading !== undefined) await loading;
+    let loadFailure: unknown;
+    if (loading !== undefined) {
+      await loading.catch((error: unknown) => {
+        loadFailure = error;
+      });
+    }
     const record = this.#sessions.get(sessionId);
-    if (record === undefined) return {};
+    if (record === undefined) {
+      if (loadFailure !== undefined) throw loadFailure;
+      return {};
+    }
     this.#sessions.delete(sessionId);
     try {
       await this.#disposeRecord(record);
@@ -1180,9 +1188,11 @@ export class DurableSessionAgent implements AcpAgent {
     this.#assertOpen();
     if (typeof params.value !== "string") throw invalidParams("DeepSeek config options require a selection value");
     const sessionId = parseSessionId(params.sessionId);
+    if (this.#loads.has(sessionId)) throw invalidParams("session load is in progress");
     const record = this.#sessions.get(sessionId);
     if (record === undefined) throw invalidParams("unknown session");
     const catalog = await this.#catalog();
+    if (this.#loads.has(sessionId)) throw invalidParams("session load is in progress");
     if (this.#sessions.get(sessionId) !== record) throw invalidParams("unknown session");
     const current = record.selection.current;
     if (current === undefined) throw internalError("session has no model selection");
@@ -1259,6 +1269,7 @@ export class DurableSessionAgent implements AcpAgent {
     if (loading !== undefined) await loading;
     const closing = this.#closes.get(sessionId);
     if (closing !== undefined) await closing;
+    this.#assertOpen();
     const titles = this.#context.get("sessionTitle") as
       | { rename(session: Agent["session"], title: string): { title: string } }
       | undefined;
@@ -1308,6 +1319,8 @@ export class DurableSessionAgent implements AcpAgent {
         await this.#connection.sessionUpdate({
           sessionId: String(sessionId),
           update: { sessionUpdate: "session_info_update", title: renamed.title },
+        }).catch((error: unknown) => {
+          this.#diagnose("deepseek/session/rename update", sessionId, error);
         });
         response = this.#renameResponse(renamed.title);
       } catch (error) {

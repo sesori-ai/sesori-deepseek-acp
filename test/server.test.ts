@@ -2,7 +2,7 @@ import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
 import { Context } from "@deepseek-ai/cordis";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   ADAPTER_NAME,
   ADAPTER_TITLE,
@@ -36,7 +36,10 @@ function capture(args: { stream: PassThrough }): () => string {
   return () => content;
 }
 
-function startHarness(args: { signalSource?: SignalSource } = {}): ServerHarness {
+function startHarness(args: {
+  signalSource?: SignalSource;
+  runtimeBoot?: RuntimeBoot;
+} = {}): ServerHarness {
   const input = new PassThrough();
   const output = new PassThrough();
   const diagnostics = new PassThrough();
@@ -49,7 +52,7 @@ function startHarness(args: { signalSource?: SignalSource } = {}): ServerHarness
       input,
       output,
       diagnostics,
-      runtimeBoot: testRuntimeBoot,
+      runtimeBoot: args.runtimeBoot ?? testRuntimeBoot,
       ...(args.signalSource === undefined ? {} : { signalSource: args.signalSource }),
     }),
   };
@@ -59,6 +62,8 @@ const testRuntimeBoot: RuntimeBoot = async (args) => {
   const context = new Context();
   const prepared = args.prepare(context);
   if (prepared !== undefined) await prepared;
+  context.provide("agents", {} as never);
+  context.provide("sessionPersistence", {} as never);
   context.provide(RUNTIME_READY_KEY, true);
   return context;
 };
@@ -96,7 +101,7 @@ async function finish(args: { harness: ServerHarness }): Promise<void> {
   await args.harness.completion;
 }
 
-describe("initialize-only ACP server", () => {
+describe("ACP server", () => {
   it("frames responses, preserves request ids, and publishes exact metadata", async () => {
     const harness = startHarness();
     writeMessage({ harness, message: initializeRequest({ id: "request-a" }) });
@@ -108,7 +113,10 @@ describe("initialize-only ACP server", () => {
     expect(byId.get(42)?.jsonrpc).toBe("2.0");
     expect(result).toMatchObject({
       protocolVersion: PROTOCOL_VERSION,
-      agentCapabilities: { loadSession: false },
+      agentCapabilities: {
+        loadSession: true,
+        sessionCapabilities: { list: {}, close: {} },
+      },
       agentInfo: { name: ADAPTER_NAME, title: ADAPTER_TITLE, version: ADAPTER_VERSION },
       authMethods: [],
       _meta: {
@@ -191,6 +199,66 @@ describe("initialize-only ACP server", () => {
     expect(emitter.listenerCount(signal)).toBe(1);
 
     emitter.emit(signal);
+    await harness.completion;
+    expect(emitter.listenerCount("SIGINT")).toBe(0);
+    expect(emitter.listenerCount("SIGTERM")).toBe(0);
+  });
+
+  it("cancels runtime startup when a termination signal arrives before transport mount", async () => {
+    const emitter = new EventEmitter();
+    const signalSource: SignalSource = {
+      once: (event, listener) => emitter.once(event, listener),
+      off: (event, listener) => emitter.off(event, listener),
+    };
+    const started = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const context = new Context();
+    const dispose = vi.spyOn(context.fiber, "dispose");
+    const runtimeBoot: RuntimeBoot = async (args) => {
+      await args.prepare(context);
+      started.resolve();
+      await release.promise;
+      return context;
+    };
+    const harness = startHarness({ signalSource, runtimeBoot });
+    await started.promise;
+
+    emitter.emit("SIGTERM");
+    await expect.poll(() => dispose.mock.calls.length).toBe(1);
+    release.resolve();
+    await harness.completion;
+    expect(emitter.listenerCount("SIGINT")).toBe(0);
+    expect(emitter.listenerCount("SIGTERM")).toBe(0);
+  });
+
+  it("cancels runtime startup when a signal arrives before prepare", async () => {
+    const emitter = new EventEmitter();
+    const signalSource: SignalSource = {
+      once: (event, listener) => emitter.once(event, listener),
+      off: (event, listener) => emitter.off(event, listener),
+    };
+    const started = Promise.withResolvers<void>();
+    const releasePrepare = Promise.withResolvers<void>();
+    const prepared = Promise.withResolvers<void>();
+    const releaseBoot = Promise.withResolvers<void>();
+    const context = new Context();
+    const dispose = vi.spyOn(context.fiber, "dispose");
+    const runtimeBoot: RuntimeBoot = async (args) => {
+      started.resolve();
+      await releasePrepare.promise;
+      await args.prepare(context);
+      prepared.resolve();
+      await releaseBoot.promise;
+      return context;
+    };
+    const harness = startHarness({ signalSource, runtimeBoot });
+    await started.promise;
+
+    emitter.emit("SIGTERM");
+    releasePrepare.resolve();
+    await prepared.promise;
+    await expect.poll(() => dispose.mock.calls.length).toBe(1);
+    releaseBoot.resolve();
     await harness.completion;
     expect(emitter.listenerCount("SIGINT")).toBe(0);
     expect(emitter.listenerCount("SIGTERM")).toBe(0);

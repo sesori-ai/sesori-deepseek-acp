@@ -2,8 +2,9 @@ import { cp, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink } from "no
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, sep } from "node:path";
 import { PassThrough } from "node:stream";
-import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
+import { PROTOCOL_VERSION, type AgentSideConnection, type SessionNotification } from "@agentclientprotocol/sdk";
 import { defaultDshHome, resolveDshHome } from "@deepseek-ai/dsh-home-paths";
+import { SESSION_FORMAT_VERSION, SessionId, type SessionEvent } from "@deepseek-ai/dsh-session";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   bootRuntime,
@@ -11,6 +12,7 @@ import {
   composeRuntimeProfile,
 } from "../src/runtime.ts";
 import { serveStdio } from "../src/server.ts";
+import { DurableSessionAgent } from "../src/sessions.ts";
 
 const originalDshHome = process.env.DSH_HOME;
 const originalApiKey = process.env.DEEPSEEK_API_KEY;
@@ -111,8 +113,8 @@ describe("DeepSeek runtime composition", () => {
         resolve(request: { session: object }): { mode: string; workspaceRoot: string };
       };
       const approval = context.get("approval") as { config: { policy?: string } };
-      const persistence = context.get("sessionPersistence") as { root: string };
-      const attachments = context.get("attachments") as { root: string };
+      const persistence = context.get("sessionPersistence") as unknown as { root: string };
+      const attachments = context.get("attachments") as unknown as { root: string };
       const query = context.get("sessionQuery") as { config: { path: string; openAt: string } };
       const spills = context.get("spillStore") as { root: string };
 
@@ -163,6 +165,98 @@ describe("DeepSeek runtime composition", () => {
       await expect(credentials.resolve("DEEPSEEK_API_KEY")).resolves.toBeUndefined();
     } finally {
       await context.fiber.dispose();
+    }
+  });
+
+  it("recovers and loads an interrupted JSONL session after restart", async () => {
+    const root = await tempRoot();
+    const stateDir = join(root, "state");
+    const project = join(root, "project");
+    await mkdir(project);
+    process.env.DSH_HOME = join(root, "home");
+    delete process.env.DEEPSEEK_API_KEY;
+    const sessionId = SessionId("restart-session");
+    const sessionEvents = [
+      { type: "turn/start", seq: 0, time: 10, data: { turn: 1 } },
+      { type: "step/start", seq: 1, time: 11, data: { turn: 1, step: 1 } },
+      {
+        type: "user/message",
+        seq: 2,
+        time: 12,
+        surfaceOp: "append",
+        data: {
+          id: "restart-user",
+          role: "user",
+          source: { kind: "user" },
+          content: [{ type: "text", text: "persisted question" }],
+        },
+      },
+    ] as unknown as SessionEvent[];
+
+    const first = await bootRuntime({ stateDir });
+    await first.sessionPersistence.create({
+      version: SESSION_FORMAT_VERSION,
+      id: sessionId,
+      createdAt: 1,
+      cwd: project,
+    });
+    await first.sessionPersistence.append(sessionId, sessionEvents);
+    await first.fiber.dispose();
+
+    const second = await bootRuntime({ stateDir });
+    const updates: SessionNotification[] = [];
+    const connection = {
+      sessionUpdate: vi.fn(async (notification: SessionNotification) => {
+        updates.push(notification);
+      }),
+    } as unknown as AgentSideConnection;
+    const diagnostics: string[] = [];
+    const agent = new DurableSessionAgent({
+      context: second,
+      connection,
+      diagnostics: { write: (message) => diagnostics.push(message) },
+    });
+    try {
+      const history = await agent.extMethod("deepseek/session/history", {
+        sessionId: String(sessionId),
+      });
+      expect(history).toMatchObject({
+        hasMore: false,
+        updates: [
+          {
+            sessionId: String(sessionId),
+            update: {
+              sessionUpdate: "user_message_chunk",
+              messageId: "restart-user",
+              content: { type: "text", text: "persisted question" },
+            },
+          },
+        ],
+      });
+      expect(updates).toEqual([]);
+      expect(second.agents.get(sessionId)).toBeUndefined();
+
+      await expect(
+        agent.loadSession({
+          sessionId: String(sessionId),
+          cwd: project,
+          mcpServers: [],
+        }),
+      ).resolves.toEqual({ configOptions: [] });
+      expect(updates).toContainEqual({
+        sessionId: String(sessionId),
+        update: {
+          sessionUpdate: "user_message_chunk",
+          messageId: "restart-user",
+          content: { type: "text", text: "persisted question" },
+        },
+      });
+      await agent.closeSession({ sessionId: String(sessionId) });
+      expect((await second.sessionPersistence.list()).map((item) => item.id)).toContain(sessionId);
+      expect(diagnostics).toEqual([]);
+    } finally {
+      await agent.dispose();
+      await second.fiber.dispose();
     }
   });
 

@@ -27,7 +27,10 @@ export function createInitializeMetadata(): DeepSeekInitializeMetadata {
 export function createInitializeResponse(): InitializeResponse {
   return {
     protocolVersion: PROTOCOL_VERSION,
-    agentCapabilities: { loadSession: false },
+    agentCapabilities: {
+      loadSession: true,
+      sessionCapabilities: { list: {}, close: {} },
+    },
     agentInfo: {
       name: ADAPTER_NAME,
       title: ADAPTER_TITLE,

@@ -1,6 +1,7 @@
 import type { AgentSideConnection, SessionNotification } from "@agentclientprotocol/sdk";
 import type { Context } from "@deepseek-ai/cordis";
-import type { AgentHandle } from "@deepseek-ai/dsh-agent";
+import type { Agent, AgentHandle } from "@deepseek-ai/dsh-agent";
+import { CommandId } from "@deepseek-ai/dsh-commands";
 import { SessionId, type SessionEvent, type SessionHeader } from "@deepseek-ai/dsh-session";
 import { describe, expect, it, vi } from "vitest";
 import { DurableSessionAgent } from "../src/sessions.ts";
@@ -75,11 +76,28 @@ function services(): SessionServices {
   const live = new Map<string, AgentHandle>();
   const listeners = new Map<string, ((...args: never[]) => unknown)[]>();
   const contextServices = new Map<string, unknown>();
+  let context: Context;
   let questionProvider: { ask(request: unknown): Promise<unknown> } | undefined;
-  const makeHandle = (meta: SessionHeader, sessionEvents: readonly SessionEvent[]): AgentHandle => {
+  const makeHandle = async (
+    meta: SessionHeader,
+    sessionEvents: readonly SessionEvent[],
+    setup?: (context: Context) => void | Promise<void>,
+  ): Promise<AgentHandle> => {
+    const storedEvents = [...sessionEvents];
     const agent = {
       id: meta.id,
-      session: { id: meta.id, header: meta, events: sessionEvents },
+      session: {
+        id: meta.id,
+        header: meta,
+        events: storedEvents,
+        requestHeader: () => undefined,
+        append: (type: string, data: unknown) => {
+          const event = { type, seq: storedEvents.length, time: Date.now(), data } as unknown as SessionEvent;
+          storedEvents.push(event);
+          (context as unknown as { __emit(name: string, ...args: unknown[]): void }).__emit("session/event", agent.session, event);
+          return event;
+        },
+      },
       status: "idle",
       followup: vi.fn((message: unknown) => {
         for (const listener of listeners.get("agent/inbox/claimed") ?? []) listener({ agent, message, turn: 1 } as never);
@@ -87,6 +105,9 @@ function services(): SessionServices {
       cancel: vi.fn(),
       whenIdle: vi.fn(async () => undefined),
     };
+    const agentContext = Object.assign(Object.create(context), { agent });
+    Object.assign(agent, { ctx: agentContext });
+    await setup?.(agentContext as Context);
     const handle = {
       agent,
       dispose: vi.fn(async () => {
@@ -96,15 +117,15 @@ function services(): SessionServices {
     live.set(String(meta.id), handle);
     return handle;
   };
-  const create = vi.fn(async (options: { sessionId: string; meta: { cwd: string } }) => {
-    return makeHandle(header({ id: options.sessionId, cwd: options.meta.cwd }), []);
+  const create = vi.fn(async (options: { sessionId: string; meta: { cwd: string }; setup?: (context: Context) => void }) => {
+    return makeHandle(header({ id: options.sessionId, cwd: options.meta.cwd }), [], options.setup);
   });
-  const resume = vi.fn(async (options: { resumeSessionId: string }) => {
+  const resume = vi.fn(async (options: { resumeSessionId: string; setup?: (context: Context) => void }) => {
     const inspection = inspections.get(options.resumeSessionId);
     if (inspection === undefined) throw new Error("not found");
-    return makeHandle(inspection.meta, inspection.events);
+    return makeHandle(inspection.meta, inspection.events, options.setup);
   });
-  const context = {
+  context = {
     on: (name: string, listener: (...args: never[]) => unknown) => {
       listeners.set(name, [...(listeners.get(name) ?? []), listener]);
       return () => undefined;
@@ -115,6 +136,21 @@ function services(): SessionServices {
       get: (id: string) => live.get(id)?.agent,
     },
     sessions: { flush: vi.fn(async () => true) },
+    llm: {
+      listProviders: () => [],
+      listModels: async () => [],
+      resolveModelInfo: async () => {
+        throw new Error("model unavailable");
+      },
+    },
+    agentDefaultModel: { currentSelection: () => ({ provider: "synthetic", model: "synthetic" }) },
+    commands: { list: () => [], find: () => undefined },
+    sessionTitle: {
+      rename: (session: { append(type: string, data: unknown): unknown }, title: string) => {
+        session.append("session/title", { title, messageSeqs: [], source: { kind: "user" } });
+        return { title, seq: 0, updatedAt: Date.now() };
+      },
+    },
     sessionPersistence: {
       list: vi.fn(async () => [...headers]),
       inspect: vi.fn(async (id: string) => {
@@ -123,7 +159,7 @@ function services(): SessionServices {
         return inspection;
       }),
     },
-    get: (name: string) => contextServices.get(name),
+    get: (name: string) => contextServices.get(name) ?? (context as unknown as Record<string, unknown>)[name],
     __emit: (name: string, ...args: unknown[]) => {
       for (const listener of listeners.get(name) ?? []) listener(...(args as never[]));
     },
@@ -465,9 +501,10 @@ describe("durable ACP sessions", () => {
       agent: { session: { id: meta.id, header: meta, events: [] } },
       dispose,
     } as unknown as AgentHandle;
-    state.resume.mockImplementationOnce(async () => {
+    state.resume.mockImplementationOnce(async (options) => {
       resumed.resolve();
       await release.promise;
+      await options.setup?.(Object.assign(Object.create(state.context), { agent: handle.agent }));
       state.live.set("raced", handle);
       return handle;
     });
@@ -508,9 +545,10 @@ describe("durable ACP sessions", () => {
       agent: { session: { id: meta.id, header: meta, events: [] } },
       dispose,
     } as unknown as AgentHandle;
-    state.resume.mockImplementationOnce(async () => {
+    state.resume.mockImplementationOnce(async (options) => {
       resumed.resolve();
       await release.promise;
+      await options.setup?.(Object.assign(Object.create(state.context), { agent: handle.agent }));
       state.live.set("failed-cleanup", handle);
       return handle;
     });
@@ -543,9 +581,10 @@ describe("durable ACP sessions", () => {
       agent: { session: { id: meta.id, header: meta, events: [] } },
       dispose,
     } as unknown as AgentHandle;
-    state.resume.mockImplementationOnce(async () => {
+    state.resume.mockImplementationOnce(async (options) => {
       resumed.resolve();
       await release.promise;
+      await options.setup?.(Object.assign(Object.create(state.context), { agent: handle.agent }));
       state.live.set("closing-load", handle);
       return handle;
     });
@@ -863,6 +902,157 @@ describe("durable ACP sessions", () => {
         totalTokens: 16,
       },
     });
+  });
+
+  it("exposes opaque catalogs and applies exact model and reasoning selections", async () => {
+    const state = services();
+    const secret = "SENTINEL_PROVIDER_CREDENTIAL";
+    state.contextServices.set("llm", {
+      listProviders: () => [
+        { id: "gateway/東京", name: "Gateway 東京" },
+        { id: "broken", name: "Broken" },
+      ],
+      listModels: async (provider: string) => {
+        if (provider === "broken") throw new Error(secret);
+        return [
+          { provider, id: "models/code/pro", name: "Code / Pro" },
+          { provider, id: "模型/vision", name: "Vision 模型" },
+        ];
+      },
+      resolveModelInfo: async (provider: string, model: string) => ({
+        provider,
+        id: model,
+        name: model,
+        inputModalities: model.includes("vision") ? ["text", "image"] : ["text"],
+        reasoning: {
+          efforts: [
+            { id: "low", name: "Low" },
+            { id: "high", name: "High" },
+          ],
+          defaultEffort: "high",
+        },
+      }),
+    });
+    state.contextServices.set("agentDefaultModel", {
+      currentSelection: () => ({ provider: "gateway/東京", model: "models/code/pro", reasoningEffort: "low" }),
+    });
+    state.contextServices.set("commands", {
+      list: () => [{ name: "compact", description: "Compact context" }],
+      find: () => undefined,
+    });
+
+    const catalog = await state.agent.extMethod("deepseek/catalog", { cwd: "/project" });
+    const providers = catalog.providers as { id: string; models: { id: string; upstreamModelId: string; supportsImages: boolean }[] }[];
+    expect(providers).toHaveLength(1);
+    expect(providers[0]?.models.map((model) => model.upstreamModelId)).toEqual([
+      "models/code/pro",
+      "模型/vision",
+    ]);
+    expect(providers[0]?.models.every((model) => model.id.startsWith("v1") && !model.id.includes("/"))).toBe(true);
+    expect(providers[0]?.models[1]?.supportsImages).toBe(true);
+    expect(catalog.failures).toEqual([
+      { providerId: "broken", category: "unavailable", message: "Provider catalog unavailable" },
+    ]);
+    expect(JSON.stringify(catalog)).not.toContain(secret);
+    expect(state.diagnostics.join("\n")).toContain(secret);
+
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    expect(created.configOptions?.map((option) => option.id)).toEqual([
+      "deepseek.model",
+      "deepseek.reasoning_effort",
+    ]);
+    const nextModel = providers[0]!.models[1]!.id;
+    const selected = await state.agent.setSessionConfigOption!({
+      sessionId: created.sessionId,
+      configId: "deepseek.model",
+      value: nextModel,
+    });
+    expect(selected.configOptions[0]?.currentValue).toBe(nextModel);
+    const reasoning = await state.agent.setSessionConfigOption!({
+      sessionId: created.sessionId,
+      configId: "deepseek.reasoning_effort",
+      value: "low",
+    });
+    expect(reasoning.configOptions[1]?.currentValue).toBe("low");
+    await expect(
+      state.agent.setSessionConfigOption!({
+        sessionId: created.sessionId,
+        configId: "deepseek.reasoning_effort",
+        value: "invented",
+      }),
+    ).rejects.toThrow("unknown DeepSeek reasoning effort");
+  });
+
+  it("routes only exact advertised slash commands away from the model", async () => {
+    const state = services();
+    const execute = vi.fn(async (agent: Agent, _line: string) => {
+      agent.session.append("command/done", {
+        commandId: CommandId("command-1"),
+        kind: "success",
+        text: "Compacted",
+      });
+      return { commandId: "command-1", result: { kind: "success", text: "Compacted" } };
+    });
+    state.contextServices.set("commands", {
+      list: () => [{ name: "compact", description: "Compact context" }],
+      find: (_agent: Agent, name: string) => (name === "compact" ? {} : undefined),
+      execute,
+    });
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const handle = state.live.get(created.sessionId)!;
+    state.updates.length = 0;
+
+    await expect(
+      state.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "/compact now" }] }),
+    ).resolves.toEqual({ stopReason: "end_turn" });
+    expect(execute).toHaveBeenCalledOnce();
+    expect(handle.agent.followup).not.toHaveBeenCalled();
+    expect(state.updates).toContainEqual({
+      sessionId: created.sessionId,
+      update: expect.objectContaining({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "Compacted" },
+      }),
+    });
+
+    const prose = state.agent.prompt({
+      sessionId: created.sessionId,
+      prompt: [{ type: "text", text: "/compacting is ordinary prose" }],
+    });
+    await expect.poll(() => vi.mocked(handle.agent.followup).mock.calls.length).toBe(1);
+    state.invoke("session/event", handle.agent.session, {
+      type: "turn/end",
+      data: { turn: 1, reason: { kind: "completed" } },
+    });
+    await expect(prose).resolves.toEqual({ stopReason: "end_turn" });
+    expect(execute).toHaveBeenCalledOnce();
+  });
+
+  it("renames live and cold sessions through the title owner", async () => {
+    const state = services();
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    await expect(
+      state.agent.extMethod("deepseek/session/rename", {
+        sessionId: created.sessionId,
+        title: "Live title",
+      }),
+    ).resolves.toEqual({ title: "Live title" });
+    expect(state.updates.at(-1)).toMatchObject({
+      sessionId: created.sessionId,
+      update: { sessionUpdate: "session_info_update", title: "Live title" },
+    });
+
+    const meta = header({ id: "cold-rename", cwd: "/project" });
+    state.headers.push(meta);
+    state.inspections.set("cold-rename", { meta, events: [] });
+    await expect(
+      state.agent.extMethod("deepseek/session/rename", {
+        sessionId: "cold-rename",
+        title: "Cold title",
+      }),
+    ).resolves.toEqual({ title: "Cold title" });
+    expect(state.resume).toHaveBeenCalledWith(expect.objectContaining({ resumeSessionId: "cold-rename" }));
+    expect(state.live.has("cold-rename")).toBe(false);
   });
 
   it("keeps later output moving after one client update fails", async () => {

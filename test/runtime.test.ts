@@ -242,7 +242,12 @@ describe("DeepSeek runtime composition", () => {
           cwd: project,
           mcpServers: [],
         }),
-      ).resolves.toEqual({ configOptions: [] });
+      ).resolves.toMatchObject({
+        configOptions: [
+          { id: "deepseek.model", category: "model" },
+          { id: "deepseek.reasoning_effort", category: "thought_level" },
+        ],
+      });
       expect(updates).toContainEqual({
         sessionId: String(sessionId),
         update: {

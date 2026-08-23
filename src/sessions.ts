@@ -1,7 +1,6 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { isAbsolute } from "node:path";
 import {
-  AGENT_METHODS,
   RequestError,
   type Agent as AcpAgent,
   type AgentSideConnection,
@@ -22,9 +21,16 @@ import {
   type PromptResponse,
   type SessionInfo,
   type SessionNotification,
+  type StopReason,
+  type ToolCallContent,
 } from "@agentclientprotocol/sdk";
 import type { Context } from "@deepseek-ai/cordis";
-import type { AgentHandle } from "@deepseek-ai/dsh-agent";
+import type { Agent, AgentHandle } from "@deepseek-ai/dsh-agent";
+import { isImageAdmissionError } from "@deepseek-ai/dsh-attachment";
+import { freezeMessage, MessageId, type ContentBlock, type TokenUsage, type UserMessage } from "@deepseek-ai/dsh-llm";
+import type { ApprovalOutcome, ApprovalRequest } from "@deepseek-ai/dsh-user-approval";
+import type {} from "@deepseek-ai/dsh-llm-retry/types";
+import type {} from "@deepseek-ai/dsh-compaction/types";
 import {
   KNOWN_SESSION_EVENT_TYPES,
   SessionId,
@@ -42,9 +48,96 @@ const DEFAULT_HISTORY_MESSAGES = 50;
 const MAX_CURSOR_LENGTH = 512;
 const MAX_PATH_LENGTH = 4096;
 const MAX_SESSION_ID_LENGTH = 256;
+const MAX_MESSAGE_ID_LENGTH = 256;
+const PROMPT_METADATA_KEY = "sesori.ai/deepseek";
+
+function assistantMessageId(sessionId: string, turn: number, step: number): string {
+  return `deepseek-assistant-${createHash("sha256").update(`${sessionId}\0${turn}\0${step}`).digest("base64url").slice(0, 24)}`;
+}
+
+function promptMessageId(params: PromptRequest): string {
+  const metadata = params._meta?.[PROMPT_METADATA_KEY];
+  const value =
+    typeof metadata === "object" && metadata !== null && "messageId" in metadata
+      ? metadata.messageId
+      : undefined;
+  if (value === undefined) return randomUUID();
+  if (
+    typeof value !== "string" ||
+    value.length > MAX_MESSAGE_ID_LENGTH ||
+    !/\S/u.test(value) ||
+    [...value].some((character) => {
+      const code = character.codePointAt(0) as number;
+      return code <= 0x1f || (code >= 0x7f && code <= 0x9f);
+    })
+  ) {
+    throw invalidParams("invalid DeepSeek prompt message id");
+  }
+  return value;
+}
+
+interface InflightPrompt {
+  readonly completion: PromiseWithResolvers<StopReason>;
+  readonly admission: PromiseWithResolvers<void>;
+  readonly terminal: PromiseWithResolvers<void>;
+  readonly controller: AbortController;
+  messageId?: string;
+  turn?: number;
+  endReason?: unknown;
+  queued: boolean;
+  cancelled: boolean;
+  settling: boolean;
+  outputError?: unknown;
+  agentError?: unknown;
+  readonly usageByStep: Map<number, TokenUsage>;
+}
 
 interface SessionRecord {
   readonly handle: AgentHandle;
+  readonly toolCalls: Map<string, { name: string; arguments: string }>;
+  outputTail: Promise<void>;
+  inflight: InflightPrompt | undefined;
+}
+
+function promptUsage(usages: Iterable<TokenUsage>): PromptResponse["usage"] {
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let cachedReadTokens = 0;
+  let cachedWriteTokens = 0;
+  let thoughtTokens = 0;
+  for (const usage of usages) {
+    inputTokens += usage.inputTokens;
+    outputTokens += usage.outputTokens;
+    cachedReadTokens += usage.cacheReadTokens ?? 0;
+    cachedWriteTokens += usage.cacheWriteTokens ?? 0;
+    thoughtTokens += usage.reasoningTokens ?? 0;
+  }
+  const totalTokens = inputTokens + outputTokens + cachedReadTokens + cachedWriteTokens;
+  if (totalTokens === 0) return undefined;
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens,
+    ...(cachedReadTokens === 0 ? {} : { cachedReadTokens }),
+    ...(cachedWriteTokens === 0 ? {} : { cachedWriteTokens }),
+    ...(thoughtTokens === 0 ? {} : { thoughtTokens }),
+  };
+}
+
+async function withAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (signal === undefined) return promise;
+  signal.throwIfAborted();
+  let rejectAborted: (reason: unknown) => void = () => undefined;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    rejectAborted = reject;
+  });
+  const onAbort = (): void => rejectAborted(signal.reason);
+  signal.addEventListener("abort", onAbort, { once: true });
+  try {
+    return await Promise.race([promise, aborted]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
 }
 
 interface HistoryRequest {
@@ -140,6 +233,24 @@ function decodeCursor(value: string): ListCursor {
   }
 }
 
+class ToolArgumentsParseError extends Error {
+  constructor(cause: unknown) {
+    super("tool arguments are not valid JSON", { cause });
+  }
+}
+
+function parseToolArguments(value: string): unknown {
+  try {
+    return JSON.parse(value);
+  } catch (error) {
+    throw new ToolArgumentsParseError(error);
+  }
+}
+
+function toolPresentationError(error: unknown, message: string): Error {
+  return error instanceof ToolArgumentsParseError ? error : new Error(message, { cause: error });
+}
+
 function afterCursor(header: SessionHeader, cursor: ListCursor): boolean {
   return (
     header.createdAt < cursor.createdAt ||
@@ -179,6 +290,37 @@ function historyRequest(params: Record<string, unknown>): HistoryRequest {
   const validation = validateProtocolValue({ definition: "historyRequest", value: params });
   if (!validation.valid) throw invalidParams("invalid DeepSeek history request");
   return params as unknown as HistoryRequest;
+}
+
+async function admitPrompt(args: {
+  context: Context;
+  prompt: PromptRequest["prompt"];
+  signal: AbortSignal;
+}): Promise<UserMessage["content"]> {
+  const images = args.prompt.filter((block) => block.type === "image");
+  const attachments = args.context.get("attachments") as
+    | { saveImages(inputs: readonly { data: Uint8Array; mediaType: string }[]): Promise<readonly unknown[]> }
+    | undefined;
+  if (images.length > 0 && attachments === undefined) throw invalidParams("image prompts are unavailable");
+  const inputs = images.map((image) => {
+    if (image.uri !== undefined && image.uri !== null) throw invalidParams("image URLs are not supported");
+    if (!["image/png", "image/jpeg", "image/webp", "image/gif"].includes(image.mimeType)) {
+      throw invalidParams("unsupported image media type");
+    }
+    if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(image.data)) {
+      throw invalidParams("invalid image base64");
+    }
+    return { data: Buffer.from(image.data, "base64"), mediaType: image.mimeType };
+  });
+  args.signal.throwIfAborted();
+  const refs = inputs.length === 0 ? [] : await withAbort(attachments!.saveImages(inputs), args.signal);
+  args.signal.throwIfAborted();
+  let imageIndex = 0;
+  return args.prompt.map((block) => {
+    if (block.type === "text") return { type: "text", text: block.text };
+    if (block.type === "image") return { type: "image", attachment: refs[imageIndex++] };
+    throw invalidParams("unsupported prompt content");
+  }) as UserMessage["content"];
 }
 
 function messageBoundary(event: SessionEvent): boolean {
@@ -240,84 +382,246 @@ async function imageContent(args: {
   };
 }
 
+async function toolContent(args: {
+  context: Context;
+  blocks: readonly ContentBlock[];
+}): Promise<ToolCallContent[]> {
+  const content: ToolCallContent[] = [];
+  for (const block of args.blocks) {
+    if (block.type === "text" || block.type === "reasoning") {
+      content.push({ type: "content", content: { type: "text", text: block.text } });
+    } else if (block.type === "image") {
+      content.push({
+        type: "content",
+        content: await imageContent({ context: args.context, attachment: block.attachment }),
+      });
+    }
+  }
+  return content;
+}
+
+interface EventProjection {
+  context: Context;
+  sessionId: string;
+  agent?: Agent;
+  mode: "live" | "replay";
+  toolCalls: Map<string, { name: string; arguments: string }>;
+  emitUpdate(update: SessionNotification["update"]): Promise<void>;
+  emitStatus?(status: Record<string, unknown>): Promise<void>;
+  diagnose(operation: string, error: unknown): void;
+  onUsage?(turn: number, step: number, usage: TokenUsage): void;
+  onTurnEnd?(turn: number, reason: unknown): void;
+}
+
+async function projectSessionEvent(args: EventProjection, event: SessionEvent): Promise<void> {
+  if (!KNOWN_SESSION_EVENT_TYPES.has(event.type)) return;
+  if (event.type === "user/message" && isAppendSurfaceEvent(event)) {
+    if (args.mode === "live" || event.data.source.kind !== "user") return;
+    for (const block of event.data.content) {
+      if (block.type !== "text" && block.type !== "image") {
+        throw new Error("session history contains unsupported user content");
+      }
+      await args.emitUpdate({
+        sessionUpdate: "user_message_chunk",
+        messageId: String(event.data.id),
+        content:
+          block.type === "text"
+            ? { type: "text", text: block.text }
+            : await imageContent({ context: args.context, attachment: block.attachment }),
+      });
+    }
+    return;
+  }
+  if (event.type === "assistant/chunk" && args.mode === "live") {
+    const chunk = event.data.chunk;
+    if (chunk.type === "text-delta" || chunk.type === "reasoning-delta") {
+      await args.emitUpdate({
+        sessionUpdate: chunk.type === "reasoning-delta" ? "agent_thought_chunk" : "agent_message_chunk",
+        messageId: assistantMessageId(args.sessionId, event.data.turn, event.data.step),
+        content: { type: "text", text: chunk.text },
+      });
+    } else if (chunk.type === "usage") {
+      args.onUsage?.(event.data.turn, event.data.step, chunk.usage);
+    }
+    return;
+  }
+  if (event.type === "assistant/message" && isAppendSurfaceEvent(event)) {
+    if (event.data.usage !== undefined) {
+      args.onUsage?.(event.data.turn, event.data.step, event.data.usage);
+    }
+    for (const block of event.data.message.content) {
+      if (block.type === "tool-call") continue;
+      if (block.type === "tool-result") {
+        throw new Error("session history contains unsupported assistant tool-result content");
+      }
+      if (args.mode === "live" && block.type !== "image") continue;
+      await args.emitUpdate({
+        sessionUpdate: block.type === "reasoning" ? "agent_thought_chunk" : "agent_message_chunk",
+        messageId: assistantMessageId(args.sessionId, event.data.turn, event.data.step),
+        content:
+          block.type === "image"
+            ? await imageContent({ context: args.context, attachment: block.attachment })
+            : { type: "text", text: block.text },
+      });
+    }
+    return;
+  }
+  if (event.type === "tool/call") {
+    const callId = String(event.data.callId);
+    args.toolCalls.set(callId, { name: event.data.name, arguments: event.data.arguments });
+    const update: Extract<SessionNotification["update"], { sessionUpdate: "tool_call" }> = {
+      sessionUpdate: "tool_call",
+      toolCallId: callId,
+      title: event.data.name,
+      status: "in_progress",
+    };
+    try {
+      const tools = args.context.get("tools") as
+        | { get(name: string, agent?: Agent): { presentCall?(value: unknown): unknown } | undefined }
+        | undefined;
+      const view = tools?.get(event.data.name, args.agent)?.presentCall?.(parseToolArguments(event.data.arguments)) as
+        | {
+            card: string;
+            title: string;
+            kind?: typeof update.kind;
+            rawInput?: unknown;
+            content?: ContentBlock[];
+            locations?: { path: string; line?: number }[];
+            diffs?: { path: string; oldText: string | null; newText: string }[];
+          }
+        | undefined;
+      if (view !== undefined) {
+        update.title = view.title;
+        if (view.card === "diff") {
+          update.kind = "edit";
+          update.content = (view.diffs ?? []).map((diff) => ({ type: "diff", ...diff }));
+        } else if (view.card === "terminal") {
+          update.kind = "execute";
+        } else {
+          update.kind = view.kind ?? "other";
+          if (view.rawInput !== undefined) update.rawInput = view.rawInput;
+          if (view.content !== undefined) {
+            update.content = await toolContent({ context: args.context, blocks: view.content });
+          }
+        }
+        if (view.locations !== undefined) update.locations = view.locations;
+      }
+    } catch (error) {
+      args.diagnose("tool/call presentation", toolPresentationError(error, "tool call presenter failed"));
+    }
+    await args.emitUpdate(update);
+    return;
+  }
+  if (event.type === "tool/result" && isAppendSurfaceEvent(event)) {
+    const result = event.data.message.content[0];
+    const callId = String(result.toolCallId);
+    const update: Extract<SessionNotification["update"], { sessionUpdate: "tool_call_update" }> = {
+      sessionUpdate: "tool_call_update",
+      toolCallId: callId,
+      status: event.data.error === undefined && result.isError !== true ? "completed" : "failed",
+    };
+    const call = args.toolCalls.get(callId);
+    args.toolCalls.delete(callId);
+    if (call !== undefined) {
+      try {
+        const tools = args.context.get("tools") as
+          | {
+              get(name: string, agent?: Agent):
+                | { presentResult?(value: unknown, result: unknown): unknown }
+                | undefined;
+            }
+          | undefined;
+        const view = tools?.get(call.name, args.agent)?.presentResult?.(parseToolArguments(call.arguments), {
+          content: result.content,
+          isError: result.isError === true,
+          ...(event.data.meta === undefined ? {} : { meta: event.data.meta }),
+        }) as
+          | {
+              card: string;
+              title?: string;
+              content?: ContentBlock[];
+              output?: string;
+              diffs?: { path: string; oldText: string | null; newText: string }[];
+            }
+          | undefined;
+        if (view?.title !== undefined) update.title = view.title;
+        if (view?.card === "diff") {
+          update.content = (view.diffs ?? []).map((diff) => ({ type: "diff", ...diff }));
+        } else if (view?.card === "terminal" && view.output !== undefined) {
+          update.content = [{ type: "content", content: { type: "text", text: view.output } }];
+        } else if (view?.content !== undefined) {
+          update.content = await toolContent({ context: args.context, blocks: view.content });
+        }
+      } catch (error) {
+        args.diagnose("tool/result presentation", toolPresentationError(error, "tool result presenter failed"));
+      }
+    }
+    await args.emitUpdate(update);
+    return;
+  }
+  if (event.type === "todo/write") {
+    await args.emitUpdate({
+      sessionUpdate: "plan",
+      entries: event.data.todos.map((item) => ({
+        content: item.content,
+        status: item.status,
+        priority: "medium",
+      })),
+    });
+    return;
+  }
+  if (event.type === "session/title") {
+    await args.emitUpdate({ sessionUpdate: "session_info_update", title: event.data.title });
+    return;
+  }
+  if (event.type === "turn/end" && args.mode === "live") {
+    args.onTurnEnd?.(event.data.turn, event.data.reason);
+    return;
+  }
+  if (event.type === "llm/retry" && args.mode === "live") {
+    const status = {
+      sessionId: args.sessionId,
+      kind: "retry",
+      attempt: event.data.retry,
+      ...("maxRetries" in event.data ? { limit: event.data.maxRetries } : {}),
+    };
+    if (validateProtocolValue({ definition: "sessionStatusNotification", value: status }).valid) {
+      await args.emitStatus?.(status);
+    }
+    return;
+  }
+  if ((event.type === "compaction/start" || event.type === "compaction/end") && args.mode === "live") {
+    const status =
+      event.type === "compaction/end" && event.data.error !== undefined
+        ? { sessionId: args.sessionId, kind: "warning", message: "DeepSeek compaction failed" }
+        : {
+            sessionId: args.sessionId,
+            kind: event.type === "compaction/start" ? "compaction_started" : "compaction_completed",
+          };
+    await args.emitStatus?.(status);
+  }
+}
+
 async function replayUpdates(args: {
   context: Context;
   sessionId: string;
   events: readonly SessionEvent[];
+  diagnose: (operation: string, error: unknown) => void;
 }): Promise<SessionNotification[]> {
   assertKnownEvents(args.events);
   const updates: SessionNotification[] = [];
-  for (const event of args.events) {
-    if (!KNOWN_SESSION_EVENT_TYPES.has(event.type)) {
-      continue;
-    }
-    if (event.type === "user/message" && isAppendSurfaceEvent(event)) {
-      if (event.data.source.kind !== "user") continue;
-      for (const block of event.data.content) {
-        if (block.type !== "text" && block.type !== "image") {
-          throw new Error("session history contains unsupported user content");
-        }
-        const content =
-          block.type === "text"
-            ? ({ type: "text", text: block.text } as const)
-            : await imageContent({ context: args.context, attachment: block.attachment });
-        updates.push({
-          sessionId: args.sessionId,
-          update: {
-            sessionUpdate: "user_message_chunk",
-            messageId: String(event.data.id),
-            content,
-          },
-        });
-      }
-      continue;
-    }
-    if (event.type === "assistant/message" && isAppendSurfaceEvent(event)) {
-      for (const block of event.data.message.content) {
-        if (block.type === "tool-call") continue;
-        if (block.type === "tool-result") {
-          throw new Error("session history contains unsupported assistant tool-result content");
-        }
-        const content =
-          block.type === "image"
-            ? await imageContent({ context: args.context, attachment: block.attachment })
-            : ({ type: "text", text: block.text } as const);
-        updates.push({
-          sessionId: args.sessionId,
-          update: {
-            sessionUpdate:
-              block.type === "reasoning" ? "agent_thought_chunk" : "agent_message_chunk",
-            messageId: String(event.data.message.id),
-            content,
-          },
-        });
-      }
-      continue;
-    }
-    if (event.type === "tool/call") {
-      updates.push({
-        sessionId: args.sessionId,
-        update: {
-          sessionUpdate: "tool_call",
-          toolCallId: String(event.data.callId),
-          title: event.data.name,
-          status: "in_progress",
-        },
-      });
-      continue;
-    }
-    if (event.type === "tool/result" && isAppendSurfaceEvent(event)) {
-      const result = event.data.message.content[0];
-      updates.push({
-        sessionId: args.sessionId,
-        update: {
-          sessionUpdate: "tool_call_update",
-          toolCallId: String(result.toolCallId),
-          status: event.data.error === undefined && result.isError !== true ? "completed" : "failed",
-        },
-      });
-    }
-  }
+  const projection: EventProjection = {
+    context: args.context,
+    sessionId: args.sessionId,
+    mode: "replay",
+    toolCalls: new Map(),
+    emitUpdate: (update) => {
+      updates.push({ sessionId: args.sessionId, update });
+      return Promise.resolve();
+    },
+    diagnose: args.diagnose,
+  };
+  for (const event of args.events) await projectSessionEvent(projection, event);
   return updates;
 }
 
@@ -329,6 +633,7 @@ export class DurableSessionAgent implements AcpAgent {
   readonly #creations = new Set<Promise<void>>();
   readonly #loads = new Map<SessionId, Promise<void>>();
   readonly #closes = new Map<SessionId, Promise<CloseSessionResponse>>();
+  readonly #hooks: (() => void)[] = [];
   #closed = false;
   #disposal: Promise<void> | undefined;
 
@@ -340,6 +645,54 @@ export class DurableSessionAgent implements AcpAgent {
     this.#context = args.context;
     this.#connection = args.connection;
     this.#diagnostics = args.diagnostics;
+    this.#hooks.push(this.#context.on("session/event", (session, event: SessionEvent) => {
+      const record = this.#sessions.get(session.id);
+      if (record?.handle.agent.session !== session) return;
+      this.#projectEvent(record, event);
+    }));
+    this.#hooks.push(this.#context.on("agent/inbox/claimed", ({ agent, message, turn }) => {
+      const inflight = this.#ownedRecord(agent)?.inflight;
+      if (inflight?.messageId === String(message.id)) inflight.turn = turn;
+    }));
+    this.#hooks.push(this.#context.on("agent/error", ({ agent, turn, error }) => {
+      const record = this.#ownedRecord(agent);
+      const inflight = record?.inflight;
+      if (record === undefined || inflight === undefined || !inflight.queued || inflight.turn !== turn) return;
+      inflight.agentError = error;
+      inflight.terminal.resolve();
+      this.#settle(record, inflight);
+    }));
+    this.#hooks.push(this.#context.on("approval/request", (request: ApprovalRequest, next: () => Promise<ApprovalOutcome>) => {
+      const record = this.#ownedRecord(request.agent);
+      if (record === undefined || request.callId === undefined) return next();
+      return withAbort(
+        record.outputTail.then(() => {
+          request.signal?.throwIfAborted();
+          return this.#connection.requestPermission({
+            sessionId: String(request.agent.id),
+            toolCall: { toolCallId: String(request.callId) },
+            options: [
+              { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
+              { optionId: "reject-once", name: "Reject", kind: "reject_once" },
+            ],
+          });
+        }),
+        request.signal,
+      )
+        .then(({ outcome }) =>
+          outcome.outcome === "cancelled"
+            ? "cancelled"
+            : outcome.optionId === "allow-once"
+              ? "allowed-once"
+              : "rejected",
+        )
+        .catch(() => "unavailable");
+    }));
+    const questions = this.#context.get("userQuestions") as
+      | { registerProvider(provider: { ask(request: unknown): Promise<unknown> }): () => void }
+      | undefined;
+    const unregisterQuestions = questions?.registerProvider({ ask: (request) => this.#askQuestion(request) });
+    if (unregisterQuestions !== undefined) this.#hooks.push(unregisterQuestions);
   }
 
   async initialize(_params: InitializeRequest): Promise<InitializeResponse> {
@@ -401,7 +754,12 @@ export class DurableSessionAgent implements AcpAgent {
       if (handle.agent.session.id !== sessionId || this.#sessions.has(sessionId)) {
         throw new Error("agent factory returned a duplicate or mismatched session id");
       }
-      this.#sessions.set(sessionId, { handle });
+      this.#sessions.set(sessionId, {
+        handle,
+        toolCalls: new Map(),
+        outputTail: Promise.resolve(),
+        inflight: undefined,
+      });
       return { sessionId: String(sessionId), configOptions: [] };
     } catch (error) {
       await handle?.dispose().catch((disposeError: unknown) => {
@@ -440,12 +798,16 @@ export class DurableSessionAgent implements AcpAgent {
       if (inspection.meta.cwd !== params.cwd) {
         throw invalidParams("cwd does not match persisted session");
       }
+      const resident = this.#sessions.get(sessionId);
+      if (resident?.inflight !== undefined) {
+        throw invalidParams("cannot load a session while its prompt is active");
+      }
       const updates = await replayUpdates({
         context: this.#context,
         sessionId: String(sessionId),
         events: inspection.events,
+        diagnose: (operation, error) => this.#diagnose(operation, sessionId, error),
       });
-      const resident = this.#sessions.get(sessionId);
       if (resident !== undefined) {
         if (this.#context.agents.get(sessionId) !== resident.handle.agent) {
           throw new Error("owned session is no longer registered");
@@ -460,7 +822,12 @@ export class DurableSessionAgent implements AcpAgent {
         if (this.#closed || this.#sessions.has(sessionId)) {
           throw new Error("adapter ownership changed during session load");
         }
-        this.#sessions.set(sessionId, { handle });
+        this.#sessions.set(sessionId, {
+          handle,
+          toolCalls: new Map(),
+          outputTail: Promise.resolve(),
+          inflight: undefined,
+        });
         adopted = true;
       }
       for (const update of updates) await this.#connection.sessionUpdate(update);
@@ -504,7 +871,7 @@ export class DurableSessionAgent implements AcpAgent {
     if (record === undefined) return {};
     this.#sessions.delete(sessionId);
     try {
-      await record.handle.dispose();
+      await this.#disposeRecord(record);
       return {};
     } catch (error) {
       if (!this.#closed && !this.#sessions.has(sessionId)) {
@@ -532,6 +899,7 @@ export class DurableSessionAgent implements AcpAgent {
           context: this.#context,
           sessionId: request.sessionId,
           events: page.events,
+          diagnose: (operation, error) => this.#diagnose(operation, sessionId, error),
         }),
         hasMore: page.hasMore,
         ...(page.nextBeforeSeq === undefined ? {} : { nextBeforeSeq: page.nextBeforeSeq }),
@@ -547,15 +915,219 @@ export class DurableSessionAgent implements AcpAgent {
     }
   }
 
-  async prompt(_params: PromptRequest): Promise<PromptResponse> {
-    throw RequestError.methodNotFound(AGENT_METHODS.session_prompt);
+  async prompt(params: PromptRequest): Promise<PromptResponse> {
+    this.#assertOpen();
+    const sessionId = parseSessionId(params.sessionId);
+    if (this.#loads.has(sessionId)) throw invalidParams("session load is in progress");
+    const record = this.#sessions.get(sessionId);
+    if (record === undefined) throw invalidParams("unknown session");
+    if (record.inflight !== undefined) throw invalidParams("a prompt is already in flight for this session");
+    const inflight: InflightPrompt = {
+      completion: Promise.withResolvers<StopReason>(),
+      admission: Promise.withResolvers<void>(),
+      terminal: Promise.withResolvers<void>(),
+      controller: new AbortController(),
+      queued: false,
+      cancelled: false,
+      settling: false,
+      usageByStep: new Map(),
+    };
+    record.inflight = inflight;
+    try {
+      const messageId = promptMessageId(params);
+      const content = await admitPrompt({
+        context: this.#context,
+        prompt: params.prompt,
+        signal: inflight.controller.signal,
+      });
+      inflight.controller.signal.throwIfAborted();
+      const message = freezeMessage({
+        id: MessageId(messageId),
+        role: "user",
+        source: { kind: "user" },
+        content,
+      });
+      inflight.messageId = messageId;
+      inflight.queued = true;
+      record.handle.agent.followup(message);
+    } catch (error) {
+      if (!inflight.cancelled) {
+        record.inflight = undefined;
+        if (error instanceof RequestError) throw error;
+        if (isImageAdmissionError(error)) throw invalidParams("image prompt was not admitted");
+        throw internalError("prompt was not admitted");
+      }
+    } finally {
+      inflight.admission.resolve();
+    }
+    this.#settle(record, inflight);
+    const stopReason = await inflight.completion.promise;
+    const usage = promptUsage(inflight.usageByStep.values());
+    return { stopReason, ...(usage === undefined ? {} : { usage }) };
   }
 
-  async cancel(_params: CancelNotification): Promise<void> {}
+  async cancel(params: CancelNotification): Promise<void> {
+    const record = this.#sessions.get(parseSessionId(params.sessionId));
+    if (record === undefined) return;
+    const inflight = record.inflight;
+    if (inflight !== undefined) {
+      inflight.cancelled = true;
+      inflight.controller.abort(new Error("ACP prompt cancelled"));
+      inflight.terminal.resolve();
+      this.#settle(record, inflight);
+    }
+    if (inflight === undefined || inflight.queued) record.handle.agent.cancel({ kind: "user" });
+  }
 
   dispose(): Promise<void> {
     this.#disposal ??= this.#dispose();
     return this.#disposal;
+  }
+
+  #ownedRecord(agent: Agent): SessionRecord | undefined {
+    const record = this.#sessions.get(agent.id);
+    return record?.handle.agent === agent ? record : undefined;
+  }
+
+  #queue(record: SessionRecord, task: () => Promise<void>): void {
+    const inflight = record.inflight;
+    record.outputTail = record.outputTail.catch(() => undefined).then(task);
+    void record.outputTail.catch((error: unknown) => {
+      if (inflight !== undefined) inflight.outputError ??= error;
+    });
+  }
+
+  #projectEvent(record: SessionRecord, event: SessionEvent): void {
+    const sessionId = String(record.handle.agent.id);
+    this.#queue(record, () =>
+      projectSessionEvent(
+        {
+          context: this.#context,
+          sessionId,
+          agent: record.handle.agent,
+          mode: "live",
+          toolCalls: record.toolCalls,
+          emitUpdate: (update) => this.#connection.sessionUpdate({ sessionId, update }),
+          emitStatus: (status) => this.#connection.extNotification("deepseek/session/status", status),
+          diagnose: (operation, error) => this.#diagnose(operation, record.handle.agent.id, error),
+          onUsage: (turn, step, usage) => {
+            const inflight = record.inflight;
+            if (inflight?.turn === turn && !inflight.usageByStep.has(step)) {
+              inflight.usageByStep.set(step, usage);
+            }
+          },
+          onTurnEnd: (turn, reason) => {
+            const inflight = record.inflight;
+            if (inflight?.turn === turn) {
+              inflight.endReason = reason;
+              inflight.terminal.resolve();
+            }
+          },
+        },
+        event,
+      ),
+    );
+  }
+
+  #settle(record: SessionRecord, inflight: InflightPrompt): void {
+    if (inflight.settling) return;
+    inflight.settling = true;
+    void (async () => {
+      await inflight.admission.promise;
+      if (inflight.queued) {
+        await inflight.terminal.promise;
+        await record.handle.agent.whenIdle();
+      }
+      await record.outputTail;
+      if (inflight.queued && !(await this.#context.sessions.flush(record.handle.agent.session))) {
+        throw new Error("session persistence did not participate in prompt settlement");
+      }
+      if (record.inflight !== inflight) return;
+      record.inflight = undefined;
+      if (inflight.cancelled) return inflight.completion.resolve("cancelled");
+      if (inflight.outputError !== undefined || inflight.agentError !== undefined) {
+        return inflight.completion.reject(internalError("turn output failed"));
+      }
+      const reason = inflight.endReason as { kind?: string } | undefined;
+      if (reason?.kind === "blocked") return inflight.completion.resolve("refusal");
+      if (reason?.kind === "aborted") return inflight.completion.resolve("cancelled");
+      if (reason?.kind === "max-tokens") return inflight.completion.resolve("max_tokens");
+      if (reason?.kind === "error") return inflight.completion.reject(internalError("turn failed"));
+      if (reason?.kind === "interrupted") return inflight.completion.reject(internalError("turn interrupted"));
+      inflight.completion.resolve("end_turn");
+    })().catch((error: unknown) => {
+      if (record.inflight === inflight) record.inflight = undefined;
+      inflight.completion.reject(internalError("prompt settlement failed"));
+      this.#diagnose("session/prompt settlement", record.handle.agent.id, error);
+    });
+  }
+
+  async #askQuestion(value: unknown): Promise<unknown> {
+    const request = value as { agent?: Agent; signal?: AbortSignal; questions?: unknown[] };
+    if (request.agent === undefined) {
+      throw new Error("question caller is not an owned root session");
+    }
+    const record = this.#ownedRecord(request.agent);
+    if (record === undefined) throw new Error("question caller is not an owned root session");
+    const questionIds = new Set<string>();
+    const questions = (request.questions ?? []).map((question) => {
+      const item = question as Record<string, unknown>;
+      const intent = item.intent as { kind?: string; approve?: string } | undefined;
+      if (typeof item.id !== "string" || questionIds.has(item.id)) {
+        throw new Error("invalid or duplicate DeepSeek question id");
+      }
+      questionIds.add(item.id);
+      const options = Array.isArray(item.options)
+        ? item.options.map((option) => (option as { label: string }).label)
+        : undefined;
+      if (options !== undefined && new Set(options).size !== options.length) {
+        throw new Error("duplicate DeepSeek question option");
+      }
+      if (intent?.kind === "plan-review" && !options?.includes(intent.approve as string)) {
+        throw new Error("invalid DeepSeek plan approval label");
+      }
+      return {
+        id: item.id,
+        text: item.question,
+        ...(item.header === undefined ? {} : { header: item.header }),
+        ...(item.detail === undefined ? {} : { detail: item.detail }),
+        ...(options === undefined ? {} : { options }),
+        ...(item.multiSelect === undefined ? {} : { multiSelect: item.multiSelect }),
+        ...(intent?.kind === "plan-review" ? { intent: "plan_review", approveLabel: intent.approve } : {}),
+      };
+    });
+    const params = { sessionId: String(request.agent.id), questions };
+    if (!validateProtocolValue({ definition: "askUserQuestionRequest", value: params }).valid) {
+      throw new Error("invalid DeepSeek question request");
+    }
+    request.signal?.throwIfAborted();
+    const response = await withAbort(record.outputTail.then(() => {
+      request.signal?.throwIfAborted();
+      return this.#connection.extMethod("deepseek/ask_user_question", params);
+    }), request.signal);
+    if (!validateProtocolValue({ definition: "askUserQuestionResponse", value: response }).valid) {
+      throw new Error("invalid DeepSeek question response");
+    }
+    const answers = response.answers as { questionId: string; selectedLabels: string[]; customAnswer?: string }[];
+    if (answers.length !== questions.length || answers.some((answer, index) => answer.questionId !== questions[index]?.id)) {
+      throw new Error("DeepSeek question response does not match request");
+    }
+    for (const [index, answer] of answers.entries()) {
+      const question = questions[index]!;
+      if (new Set(answer.selectedLabels).size !== answer.selectedLabels.length) {
+        throw new Error("DeepSeek question response repeats a selection");
+      }
+      if (answer.selectedLabels.some((label) => !question.options?.includes(label))) {
+        throw new Error("DeepSeek question response contains an unknown selection");
+      }
+      if (question.multiSelect !== true && (answer.selectedLabels.length > 1 || (answer.selectedLabels.length > 0 && answer.customAnswer !== undefined))) {
+        throw new Error("DeepSeek single-select response is invalid");
+      }
+      if (answer.selectedLabels.length === 0 && answer.customAnswer === undefined) {
+        throw new Error("DeepSeek question response is empty");
+      }
+    }
+    return { answers: answers.map((answer) => ({ id: answer.questionId, selected: answer.selectedLabels, ...(answer.customAnswer === undefined ? {} : { custom: answer.customAnswer }) })) };
   }
 
   async #inspect(sessionId: SessionId): Promise<SessionInspection> {
@@ -572,6 +1144,26 @@ export class DurableSessionAgent implements AcpAgent {
     if (this.#closed) throw internalError("the ACP session owner has been disposed");
   }
 
+  async #disposeRecord(record: SessionRecord): Promise<void> {
+    const inflight = record.inflight;
+    if (inflight !== undefined) {
+      inflight.cancelled = true;
+      inflight.controller.abort(new Error("ACP session owner disposed"));
+      inflight.terminal.resolve();
+      record.handle.agent.cancel({ kind: "disposed" });
+      this.#settle(record, inflight);
+    }
+    let handleFailure: { error: unknown } | undefined;
+    await record.handle.dispose().catch((error: unknown) => {
+      handleFailure = { error };
+    });
+    await Promise.allSettled([
+      record.outputTail,
+      ...(inflight === undefined ? [] : [inflight.completion.promise]),
+    ]);
+    if (handleFailure !== undefined) throw handleFailure.error;
+  }
+
   #diagnose(operation: string, sessionId: SessionId | undefined, error: unknown): void {
     const detail = error instanceof Error ? (error.stack ?? error.message) : String(error);
     this.#diagnostics.write(
@@ -581,6 +1173,7 @@ export class DurableSessionAgent implements AcpAgent {
 
   async #dispose(): Promise<void> {
     this.#closed = true;
+    for (const disposeHook of this.#hooks.splice(0).reverse()) disposeHook();
     const transitionOutcomes = await Promise.allSettled([
       ...this.#creations,
       ...this.#loads.values(),
@@ -588,7 +1181,7 @@ export class DurableSessionAgent implements AcpAgent {
     ]);
     const records = [...this.#sessions.values()];
     this.#sessions.clear();
-    const outcomes = await Promise.allSettled(records.map((record) => record.handle.dispose()));
+    const outcomes = await Promise.allSettled(records.map((record) => this.#disposeRecord(record)));
     const failures = [...transitionOutcomes, ...outcomes].flatMap((outcome) =>
       outcome.status === "rejected" ? [outcome.reason] : [],
     );

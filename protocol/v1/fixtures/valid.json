@@ -150,12 +150,38 @@
     }
   },
   {
+    "definition": "askUserQuestionRequest",
+    "value": {
+      "sessionId": "session-1",
+      "questions": [
+        {
+          "id": "plan-1",
+          "text": "Review the plan",
+          "options": [
+            "Approve",
+            "Reject"
+          ],
+          "intent": "plan_review",
+          "approveLabel": "Approve"
+        }
+      ]
+    }
+  },
+  {
     "definition": "sessionStatusNotification",
     "value": {
       "sessionId": "session-1",
       "kind": "retry",
       "attempt": 1,
       "limit": 3
+    }
+  },
+  {
+    "definition": "sessionStatusNotification",
+    "value": {
+      "sessionId": "session-1",
+      "kind": "retry",
+      "attempt": 2
     }
   },
   {

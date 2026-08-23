@@ -896,8 +896,10 @@ export class DurableSessionAgent implements AcpAgent {
       await this.#sendCommands(record);
       return { sessionId: String(sessionId), configOptions: await this.#configOptions(record) };
     } catch (error) {
-      if (this.#sessions.get(sessionId)?.handle === handle) this.#sessions.delete(sessionId);
-      await handle?.dispose().catch((disposeError: unknown) => {
+      const adopted = this.#sessions.get(sessionId)?.handle === handle;
+      await handle?.dispose().then(() => {
+        if (adopted) this.#sessions.delete(sessionId);
+      }).catch((disposeError: unknown) => {
         cleanupFailure = { error: disposeError };
         this.#diagnose("session/new cleanup", sessionId, disposeError);
       });
@@ -1107,8 +1109,10 @@ export class DurableSessionAgent implements AcpAgent {
             }),
           );
           return { provider: { id: provider.id, name: provider.name, models: entries } };
-        } catch (error) {
-          this.#diagnose("deepseek/catalog provider", undefined, error);
+        } catch {
+          this.#diagnostics.write(
+            `sesori-deepseek-acp: deepseek/catalog provider provider=${provider.id} category=unavailable\n`,
+          );
           return {
             failure: {
               providerId: provider.id,
@@ -1174,9 +1178,11 @@ export class DurableSessionAgent implements AcpAgent {
   async setSessionConfigOption(params: SetSessionConfigOptionRequest): Promise<SetSessionConfigOptionResponse> {
     this.#assertOpen();
     if (typeof params.value !== "string") throw invalidParams("DeepSeek config options require a selection value");
-    const record = this.#sessions.get(parseSessionId(params.sessionId));
+    const sessionId = parseSessionId(params.sessionId);
+    const record = this.#sessions.get(sessionId);
     if (record === undefined) throw invalidParams("unknown session");
     const catalog = await this.#catalog();
+    if (this.#sessions.get(sessionId) !== record) throw invalidParams("unknown session");
     const current = record.selection.current;
     if (current === undefined) throw internalError("session has no model selection");
     if (params.configId === MODEL_CONFIG_ID) {
@@ -1271,10 +1277,6 @@ export class DurableSessionAgent implements AcpAgent {
         throw internalError("unable to rename DeepSeek session");
       }
     }
-    if (this.#context.agents.get(sessionId) !== undefined) {
-      throw invalidParams("session is already being used outside this ACP connection");
-    }
-    await this.#inspect(sessionId);
     const transition = Promise.withResolvers<void>();
     void transition.promise.catch(() => undefined);
     this.#loads.set(sessionId, transition.promise);
@@ -1284,51 +1286,60 @@ export class DurableSessionAgent implements AcpAgent {
     let operationFailure: RequestError | undefined;
     let response: Record<string, unknown> | undefined;
     try {
-      handle = await this.#context.agents.resume({
-        resumeSessionId: sessionId,
-        setup: (agentContext) => {
-          selection = this.#installSelection(agentContext);
-        },
-      });
-      if (this.#closed || this.#sessions.has(sessionId)) {
-        throw new Error("adapter ownership changed during session rename");
-      }
-      const renamed = titles.rename(handle.agent.session, params.title as string);
-      if (!(await this.#context.sessions.flush(handle.agent.session))) {
-        throw new Error("session persistence did not participate in rename");
-      }
-      await this.#connection.sessionUpdate({
-        sessionId: String(sessionId),
-        update: { sessionUpdate: "session_info_update", title: renamed.title },
-      });
-      response = this.#renameResponse(renamed.title);
-    } catch (error) {
-      this.#diagnose("deepseek/session/rename", sessionId, error);
-      operationFailure =
-        error instanceof SessionTitleInvalidError
-          ? invalidParams("invalid DeepSeek session title")
-          : internalError("unable to rename DeepSeek session");
-    }
-    await handle?.dispose().catch((error: unknown) => {
-      cleanupFailure = error;
-      this.#diagnose("deepseek/session/rename cleanup", sessionId, error);
-      if (selection !== undefined && !this.#closed && !this.#sessions.has(sessionId)) {
-        this.#sessions.set(sessionId, {
-          handle: handle!,
-          selection,
-          toolCalls: new Map(),
-          outputTail: Promise.resolve(),
-          inflight: undefined,
+      try {
+        if (this.#context.agents.get(sessionId) !== undefined) {
+          throw invalidParams("session is already being used outside this ACP connection");
+        }
+        await this.#inspect(sessionId);
+        handle = await this.#context.agents.resume({
+          resumeSessionId: sessionId,
+          setup: (agentContext) => {
+            selection = this.#installSelection(agentContext);
+          },
         });
+        if (this.#closed || this.#sessions.has(sessionId)) {
+          throw new Error("adapter ownership changed during session rename");
+        }
+        const renamed = titles.rename(handle.agent.session, params.title as string);
+        if (!(await this.#context.sessions.flush(handle.agent.session))) {
+          throw new Error("session persistence did not participate in rename");
+        }
+        await this.#connection.sessionUpdate({
+          sessionId: String(sessionId),
+          update: { sessionUpdate: "session_info_update", title: renamed.title },
+        });
+        response = this.#renameResponse(renamed.title);
+      } catch (error) {
+        this.#diagnose("deepseek/session/rename", sessionId, error);
+        operationFailure =
+          error instanceof SessionTitleInvalidError || error instanceof RequestError
+            ? error instanceof SessionTitleInvalidError
+              ? invalidParams("invalid DeepSeek session title")
+              : error
+            : internalError("unable to rename DeepSeek session");
       }
-    });
-    this.#loads.delete(sessionId);
-    if (cleanupFailure === undefined) transition.resolve();
-    else transition.reject(cleanupFailure);
-    if (cleanupFailure !== undefined) throw internalError("unable to release renamed DeepSeek session");
-    if (operationFailure !== undefined) throw operationFailure;
-    if (response === undefined) throw internalError("DeepSeek rename did not produce a response");
-    return response;
+      await handle?.dispose().catch((error: unknown) => {
+        cleanupFailure = error;
+        this.#diagnose("deepseek/session/rename cleanup", sessionId, error);
+        if (selection !== undefined && !this.#closed && !this.#sessions.has(sessionId)) {
+          this.#sessions.set(sessionId, {
+            handle: handle!,
+            selection,
+            toolCalls: new Map(),
+            outputTail: Promise.resolve(),
+            inflight: undefined,
+          });
+        }
+      });
+      if (cleanupFailure !== undefined) throw internalError("unable to release renamed DeepSeek session");
+      if (operationFailure !== undefined) throw operationFailure;
+      if (response === undefined) throw internalError("DeepSeek rename did not produce a response");
+      return response;
+    } finally {
+      if (this.#loads.get(sessionId) === transition.promise) this.#loads.delete(sessionId);
+      if (cleanupFailure === undefined) transition.resolve();
+      else transition.reject(cleanupFailure);
+    }
   }
 
   #renameResponse(title: string): Record<string, unknown> {
@@ -1373,12 +1384,12 @@ export class DurableSessionAgent implements AcpAgent {
         inflight.command = true;
         inflight.queued = true;
         try {
-          const execution = await commands.execute(
+          const execution = await withAbort(commands.execute(
             record.handle.agent,
             candidate!.line,
             candidate!.images,
             inflight.controller.signal,
-          );
+          ), inflight.controller.signal);
           if (execution === undefined) throw new Error("advertised DeepSeek command disappeared during admission");
           inflight.endReason = { kind: "completed" };
         } catch (error) {

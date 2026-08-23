@@ -739,6 +739,24 @@ describe("durable ACP sessions", () => {
     expect(handle.dispose).toHaveBeenCalledOnce();
   });
 
+  it("retains an adopted new session when failure cleanup disposal fails", async () => {
+    const state = services();
+    state.contextServices.set("commands", {
+      list: () => [{ name: "compact", description: "Compact" }],
+    });
+    const commandUpdate = Promise.withResolvers<void>();
+    state.sessionUpdate.mockReturnValueOnce(commandUpdate.promise);
+    const creating = state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    await expect.poll(() => state.live.size).toBe(1);
+    const [sessionId, handle] = [...state.live.entries()][0]!;
+    vi.mocked(handle.dispose).mockRejectedValueOnce(new Error("synthetic cleanup failure"));
+    commandUpdate.reject(new Error("synthetic command update failure"));
+
+    await expect(creating).rejects.toThrow("unable to create DeepSeek session");
+    await expect(state.agent.closeSession({ sessionId })).resolves.toEqual({});
+    expect(handle.dispose).toHaveBeenCalledTimes(2);
+  });
+
   it("rejects control characters in session ids before diagnostics", async () => {
     const state = services();
 
@@ -1002,7 +1020,8 @@ describe("durable ACP sessions", () => {
       { providerId: "broken", category: "unavailable", message: "Provider catalog unavailable" },
     ]);
     expect(JSON.stringify(catalog)).not.toContain(secret);
-    expect(state.diagnostics.join("\n")).toContain(secret);
+    expect(state.diagnostics.join("\n")).toContain("provider=broken category=unavailable");
+    expect(state.diagnostics.join("\n")).not.toContain(secret);
 
     const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
     expect(created.configOptions?.map((option) => option.id)).toEqual([
@@ -1074,6 +1093,37 @@ describe("durable ACP sessions", () => {
     expect(listProviders).toHaveBeenCalledOnce();
   });
 
+  it("rejects config mutation when ownership changes during catalog lookup", async () => {
+    const state = services();
+    state.contextServices.set("llm", {
+      listProviders: () => [{ id: "provider", name: "Provider" }],
+      listModels: async () => [{ id: "first", name: "First" }, { id: "second", name: "Second" }],
+      resolveModelInfo: async () => ({}),
+    });
+    state.contextServices.set("agentDefaultModel", {
+      currentSelection: () => ({ provider: "provider", model: "first" }),
+    });
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const catalog = await state.agent.extMethod("deepseek/catalog", { cwd: "/project" });
+    const nextModel = (catalog.providers as { models: { id: string }[] }[])[0]!.models[1]!.id;
+    const lookup = Promise.withResolvers<unknown>();
+    state.contextServices.set("llm", {
+      listProviders: () => [{ id: "provider", name: "Provider" }],
+      listModels: () => lookup.promise,
+      resolveModelInfo: async () => ({}),
+    });
+    const changing = state.agent.setSessionConfigOption!({
+      sessionId: created.sessionId,
+      configId: "deepseek.model",
+      value: nextModel,
+    });
+    await Promise.resolve();
+    await state.agent.closeSession({ sessionId: created.sessionId });
+    lookup.resolve([{ id: "second", name: "Second" }]);
+
+    await expect(changing).rejects.toThrow("unknown session");
+  });
+
   it("routes only exact advertised slash commands away from the model", async () => {
     const state = services();
     const execute = vi.fn(async (agent: Agent, _line: string) => {
@@ -1130,6 +1180,25 @@ describe("durable ACP sessions", () => {
     expect(execute).toHaveBeenCalledOnce();
   });
 
+  it("settles cancellation when a command ignores its abort signal", async () => {
+    const state = services();
+    const execution = Promise.withResolvers<unknown>();
+    state.contextServices.set("commands", {
+      list: () => [{ name: "hang", description: "Hang" }],
+      find: () => ({}),
+      execute: () => execution.promise,
+    });
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const prompt = state.agent.prompt({
+      sessionId: created.sessionId,
+      prompt: [{ type: "text", text: "/hang" }],
+    });
+    await Promise.resolve();
+
+    await state.agent.cancel({ sessionId: created.sessionId });
+    await expect(prompt).resolves.toEqual({ stopReason: "cancelled" });
+  });
+
   it("renames live and cold sessions through the title owner", async () => {
     const state = services();
     const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
@@ -1155,6 +1224,41 @@ describe("durable ACP sessions", () => {
     ).resolves.toEqual({ title: "Cold title" });
     expect(state.resume).toHaveBeenCalledWith(expect.objectContaining({ resumeSessionId: "cold-rename" }));
     expect(state.live.has("cold-rename")).toBe(false);
+  });
+
+  it("blocks concurrent operations during cold rename inspection", async () => {
+    const state = services();
+    const meta = header({ id: "rename-inspecting", cwd: "/project" });
+    state.headers.push(meta);
+    state.inspections.set("rename-inspecting", { meta, events: [] });
+    const inspection = Promise.withResolvers<{ meta: SessionHeader; events: readonly SessionEvent[] }>();
+    vi.mocked(state.context.sessionPersistence.inspect).mockReturnValueOnce(inspection.promise);
+    const renaming = state.agent.extMethod("deepseek/session/rename", {
+      sessionId: "rename-inspecting",
+      title: "Cold title",
+    });
+    await expect.poll(() => vi.mocked(state.context.sessionPersistence.inspect).mock.calls.length).toBe(1);
+
+    await expect(
+      state.agent.prompt({ sessionId: "rename-inspecting", prompt: [{ type: "text", text: "question" }] }),
+    ).rejects.toThrow("session load is in progress");
+    inspection.resolve({ meta, events: [] });
+    await expect(renaming).resolves.toEqual({ title: "Cold title" });
+  });
+
+  it("clears cold rename transition after inspection failure so retry works", async () => {
+    const state = services();
+    const meta = header({ id: "rename-retry", cwd: "/project" });
+    state.headers.push(meta);
+    state.inspections.set("rename-retry", { meta, events: [] });
+    vi.mocked(state.context.sessionPersistence.inspect).mockRejectedValueOnce(new Error("synthetic inspect failure"));
+
+    await expect(
+      state.agent.extMethod("deepseek/session/rename", { sessionId: "rename-retry", title: "First" }),
+    ).rejects.toThrow("unable to rename DeepSeek session");
+    await expect(
+      state.agent.extMethod("deepseek/session/rename", { sessionId: "rename-retry", title: "Second" }),
+    ).resolves.toEqual({ title: "Second" });
   });
 
   it("validates cold rename persistence before resuming", async () => {

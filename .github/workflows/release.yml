@@ -1,0 +1,197 @@
+name: Managed runtime release
+
+on:
+  pull_request:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: managed-runtime-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+jobs:
+  cross-repository-conformance:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release contract
+        id: release
+        shell: bash
+        run: |
+          echo "consumer_commit=$(node -p "require('./release/config.json').consumerCommit")" >> "$GITHUB_OUTPUT"
+
+      - name: Verify protocol v1 is unchanged after its consumed source commit
+        shell: bash
+        run: |
+          protocol_source_commit=$(node -p "require('./release/config.json').protocolSourceCommit")
+          git diff --exit-code "$protocol_source_commit" -- protocol
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: sesori-ai/sesori_apps_monorepo
+          ref: ${{ steps.release.outputs.consumer_commit }}
+          path: apps
+
+      - name: Resolve pinned Dart version
+        id: dart-version
+        working-directory: apps
+        shell: bash
+        run: |
+          set -euo pipefail
+          TOOL_SPEC=$(awk '$1 == "flutter" {print $2}' .tool-versions)
+          if [[ "$TOOL_SPEC" == *-* ]]; then
+            FLUTTER_VERSION="${TOOL_SPEC%-*}"
+            CHANNEL="${TOOL_SPEC##*-}"
+          else
+            FLUTTER_VERSION="$TOOL_SPEC"
+            CHANNEL="stable"
+          fi
+          DART_VERSION=$(curl -fsSL https://storage.googleapis.com/flutter_infra_release/releases/releases_linux.json \
+            | jq -r --arg v "$FLUTTER_VERSION" --arg c "$CHANNEL" \
+                '[.releases[] | select(.version == $v and .channel == $c)][0].dart_sdk_version // empty
+                 | if test("\\(build [^)]+\\)")
+                   then capture("\\(build (?<version>[^)]+)\\)").version
+                   else split(" ")[0]
+                   end')
+          test -n "$DART_VERSION"
+          echo "version=${DART_VERSION}" >> "$GITHUB_OUTPUT"
+
+      - uses: dart-lang/setup-dart@65eb853c7ba17dde3be364c3d2858773e7144260 # v1
+        with:
+          sdk: ${{ steps.dart-version.outputs.version }}
+
+      - name: Resolve bridge workspace
+        working-directory: apps/bridge
+        run: dart pub get
+
+      - name: Run vendored consumer conformance
+        working-directory: apps/bridge/sesori_plugin_deepseek
+        run: dart test
+
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: darwin-arm64
+            runner: macos-15
+          - target: darwin-x64
+            runner: macos-15-intel
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
+          - target: linux-x64
+            runner: ubuntu-24.04
+          - target: windows-arm64
+            runner: windows-11-arm
+          - target: windows-x64
+            runner: windows-2025
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.19.0
+          cache: npm
+
+      - run: npm ci
+      - run: npm run check
+
+      - name: Build and smoke relocatable package
+        env:
+          SESORI_RELEASE_TARGET: ${{ matrix.target }}
+          SESORI_RELEASE_OUTPUT: release-output
+        run: npm run release:package
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: package-${{ matrix.target }}
+          path: release-output/
+          if-no-files-found: error
+          retention-days: 14
+
+  verify-release-set:
+    needs: [cross-repository-conformance, package]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.19.0
+          cache: npm
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: package-*
+          path: release-artifacts
+
+      - name: Verify complete six-target set and aggregate checksums
+        run: |
+          mkdir release-checksums
+          npm run release:checksums -- --input release-artifacts --output release-checksums/checksums.txt
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-checksums
+          path: release-checksums/checksums.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    if: github.ref_type == 'tag'
+    needs: verify-release-set
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: package-*
+          path: release-assets
+          merge-multiple: true
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-checksums
+          path: release-assets
+
+      - name: Validate release tag
+        shell: bash
+        run: |
+          test "$GITHUB_REF_NAME" = "v$(node -p "require('./package.json').version")"
+          npm run release:checksums -- --input release-assets --output release-assets/publish-checksums.txt
+          cmp release-assets/checksums.txt release-assets/publish-checksums.txt
+          rm release-assets/publish-checksums.txt
+
+      - name: Publish immutable asset set
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            test "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)" = "true"
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --draft \
+              --verify-tag \
+              --title "Sesori DeepSeek ACP $GITHUB_REF_NAME" \
+              --generate-notes
+          fi
+          gh release upload "$GITHUB_REF_NAME" \
+            --clobber \
+            release-assets/*.tar.gz \
+            release-assets/*.zip \
+            release-assets/checksums.txt
+          test "$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets | length')" -eq 7
+          gh release edit "$GITHUB_REF_NAME" --draft=false

@@ -1,6 +1,6 @@
 # Third-Party Notices
 
-This development scaffold depends on the following third-party projects:
+This adapter depends on the following principal third-party projects:
 
 - DeepSeek Harness, copyright 2026 DeepSeek, MIT License:
   <https://github.com/deepseek-ai/DeepSeek-Harness>
@@ -13,5 +13,7 @@ This development scaffold depends on the following third-party projects:
 - Ajv, copyright Evgeny Poberezkin, MIT License:
   <https://github.com/ajv-validator/ajv>
 
-The complete transitive license inventory for distributed runtime archives is
-generated and verified as part of the release step before any artifact ships.
+Every distributed runtime archive contains its target-specific CycloneDX SBOM,
+complete installed-package notice index, exact license texts, and the official
+Node runtime license. Packaging fails when an installed dependency has no
+redistributable license text.

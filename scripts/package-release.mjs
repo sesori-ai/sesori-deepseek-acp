@@ -49,6 +49,18 @@ function run(command, arguments_, options = {}) {
   return options.capture ? result.stdout : "";
 }
 
+function runNpm(arguments_, options = {}) {
+  const npmCli = process.env.npm_execpath;
+  if (npmCli === undefined) throw new Error("Release packaging must be invoked through npm");
+  return run(process.execPath, [npmCli, ...arguments_], options);
+}
+
+function runPowerShell(script, environment) {
+  run("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], {
+    env: { ...process.env, ...environment },
+  });
+}
+
 export function nodeAssetName({ nodeVersion, target }) {
   const definition = targetDefinitions[target];
   if (definition === undefined) throw new Error(`Unsupported release target: ${target}`);
@@ -103,10 +115,17 @@ async function installOfficialNode({ config, target, temporaryRoot, packageRoot 
   });
 
   const extracted = join(temporaryRoot, "node-extracted");
-  await mkdir(extracted);
-  run("tar", ["-xf", archivePath, "-C", extracted]);
-  const sourceRoot = join(extracted, assetName.replace(/\.(?:tar\.xz|zip)$/u, ""));
   const windows = target.startsWith("windows-");
+  await mkdir(extracted);
+  if (windows) {
+    runPowerShell("Expand-Archive -LiteralPath $env:SESORI_ARCHIVE -DestinationPath $env:SESORI_DESTINATION", {
+      SESORI_ARCHIVE: archivePath,
+      SESORI_DESTINATION: extracted,
+    });
+  } else {
+    run("tar", ["-xf", archivePath, "-C", extracted]);
+  }
+  const sourceRoot = join(extracted, assetName.replace(/\.(?:tar\.xz|zip)$/u, ""));
   const nodeDirectory = join(packageRoot, "node", ...(windows ? [] : ["bin"]));
   await mkdir(nodeDirectory, { recursive: true });
   const sourceExecutable = join(sourceRoot, windows ? "node.exe" : "bin", ...(windows ? [] : ["node"]));
@@ -194,8 +213,7 @@ async function generateThirdPartyInventory(packageRoot) {
 }
 
 async function generateSbom({ packageRoot, config, target }) {
-  const npm = process.platform === "win32" ? "npm.cmd" : "npm";
-  const raw = run(npm, ["sbom", "--omit=dev", "--sbom-format", "cyclonedx"], {
+  const raw = runNpm(["sbom", "--omit=dev", "--sbom-format", "cyclonedx"], {
     cwd: packageRoot,
     capture: true,
   });
@@ -309,7 +327,10 @@ async function archivePackage({ packageRoot, output, adapterVersion, target }) {
   const name = releaseArchiveName({ adapterVersion, target });
   const archive = join(output, name);
   if (target.startsWith("windows-")) {
-    run("tar", ["-a", "-cf", archive, "-C", dirname(packageRoot), basename(packageRoot)]);
+    runPowerShell("Compress-Archive -LiteralPath $env:SESORI_PACKAGE -DestinationPath $env:SESORI_ARCHIVE -CompressionLevel Optimal", {
+      SESORI_PACKAGE: packageRoot,
+      SESORI_ARCHIVE: archive,
+    });
   } else {
     run("tar", ["-czf", archive, "-C", dirname(packageRoot), basename(packageRoot)]);
   }
@@ -318,7 +339,14 @@ async function archivePackage({ packageRoot, output, adapterVersion, target }) {
 
 async function extractArchive({ archive, destination }) {
   await mkdir(destination, { recursive: true });
-  run("tar", ["-xf", archive, "-C", destination]);
+  if (archive.endsWith(".zip")) {
+    runPowerShell("Expand-Archive -LiteralPath $env:SESORI_ARCHIVE -DestinationPath $env:SESORI_DESTINATION", {
+      SESORI_ARCHIVE: archive,
+      SESORI_DESTINATION: destination,
+    });
+  } else {
+    run("tar", ["-xf", archive, "-C", destination]);
+  }
   const entries = await readdir(destination);
   if (entries.length !== 1 || entries[0] !== packageRootName) {
     throw new Error("Release archive must contain exactly one top-level package directory");
@@ -350,7 +378,7 @@ export async function packageRelease({ target, output }) {
   if (packageMetadata.version.includes("-")) throw new Error("Release package version must be stable");
   if (config.deepSeekHarnessVersion !== "0.1.1-rc.2") throw new Error("Unexpected DeepSeek Harness release pin");
 
-  run(process.platform === "win32" ? "npm.cmd" : "npm", ["run", "build"], { cwd: repositoryRoot });
+  runNpm(["run", "build"], { cwd: repositoryRoot });
   const temporaryRoot = await mkdtemp(join(tmpdir(), "sesori-deepseek-release-"));
   try {
     const packageRoot = join(temporaryRoot, packageRootName);
@@ -362,9 +390,8 @@ export async function packageRelease({ target, output }) {
     for (const directory of ["dist", "runtime", "protocol"]) {
       await cp(join(repositoryRoot, directory), join(packageRoot, directory), { recursive: true });
     }
-    const npm = process.platform === "win32" ? "npm.cmd" : "npm";
-    run(npm, ["ci", "--omit=dev"], { cwd: packageRoot });
-    run(npm, ["ls", "--omit=dev", "--all"], { cwd: packageRoot, capture: true });
+    runNpm(["ci", "--omit=dev"], { cwd: packageRoot });
+    runNpm(["ls", "--omit=dev", "--all"], { cwd: packageRoot, capture: true });
     const node = await installOfficialNode({ config, target, temporaryRoot, packageRoot });
     const launcherSource = join(repositoryRoot, "release", "launchers", target.startsWith("windows-") ? `${packageRootName}.cmd` : packageRootName);
     const launcher = launcherPath(packageRoot, target);

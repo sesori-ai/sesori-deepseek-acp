@@ -56,8 +56,11 @@ test("release checksum aggregation rejects missing targets and emits sorted hash
     const output = join(root, "checksums.txt");
     await createChecksumManifest({ input: root, output, adapterVersion: "0.1.0" });
     const lines = (await readFile(output, "utf8")).trim().split("\n");
-    assert.equal(lines.length, 6);
-    assert.deepEqual(lines.map((line) => line.slice(66)), Object.keys(targetDefinitions).sort().map((target) => releaseArchiveName({ adapterVersion: "0.1.0", target })));
+    const expected = Object.keys(targetDefinitions).sort().map((target) => {
+      const name = releaseArchiveName({ adapterVersion: "0.1.0", target });
+      return `${createHash("sha256").update(target).digest("hex")}  ${name}`;
+    });
+    assert.deepEqual(lines, expected);
 
     await rm(join(root, "windows-arm64"), { recursive: true });
     await assert.rejects(

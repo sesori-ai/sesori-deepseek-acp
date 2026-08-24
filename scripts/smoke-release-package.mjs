@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:http";
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -6,12 +6,12 @@ import { createInterface } from "node:readline";
 
 const requestTimeoutMilliseconds = 30_000;
 
-function timeout(promise, operation) {
+function timeout(promise, operation, milliseconds = requestTimeoutMilliseconds) {
   let timer;
   return Promise.race([
     promise,
     new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`Timed out during packaged ${operation}`)), requestTimeoutMilliseconds);
+      timer = setTimeout(() => reject(new Error(`Timed out during packaged ${operation}`)), milliseconds);
     }),
   ]).finally(() => clearTimeout(timer));
 }
@@ -43,6 +43,7 @@ function startAcpProcess({ launcher, target, stateDir, environment, cwd }) {
   let nextId = 1;
   let stderr = "";
   let protocolFailure;
+  let stopping;
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (chunk) => {
     stderr += chunk;
@@ -83,10 +84,29 @@ function startAcpProcess({ launcher, target, stateDir, environment, cwd }) {
       return timeout(response, method);
     },
     async stop() {
-      child.stdin.end();
-      const exit = await timeout(new Promise((resolve) => child.once("exit", (code, signal) => resolve({ code, signal }))), "shutdown");
-      if (protocolFailure !== undefined) throw protocolFailure;
-      if (exit.code !== 0) throw new Error(`Packaged ACP shutdown failed: ${JSON.stringify(exit)} stderr=${stderr}`);
+      stopping ??= (async () => {
+        const exitPromise = child.exitCode === null
+          ? new Promise((resolve) => child.once("exit", (code, signal) => resolve({ code, signal })))
+          : Promise.resolve({ code: child.exitCode, signal: child.signalCode });
+        if (!child.stdin.destroyed) child.stdin.end();
+        let exit;
+        try {
+          exit = await timeout(exitPromise, "shutdown", 5_000);
+        } catch (error) {
+          if (child.exitCode === null) {
+            if (target.startsWith("windows-")) {
+              spawnSync("taskkill.exe", ["/pid", String(child.pid), "/t", "/f"], { stdio: "ignore" });
+            } else {
+              child.kill("SIGKILL");
+            }
+          }
+          await timeout(exitPromise, "forced shutdown", 5_000).catch(() => undefined);
+          throw error;
+        }
+        if (protocolFailure !== undefined) throw protocolFailure;
+        if (exit.code !== 0) throw new Error(`Packaged ACP shutdown failed: ${JSON.stringify(exit)} stderr=${stderr}`);
+      })();
+      await stopping;
     },
   };
 }
@@ -220,11 +240,13 @@ export async function smokeAcpLifecycle({ launcher, target, packageRoot, tempora
   ].join("\n");
   await writeFile(join(home, "settings.yaml"), settings);
   const isolatedEnvironment = { ...environment, DSH_HOME: home, DEEPSEEK_API_KEY: "fixture-key" };
+  let first;
+  let restarted;
   try {
-    const first = startAcpProcess({ launcher, target, stateDir, environment: isolatedEnvironment, cwd: packageRoot });
+    first = startAcpProcess({ launcher, target, stateDir, environment: isolatedEnvironment, cwd: packageRoot });
     const sessionId = await exerciseFirstProcess({ client: first, workspace });
     await first.stop();
-    const restarted = startAcpProcess({ launcher, target, stateDir, environment: isolatedEnvironment, cwd: packageRoot });
+    restarted = startAcpProcess({ launcher, target, stateDir, environment: isolatedEnvironment, cwd: packageRoot });
     await exerciseRestart({ client: restarted, workspace, sessionId });
     await restarted.stop();
     provider.verify();
@@ -233,6 +255,7 @@ export async function smokeAcpLifecycle({ launcher, target, packageRoot, tempora
     expect(JSON.stringify(homeEntries) === JSON.stringify([".anonymous-user-id", "settings.yaml"]), `Packaged runtime wrote unexpected state into DSH_HOME: ${homeEntries.join(", ")}`);
     expect(/^[0-9a-f-]{36}\n$/iu.test(await readFile(join(home, ".anonymous-user-id"), "utf8")), "Packaged runtime wrote an invalid upstream anonymous id");
   } finally {
+    await Promise.allSettled([first?.stop(), restarted?.stop()].filter((operation) => operation !== undefined));
     await provider.close();
   }
 }

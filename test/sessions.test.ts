@@ -155,8 +155,10 @@ function services(): SessionServices {
       list: vi.fn(async () => [...headers]),
       inspect: vi.fn(async (id: string) => {
         const inspection = inspections.get(id);
-        if (inspection === undefined) throw new Error("not found");
-        return inspection;
+        if (inspection !== undefined) return inspection;
+        const meta = headers.find((candidate) => candidate.id === id);
+        if (meta === undefined) throw new Error("not found");
+        return { meta, events: [] };
       }),
     },
     get: (name: string) => contextServices.get(name) ?? (context as unknown as Record<string, unknown>)[name],
@@ -332,6 +334,31 @@ describe("durable ACP sessions", () => {
     await expect(state.agent.listSessions({ cwd: "relative" })).rejects.toThrow(
       "cwd filter must be an absolute bounded path",
     );
+  });
+
+  it("lists persisted titles for only the current page without resuming sessions", async () => {
+    const state = services();
+    for (let index = 0; index < 101; index += 1) {
+      const meta = header({ id: `titled-${String(index).padStart(3, "0")}`, cwd: "/project", createdAt: index });
+      state.headers.push(meta);
+      state.inspections.set(String(meta.id), {
+        meta,
+        events: [{
+          type: "session/title",
+          seq: 0,
+          time: index + 1_000,
+          data: { title: `Title ${index}`, messageSeqs: [], source: { kind: "user" } },
+        }] as SessionEvent[],
+      });
+    }
+
+    const listed = await state.agent.listSessions({});
+
+    expect(listed.sessions).toHaveLength(100);
+    expect(listed.sessions[0]).toEqual(expect.objectContaining({ title: "Title 100", updatedAt: new Date(1_100).toISOString() }));
+    expect(state.context.sessionPersistence.inspect).toHaveBeenCalledTimes(100);
+    expect(state.context.sessionPersistence.inspect).not.toHaveBeenCalledWith("titled-000");
+    expect(state.resume).not.toHaveBeenCalled();
   });
 
   it("paginates session headers with an opaque stable cursor", async () => {
@@ -1079,6 +1106,28 @@ describe("durable ACP sessions", () => {
     ).rejects.toThrow("unknown DeepSeek reasoning effort");
   });
 
+  it("classifies a provider with oversized generated selection ids as unavailable", async () => {
+    const state = services();
+    state.contextServices.set("llm", {
+      listProviders: () => [
+        { id: "oversized", name: "Oversized" },
+        { id: "working", name: "Working" },
+      ],
+      listModels: async (provider: string) => [{ id: provider === "oversized" ? "x".repeat(512) : "model", name: "Model" }],
+      resolveModelInfo: async () => ({}),
+    });
+    state.contextServices.set("agentDefaultModel", {
+      currentSelection: () => ({ provider: "working", model: "model" }),
+    });
+
+    const catalog = await state.agent.extMethod("deepseek/catalog", { cwd: "/project" });
+
+    expect(catalog.providers).toEqual([expect.objectContaining({ id: "working" })]);
+    expect(catalog.failures).toEqual([
+      { providerId: "oversized", category: "unavailable", message: "Provider catalog unavailable" },
+    ]);
+  });
+
   it("rejects oversized opaque model selections before decoding", async () => {
     const state = services();
     const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
@@ -1138,6 +1187,59 @@ describe("durable ACP sessions", () => {
     });
 
     expect(listProviders).toHaveBeenCalledOnce();
+  });
+
+  it("rejects config mutation while a prompt is in flight before and after catalog lookup", async () => {
+    const state = services();
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const execution = Promise.withResolvers<unknown>();
+    state.contextServices.set("commands", {
+      list: () => [{ name: "hold", description: "Hold" }],
+      find: () => ({}),
+      execute: () => execution.promise,
+    });
+    const prompting = state.agent.prompt({
+      sessionId: created.sessionId,
+      prompt: [{ type: "text", text: "/hold" }],
+    });
+    await Promise.resolve();
+
+    await expect(state.agent.setSessionConfigOption!({
+      sessionId: created.sessionId,
+      configId: "deepseek.model",
+      value: "unknown",
+    })).rejects.toThrow("a prompt is in flight for this session");
+
+    execution.resolve({});
+    state.invoke("command/done", state.live.get(created.sessionId)!.agent, { kind: "completed" });
+    await prompting;
+
+    const lookup = Promise.withResolvers<unknown>();
+    state.contextServices.set("llm", {
+      listProviders: () => [{ id: "provider", name: "Provider" }],
+      listModels: () => lookup.promise,
+      resolveModelInfo: async () => ({}),
+    });
+    const changing = state.agent.setSessionConfigOption!({
+      sessionId: created.sessionId,
+      configId: "deepseek.model",
+      value: "unknown",
+    });
+    await Promise.resolve();
+    const secondExecution = Promise.withResolvers<unknown>();
+    state.contextServices.set("commands", {
+      list: () => [{ name: "hold", description: "Hold" }],
+      find: () => ({}),
+      execute: () => secondExecution.promise,
+    });
+    const secondPrompt = state.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "/hold" }] });
+    await Promise.resolve();
+    lookup.resolve([]);
+
+    await expect(changing).rejects.toThrow("a prompt is in flight for this session");
+    secondExecution.resolve({});
+    state.invoke("command/done", state.live.get(created.sessionId)!.agent, { kind: "completed" });
+    await secondPrompt;
   });
 
   it("rejects config mutation while session load starts during catalog lookup", async () => {

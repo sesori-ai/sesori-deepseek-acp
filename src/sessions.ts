@@ -167,7 +167,9 @@ interface SessionRecord {
 }
 
 function selectionId(selection: Pick<ModelSelection, "provider" | "model">): string {
-  return `v1${Buffer.from(JSON.stringify([selection.provider, selection.model])).toString("base64url")}`;
+  const id = `v1${Buffer.from(JSON.stringify([selection.provider, selection.model])).toString("base64url")}`;
+  if (id.length > 512) throw new Error("DeepSeek model selection id exceeds protocol bounds");
+  return id;
 }
 
 function decodeSelectionId(value: string): Pick<ModelSelection, "provider" | "model"> | undefined {
@@ -851,8 +853,9 @@ export class DurableSessionAgent implements AcpAgent {
         .sort(compareHeaders)
         .filter((header) => cursor === undefined || afterCursor(header, cursor));
       const page = filtered.slice(0, LIST_PAGE_SIZE);
+      const inspections = await Promise.all(page.map((header) => this.#context.sessionPersistence.inspect(header.id)));
       return {
-        sessions: page.map((header) => sessionInfo({ header })),
+        sessions: inspections.map((inspection) => sessionInfo({ header: inspection.meta, events: inspection.events })),
         ...(filtered.length > LIST_PAGE_SIZE && page.at(-1) !== undefined
           ? { nextCursor: encodeCursor(page.at(-1) as SessionHeader) }
           : {}),
@@ -1193,9 +1196,11 @@ export class DurableSessionAgent implements AcpAgent {
     if (this.#loads.has(sessionId)) throw invalidParams("session load is in progress");
     const record = this.#sessions.get(sessionId);
     if (record === undefined) throw invalidParams("unknown session");
+    if (record.inflight !== undefined) throw invalidParams("a prompt is in flight for this session");
     const catalog = await this.#catalog();
     if (this.#loads.has(sessionId)) throw invalidParams("session load is in progress");
     if (this.#sessions.get(sessionId) !== record) throw invalidParams("unknown session");
+    if (record.inflight !== undefined) throw invalidParams("a prompt is in flight for this session");
     const current = record.selection.current;
     if (current === undefined) throw internalError("session has no model selection");
     if (params.configId === MODEL_CONFIG_ID) {

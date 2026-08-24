@@ -39,7 +39,22 @@ jobs:
 
       - name: Resolve pinned Dart version
         id: dart-version
-        uses: ./apps/.github/actions/resolve-flutter-dart-version
+        working-directory: apps
+        shell: bash
+        run: |
+          set -euo pipefail
+          TOOL_SPEC=$(awk '$1 == "flutter" {print $2}' .tool-versions)
+          FLUTTER_VERSION="${TOOL_SPEC%-*}"
+          CHANNEL="${TOOL_SPEC##*-}"
+          DART_VERSION=$(curl -fsSL https://storage.googleapis.com/flutter_infra_release/releases/releases_linux.json \
+            | jq -r --arg v "$FLUTTER_VERSION" --arg c "$CHANNEL" \
+                '[.releases[] | select(.version == $v and .channel == $c)][0].dart_sdk_version // empty
+                 | if test("\\(build [^)]+\\)")
+                   then capture("\\(build (?<version>[^)]+)\\)").version
+                   else split(" ")[0]
+                   end')
+          test -n "$DART_VERSION"
+          echo "version=${DART_VERSION}" >> "$GITHUB_OUTPUT"
 
       - uses: dart-lang/setup-dart@65eb853c7ba17dde3be364c3d2858773e7144260 # v1
         with:

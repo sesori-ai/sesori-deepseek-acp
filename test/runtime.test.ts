@@ -1,6 +1,6 @@
 import { cp, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, relative, sep } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { PassThrough } from "node:stream";
 import { PROTOCOL_VERSION, type AgentSideConnection, type SessionNotification } from "@agentclientprotocol/sdk";
 import { defaultDshHome, resolveDshHome } from "@deepseek-ai/dsh-home-paths";
@@ -34,24 +34,26 @@ afterEach(async () => {
 
 describe("DeepSeek runtime composition", () => {
   it("isolates mutable state and fixes deployment policy", () => {
+    const stateDir = resolve("synthetic-state");
+    const workspaceRoot = resolve("synthetic-project-a");
     const profile = composeRuntimeProfile({
-      stateDir: "/synthetic/state",
-      workspaceRoot: "/synthetic/project-a",
+      stateDir,
+      workspaceRoot,
     });
     const entries = new Map(profile.entries.map((entry) => [entry.id, entry]));
 
     expect(profile.paths).toEqual({
-      stateDir: "/synthetic/state",
-      sessions: "/synthetic/state/sessions",
-      attachmentsHome: "/synthetic/state/attachments-home",
-      queryDatabase: "/synthetic/state/query/sessions.sqlite",
-      spills: "/synthetic/state/spills",
+      stateDir,
+      sessions: join(stateDir, "sessions"),
+      attachmentsHome: join(stateDir, "attachments-home"),
+      queryDatabase: join(stateDir, "query", "sessions.sqlite"),
+      spills: join(stateDir, "spills"),
     });
     expect(entries.get("session-telemetry-otel")?.disabled).toBe(true);
     expect(entries.get("hmr")?.disabled).toBe(true);
     expect(entries.get("sandbox-policy")?.config).toEqual({
       mode: "workspace-write",
-      workspaceRoot: "/synthetic/project-a",
+      workspaceRoot,
     });
     expect(entries.get("approval")?.config).toEqual({ policy: "ask" });
     expect(entries.get("settings")?.config).toBeUndefined();

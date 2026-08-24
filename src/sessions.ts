@@ -45,7 +45,7 @@ import {
 } from "@deepseek-ai/dsh-session";
 import { isAppendSurfaceEvent } from "@deepseek-ai/dsh-session/surface";
 import type { SessionInspection } from "@deepseek-ai/dsh-session-persistence";
-import { foldSessionTitle, SessionTitleInvalidError } from "@deepseek-ai/dsh-session-title";
+import { SessionTitleInvalidError } from "@deepseek-ai/dsh-session-title";
 import { createInitializeResponse, INITIALIZE_METADATA_KEY } from "./protocol.js";
 import { validateProtocolValue } from "./schema.js";
 
@@ -371,21 +371,15 @@ function headerMetadata(header: SessionHeader): Record<string, unknown> {
   };
 }
 
-function sessionInfo(args: {
-  header: SessionHeader;
-  events?: readonly SessionEvent[];
-}): SessionInfo {
-  if (args.header.cwd === undefined || !isAbsolute(args.header.cwd)) {
+function sessionInfo(header: SessionHeader): SessionInfo {
+  if (header.cwd === undefined || !isAbsolute(header.cwd)) {
     throw internalError("persisted session has no valid working directory");
   }
-  const title = args.events === undefined ? undefined : foldSessionTitle(args.events);
-  const updatedAt = args.events?.at(-1)?.time ?? title?.updatedAt ?? args.header.createdAt;
   return {
-    sessionId: String(args.header.id),
-    cwd: args.header.cwd,
-    updatedAt: new Date(updatedAt).toISOString(),
-    ...(title === undefined ? {} : { title: title.title }),
-    _meta: { [INITIALIZE_METADATA_KEY]: headerMetadata(args.header) },
+    sessionId: String(header.id),
+    cwd: header.cwd,
+    updatedAt: new Date(header.createdAt).toISOString(),
+    _meta: { [INITIALIZE_METADATA_KEY]: headerMetadata(header) },
   };
 }
 
@@ -853,9 +847,8 @@ export class DurableSessionAgent implements AcpAgent {
         .sort(compareHeaders)
         .filter((header) => cursor === undefined || afterCursor(header, cursor));
       const page = filtered.slice(0, LIST_PAGE_SIZE);
-      const inspections = await Promise.all(page.map((header) => this.#context.sessionPersistence.inspect(header.id)));
       return {
-        sessions: inspections.map((inspection) => sessionInfo({ header: inspection.meta, events: inspection.events })),
+        sessions: page.map(sessionInfo),
         ...(filtered.length > LIST_PAGE_SIZE && page.at(-1) !== undefined
           ? { nextCursor: encodeCursor(page.at(-1) as SessionHeader) }
           : {}),
@@ -899,7 +892,11 @@ export class DurableSessionAgent implements AcpAgent {
       };
       this.#sessions.set(sessionId, record);
       await this.#sendCommands(record);
-      return { sessionId: String(sessionId), configOptions: await this.#configOptions(record) };
+      const configOptions = await this.#configOptions(record);
+      if (this.#closed || this.#sessions.get(sessionId) !== record) {
+        throw new Error("adapter ownership changed during session creation");
+      }
+      return { sessionId: String(sessionId), configOptions };
     } catch (error) {
       const adopted = this.#sessions.get(sessionId)?.handle === handle;
       await handle?.dispose().then(() => {
@@ -984,7 +981,7 @@ export class DurableSessionAgent implements AcpAgent {
       for (const update of updates) await this.#connection.sessionUpdate(update);
       const record = this.#sessions.get(sessionId);
       if (record === undefined) throw new Error("loaded session was not adopted");
-      await this.#sendCommands(record);
+      await this.#sendCommands(record, true);
       return { configOptions: await this.#configOptions(record) };
     } catch (error) {
       if ((adopted || resumed) && handle !== undefined) {
@@ -1073,9 +1070,9 @@ export class DurableSessionAgent implements AcpAgent {
     return selection;
   }
 
-  #sendCommands(record: SessionRecord): Promise<void> {
+  #sendCommands(record: SessionRecord, emitEmpty = false): Promise<void> {
     const availableCommands = this.#commands(record.handle.agent);
-    if (availableCommands.length === 0) return Promise.resolve();
+    if (!emitEmpty && availableCommands.length === 0) return Promise.resolve();
     return this.#connection.sessionUpdate({
       sessionId: String(record.handle.agent.id),
       update: { sessionUpdate: "available_commands_update", availableCommands },
@@ -1102,10 +1099,18 @@ export class DurableSessionAgent implements AcpAgent {
       | { currentSelection(): ModelSelection }
       | undefined;
     if (llm === undefined || defaults === undefined) throw new Error("model catalog services are unavailable");
+    let descriptors: ReturnType<typeof llm.listProviders>;
+    try {
+      descriptors = llm.listProviders();
+    } catch {
+      this.#diagnostics.write("sesori-deepseek-acp: deepseek/catalog providers category=unavailable\n");
+      throw new Error("DeepSeek provider catalog unavailable");
+    }
     const providers = await Promise.all(
-      llm.listProviders().map(async (provider) => {
+      descriptors.map(async (provider) => {
         try {
           const models = await llm.listModels(provider.id);
+          if (models.length > 256) throw new Error("provider model catalog exceeds protocol bounds");
           const entries: CatalogModel[] = await Promise.all(
             models.map(async (model) => {
               const resolved = await llm.resolveModelInfo(provider.id, model.id);

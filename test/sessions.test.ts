@@ -336,7 +336,7 @@ describe("durable ACP sessions", () => {
     );
   });
 
-  it("lists persisted titles for only the current page without resuming sessions", async () => {
+  it("lists only bounded headers and accepts omitted persisted titles", async () => {
     const state = services();
     for (let index = 0; index < 101; index += 1) {
       const meta = header({ id: `titled-${String(index).padStart(3, "0")}`, cwd: "/project", createdAt: index });
@@ -355,9 +355,8 @@ describe("durable ACP sessions", () => {
     const listed = await state.agent.listSessions({});
 
     expect(listed.sessions).toHaveLength(100);
-    expect(listed.sessions[0]).toEqual(expect.objectContaining({ title: "Title 100", updatedAt: new Date(1_100).toISOString() }));
-    expect(state.context.sessionPersistence.inspect).toHaveBeenCalledTimes(100);
-    expect(state.context.sessionPersistence.inspect).not.toHaveBeenCalledWith("titled-000");
+    expect(listed.sessions[0]).not.toHaveProperty("title");
+    expect(state.context.sessionPersistence.inspect).not.toHaveBeenCalled();
     expect(state.resume).not.toHaveBeenCalled();
   });
 
@@ -452,6 +451,10 @@ describe("durable ACP sessions", () => {
           messageId: projectedAssistantId,
           content: { type: "text", text: "answer" },
         },
+      },
+      {
+        sessionId: "cold",
+        update: { sessionUpdate: "available_commands_update", availableCommands: [] },
       },
     ]);
 
@@ -793,6 +796,24 @@ describe("durable ACP sessions", () => {
     expect(handle.dispose).toHaveBeenCalledOnce();
   });
 
+  it("cleans up when owner disposal wins after new-session output", async () => {
+    const state = services();
+    const output = Promise.withResolvers<void>();
+    state.contextServices.set("commands", {
+      list: () => [{ name: "compact", description: "Compact" }],
+    });
+    state.sessionUpdate.mockReturnValueOnce(output.promise);
+    const creating = state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    await expect.poll(() => state.sessionUpdate.mock.calls.length).toBe(1);
+
+    const disposal = state.agent.dispose();
+    output.resolve();
+
+    await expect(creating).rejects.toThrow("unable to create DeepSeek session");
+    await disposal;
+    expect(state.live.size).toBe(0);
+  });
+
   it("retains an adopted new session when failure cleanup disposal fails", async () => {
     const state = services();
     state.contextServices.set("commands", {
@@ -1106,6 +1127,42 @@ describe("durable ACP sessions", () => {
     ).rejects.toThrow("unknown DeepSeek reasoning effort");
   });
 
+  it("sanitizes provider enumeration failures", async () => {
+    const state = services();
+    const secret = "SENTINEL_PROVIDER_ENUMERATION";
+    state.contextServices.set("llm", {
+      listProviders: () => {
+        throw new Error(secret);
+      },
+    });
+
+    await expect(state.agent.extMethod("deepseek/catalog", { cwd: "/project" })).rejects.toThrow();
+
+    expect(state.diagnostics.join("\n")).toContain("deepseek/catalog providers category=unavailable");
+    expect(state.diagnostics.join("\n")).not.toContain(secret);
+  });
+
+  it("classifies a provider with more than 256 models as unavailable", async () => {
+    const state = services();
+    state.contextServices.set("llm", {
+      listProviders: () => [
+        { id: "oversized", name: "Oversized" },
+        { id: "working", name: "Working" },
+      ],
+      listModels: async (provider: string) => provider === "oversized"
+        ? Array.from({ length: 257 }, (_, index) => ({ id: `model-${index}`, name: `Model ${index}` }))
+        : [{ id: "model", name: "Model" }],
+      resolveModelInfo: async () => ({}),
+    });
+
+    const catalog = await state.agent.extMethod("deepseek/catalog", { cwd: "/project" });
+
+    expect(catalog.providers).toEqual([expect.objectContaining({ id: "working" })]);
+    expect(catalog.failures).toEqual([
+      { providerId: "oversized", category: "unavailable", message: "Provider catalog unavailable" },
+    ]);
+  });
+
   it("classifies a provider with oversized generated selection ids as unavailable", async () => {
     const state = services();
     state.contextServices.set("llm", {
@@ -1323,6 +1380,20 @@ describe("durable ACP sessions", () => {
     lookup.resolve([{ id: "second", name: "Second" }]);
 
     await expect(changing).rejects.toThrow("unknown session");
+  });
+
+  it("clears stale commands when a loaded session has none", async () => {
+    const state = services();
+    const meta = header({ id: "no-commands", cwd: "/project" });
+    state.headers.push(meta);
+    state.inspections.set("no-commands", { meta, events: [] });
+
+    await state.agent.loadSession({ sessionId: "no-commands", cwd: "/project", mcpServers: [] });
+
+    expect(state.updates).toContainEqual({
+      sessionId: "no-commands",
+      update: { sessionUpdate: "available_commands_update", availableCommands: [] },
+    });
   });
 
   it("routes only exact advertised slash commands away from the model", async () => {

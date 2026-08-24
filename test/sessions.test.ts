@@ -561,6 +561,28 @@ describe("durable ACP sessions", () => {
     expect(state.live.has("raced")).toBe(false);
   });
 
+  it("cleans up when owner disposal wins during loaded config discovery", async () => {
+    const state = services();
+    const meta = header({ id: "load-config-race", cwd: "/project" });
+    state.headers.push(meta);
+    state.inspections.set("load-config-race", { meta, events: [] });
+    const lookup = Promise.withResolvers<unknown>();
+    state.contextServices.set("llm", {
+      listProviders: () => [{ id: "provider", name: "Provider" }],
+      listModels: () => lookup.promise,
+      resolveModelInfo: async () => ({}),
+    });
+
+    const loading = state.agent.loadSession({ sessionId: "load-config-race", cwd: "/project", mcpServers: [] });
+    await expect.poll(() => state.resume.mock.calls.length).toBe(1);
+    const disposal = state.agent.dispose();
+    lookup.resolve([{ id: "model", name: "Model" }]);
+
+    await expect(loading).rejects.toThrow("unable to load DeepSeek session");
+    await disposal;
+    expect(state.live.has("load-config-race")).toBe(false);
+  });
+
   it("reports failed resumed-handle cleanup through owner disposal", async () => {
     const state = services();
     const meta = header({ id: "failed-cleanup", cwd: "/project" });
@@ -597,7 +619,7 @@ describe("durable ACP sessions", () => {
     expect(state.diagnostics.join("\n")).toContain("synthetic load cleanup failure");
   });
 
-  it("retains an adopted load record when command delivery fails and cleanup disposal fails", async () => {
+  it("degrades command enumeration failure while loading", async () => {
     const state = services();
     const meta = header({ id: "load-cleanup", cwd: "/project" });
     state.headers.push(meta);
@@ -616,12 +638,10 @@ describe("durable ACP sessions", () => {
 
     await expect(
       state.agent.loadSession({ sessionId: "load-cleanup", cwd: "/project", mcpServers: [] }),
-    ).rejects.toThrow("unable to load DeepSeek session");
-    const handle = state.live.get("load-cleanup")!;
-
-    await expect(state.agent.closeSession({ sessionId: "load-cleanup" })).resolves.toEqual({});
-    expect(handle.dispose).toHaveBeenCalledTimes(2);
-    expect(state.live.has("load-cleanup")).toBe(false);
+    ).resolves.toEqual({ configOptions: [] });
+    expect(state.live.has("load-cleanup")).toBe(true);
+    expect(state.diagnostics.join("\n")).toContain("commands/list category=unavailable");
+    expect(state.diagnostics.join("\n")).not.toContain("synthetic command failure");
   });
 
   it("makes close wait for an in-flight load ownership transition", async () => {
@@ -1163,6 +1183,24 @@ describe("durable ACP sessions", () => {
     ]);
   });
 
+  it("classifies nested provider schema violations independently", async () => {
+    const state = services();
+    state.contextServices.set("llm", {
+      listProviders: () => [{ id: "broken", name: "Broken" }, { id: "working", name: "Working" }],
+      listModels: async () => [{ id: "model", name: "Model" }],
+      resolveModelInfo: async (provider: string) => provider === "broken"
+        ? { reasoning: { efforts: [{ id: "low" }, { id: "low" }], defaultEffort: "low" } }
+        : {},
+    });
+
+    const catalog = await state.agent.extMethod("deepseek/catalog", { cwd: "/project" });
+
+    expect(catalog.providers).toEqual([expect.objectContaining({ id: "working" })]);
+    expect(catalog.failures).toEqual([
+      { providerId: "broken", category: "unavailable", message: "Provider catalog unavailable" },
+    ]);
+  });
+
   it("classifies a provider with oversized generated selection ids as unavailable", async () => {
     const state = services();
     state.contextServices.set("llm", {
@@ -1382,6 +1420,47 @@ describe("durable ACP sessions", () => {
     await expect(changing).rejects.toThrow("unknown session");
   });
 
+  it("degrades malformed command discovery without leaking diagnostics", async () => {
+    const state = services();
+    const secret = "SENTINEL_COMMAND_DISCOVERY";
+    state.contextServices.set("commands", {
+      list: () => [{ name: "bad command", description: secret }],
+      find: () => undefined,
+    });
+
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const catalog = await state.agent.extMethod("deepseek/catalog", { cwd: "/project" });
+    state.invoke("commands/change");
+    await expect.poll(() => state.updates.length).toBe(1);
+
+    expect(created.configOptions).toEqual([]);
+    expect(catalog.commands).toEqual([]);
+    expect(state.updates.at(-1)).toMatchObject({
+      update: { sessionUpdate: "available_commands_update", availableCommands: [] },
+    });
+    expect(state.diagnostics.join("\n")).toContain("commands/list category=unavailable");
+    expect(state.diagnostics.join("\n")).not.toContain(secret);
+  });
+
+  it("sanitizes command enumeration exceptions across session paths", async () => {
+    const state = services();
+    const secret = "SENTINEL_COMMAND_ENUMERATION";
+    state.contextServices.set("commands", {
+      list: () => {
+        throw new Error(secret);
+      },
+      find: () => undefined,
+    });
+
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    await state.agent.loadSession({ sessionId: created.sessionId, cwd: "/project", mcpServers: [] });
+    state.invoke("commands/change");
+    await Promise.resolve();
+
+    expect(state.diagnostics.join("\n")).toContain("commands/list category=unavailable");
+    expect(state.diagnostics.join("\n")).not.toContain(secret);
+  });
+
   it("clears stale commands when a loaded session has none", async () => {
     const state = services();
     const meta = header({ id: "no-commands", cwd: "/project" });
@@ -1568,6 +1647,21 @@ describe("durable ACP sessions", () => {
       }),
     ).rejects.toThrow("unknown session");
     expect(state.resume).not.toHaveBeenCalled();
+  });
+
+  it("returns a persisted live rename when queued update delivery fails", async () => {
+    const state = services();
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    state.sessionUpdate.mockRejectedValueOnce(new Error("synthetic live rename update failure"));
+
+    await expect(
+      state.agent.extMethod("deepseek/session/rename", {
+        sessionId: created.sessionId,
+        title: "Persisted live title",
+      }),
+    ).resolves.toEqual({ title: "Persisted live title" });
+    expect(state.diagnostics.join("\n")).toContain("deepseek/session/rename update");
+    expect(state.diagnostics.join("\n")).toContain("synthetic live rename update failure");
   });
 
   it("returns a persisted cold rename when update delivery fails", async () => {

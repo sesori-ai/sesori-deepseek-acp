@@ -982,7 +982,11 @@ export class DurableSessionAgent implements AcpAgent {
       const record = this.#sessions.get(sessionId);
       if (record === undefined) throw new Error("loaded session was not adopted");
       await this.#sendCommands(record, true);
-      return { configOptions: await this.#configOptions(record) };
+      const configOptions = await this.#configOptions(record);
+      if (this.#closed || this.#sessions.get(sessionId) !== record) {
+        throw new Error("adapter ownership changed during session load");
+      }
+      return { configOptions };
     } catch (error) {
       if ((adopted || resumed) && handle !== undefined) {
         await handle.dispose().then(() => {
@@ -1080,17 +1084,33 @@ export class DurableSessionAgent implements AcpAgent {
   }
 
   #commands(agent?: Agent): { name: string; description: string; input?: { hint: string } }[] {
-    const commands = this.#context.get("commands") as
-      | { list(agent: Agent): readonly { name: string; description: string; input?: { hint: string } }[] }
-      | undefined;
-    if (commands === undefined) throw new Error("command service is unavailable");
-    // The pinned registry treats an absent scope as its global command view.
-    const descriptors = commands.list(agent ?? (undefined as unknown as Agent));
-    return descriptors.map((command) => ({
-      name: command.name,
-      description: command.description,
-      ...(command.input === undefined ? {} : { input: { hint: command.input.hint } }),
-    }));
+    try {
+      const commands = this.#context.get("commands") as
+        | { list(agent: Agent): readonly { name: string; description: string; input?: { hint: string } }[] }
+        | undefined;
+      if (commands === undefined) throw new Error("command service is unavailable");
+      // The pinned registry treats an absent scope as its global command view.
+      const descriptors = commands.list(agent ?? (undefined as unknown as Agent));
+      const catalogCommands = descriptors.map((command) => ({ name: command.name, description: command.description }));
+      if (!validateProtocolValue({
+        definition: "catalogResponse",
+        value: {
+          agent: { id: "deepseek", name: "DeepSeek", primary: true },
+          providers: [],
+          defaultSelectionId: null,
+          commands: catalogCommands,
+          failures: [],
+        },
+      }).valid) throw new Error("command catalog exceeds protocol bounds");
+      return descriptors.map((command) => ({
+        name: command.name,
+        description: command.description,
+        ...(command.input === undefined ? {} : { input: { hint: command.input.hint } }),
+      }));
+    } catch {
+      this.#diagnostics.write("sesori-deepseek-acp: commands/list category=unavailable\n");
+      return [];
+    }
   }
 
   async #catalog(): Promise<CatalogResponse> {
@@ -1127,7 +1147,18 @@ export class DurableSessionAgent implements AcpAgent {
               };
             }),
           );
-          return { provider: { id: provider.id, name: provider.name, models: entries } };
+          const completed = { id: provider.id, name: provider.name, models: entries };
+          if (!validateProtocolValue({
+            definition: "catalogResponse",
+            value: {
+              agent: { id: "deepseek", name: "DeepSeek", primary: true },
+              providers: [completed],
+              defaultSelectionId: null,
+              commands: [],
+              failures: [],
+            },
+          }).valid) throw new Error("provider catalog exceeds protocol bounds");
+          return { provider: completed };
         } catch {
           this.#diagnostics.write(
             `sesori-deepseek-acp: deepseek/catalog provider provider=${JSON.stringify(provider.id)} category=unavailable\n`,
@@ -1302,7 +1333,9 @@ export class DurableSessionAgent implements AcpAgent {
         if (!(await this.#context.sessions.flush(record.handle.agent.session))) {
           throw new Error("session persistence did not participate in rename");
         }
-        await record.outputTail;
+        await record.outputTail.catch((error: unknown) => {
+          this.#diagnose("deepseek/session/rename update", sessionId, error);
+        });
         return this.#renameResponse(renamed.title);
       } catch (error) {
         this.#diagnose("deepseek/session/rename", sessionId, error);

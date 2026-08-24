@@ -763,12 +763,14 @@ export class DurableSessionAgent implements AcpAgent {
       const inflight = this.#ownedRecord(agent)?.inflight;
       if (inflight?.messageId === String(message.id)) inflight.turn = turn;
     }));
-    this.#hooks.push(this.#context.on("agent/error", ({ agent, turn, error }) => {
+    this.#hooks.push(this.#context.on("agent/error", ({ agent, turn }) => {
       const record = this.#ownedRecord(agent);
       const inflight = record?.inflight;
       if (record === undefined || inflight === undefined || !inflight.queued || (!inflight.command && inflight.turn !== turn)) return;
-      inflight.agentError = error;
-      this.#diagnose("session agent", record.handle.agent.id, error);
+      inflight.agentError = true;
+      this.#diagnostics.write(
+        `sesori-deepseek-acp: session agent category=execution-failed session=${record.handle.agent.id}\n`,
+      );
       inflight.terminal.resolve();
       this.#settle(record, inflight);
     }));

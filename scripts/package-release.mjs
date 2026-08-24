@@ -327,16 +327,16 @@ async function archivePackage({ packageRoot, output, adapterVersion, target }) {
   const name = releaseArchiveName({ adapterVersion, target });
   const archive = join(output, name);
   if (target.startsWith("windows-")) {
-    run("tar", ["-a", "-cf", archive, "-C", dirname(packageRoot), basename(packageRoot)]);
+    run("tar", ["-a", "-cf", archive, basename(packageRoot)], { cwd: dirname(packageRoot) });
   } else {
-    run("tar", ["-czf", archive, "-C", dirname(packageRoot), basename(packageRoot)]);
+    run("tar", ["-czf", archive, basename(packageRoot)], { cwd: dirname(packageRoot) });
   }
   return archive;
 }
 
 async function extractArchive({ archive, destination }) {
   await mkdir(destination, { recursive: true });
-  run("tar", ["-xf", archive, "-C", destination]);
+  run("tar", ["-xf", archive], { cwd: destination });
   const entries = await readdir(destination);
   if (entries.length !== 1 || entries[0] !== packageRootName) {
     throw new Error("Release archive must contain exactly one top-level package directory");

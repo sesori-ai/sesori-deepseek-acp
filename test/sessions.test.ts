@@ -2300,6 +2300,21 @@ describe("durable ACP sessions", () => {
     await expect(pending).resolves.toEqual({ stopReason: "cancelled" });
   });
 
+  it("sanitizes agent execution errors in diagnostics", async () => {
+    const state = services();
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const handle = state.live.get(created.sessionId)!;
+    const secret = "provider request and tool output";
+    const pending = state.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "question" }] });
+    await expect.poll(() => vi.mocked(handle.agent.followup).mock.calls.length).toBe(1);
+
+    state.invoke("agent/error", { agent: handle.agent, turn: 1, error: new Error(secret) });
+
+    await expect(pending).rejects.toThrow("turn output failed");
+    expect(state.diagnostics.join("\n")).toContain("session agent category=execution-failed");
+    expect(state.diagnostics.join("\n")).not.toContain(secret);
+  });
+
   it("cancels image admission before the message is queued", async () => {
     const state = services();
     const saved = Promise.withResolvers<readonly unknown[]>();

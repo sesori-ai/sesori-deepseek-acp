@@ -1079,6 +1079,24 @@ describe("durable ACP sessions", () => {
     ).rejects.toThrow("unknown DeepSeek reasoning effort");
   });
 
+  it("rejects oversized opaque model selections before decoding", async () => {
+    const state = services();
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const oversized = `v1${"A".repeat(511)}`;
+    const from = vi.spyOn(Buffer, "from");
+
+    await expect(
+      state.agent.setSessionConfigOption!({
+        sessionId: created.sessionId,
+        configId: "deepseek.model",
+        value: oversized,
+      }),
+    ).rejects.toThrow("unknown DeepSeek model selection");
+
+    expect(from.mock.calls.some(([value]) => value === oversized.slice(2))).toBe(false);
+    from.mockRestore();
+  });
+
   it("keeps config options usable when selected model is absent from a partial catalog", async () => {
     const state = services();
     state.contextServices.set("llm", {
@@ -1234,6 +1252,29 @@ describe("durable ACP sessions", () => {
     expect(execute).toHaveBeenCalledOnce();
   });
 
+  it("sanitizes command execution errors in diagnostics", async () => {
+    const state = services();
+    const secret = "SENTINEL_COMMAND_ARGUMENT";
+    state.contextServices.set("commands", {
+      list: () => [{ name: "login", description: "Login" }],
+      find: () => ({}),
+      execute: async () => {
+        throw new Error(`login failed for ${secret}`);
+      },
+    });
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+
+    await expect(
+      state.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: `/login ${secret}` }] }),
+    ).rejects.toThrow("turn output failed");
+
+    expect(state.diagnostics).toContain(
+      `sesori-deepseek-acp: session/command session=${created.sessionId} command="login" category=execution_failed\n`,
+    );
+    expect(state.diagnostics.join("\n")).not.toContain(secret);
+    expect(state.diagnostics.join("\n")).not.toContain("login failed for");
+  });
+
   it("settles cancellation when a command ignores its abort signal", async () => {
     const state = services();
     const execution = Promise.withResolvers<unknown>();
@@ -1370,6 +1411,32 @@ describe("durable ACP sessions", () => {
     await expect(state.agent.closeSession({ sessionId: "rename-cleanup" })).resolves.toEqual({});
     expect(handle.dispose).toHaveBeenCalledTimes(2);
     expect(state.live.has("rename-cleanup")).toBe(false);
+  });
+
+  it("keeps command updates ordered without failing an active prompt", async () => {
+    const state = services();
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const handle = state.live.get(created.sessionId)!;
+    const first = Promise.withResolvers<void>();
+    state.sessionUpdate.mockImplementationOnce(() => first.promise);
+    const completion = state.agent.prompt({
+      sessionId: created.sessionId,
+      prompt: [{ type: "text", text: "question" }],
+    });
+    await expect.poll(() => vi.mocked(handle.agent.followup).mock.calls.length).toBe(1);
+
+    state.invoke("commands/change");
+    state.invoke("commands/change");
+    await expect.poll(() => state.sessionUpdate.mock.calls.length).toBe(1);
+    first.reject(new Error("synthetic command update failure"));
+    await expect.poll(() => state.sessionUpdate.mock.calls.length).toBe(2);
+    state.invoke("session/event", handle.agent.session, {
+      type: "turn/end",
+      data: { turn: 1, reason: { kind: "completed" } },
+    });
+
+    await expect(completion).resolves.toEqual({ stopReason: "end_turn" });
+    expect(state.diagnostics.join("\n")).toContain("session/commands update");
   });
 
   it("keeps later output moving after one client update fails", async () => {

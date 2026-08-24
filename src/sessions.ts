@@ -171,7 +171,7 @@ function selectionId(selection: Pick<ModelSelection, "provider" | "model">): str
 }
 
 function decodeSelectionId(value: string): Pick<ModelSelection, "provider" | "model"> | undefined {
-  if (!value.startsWith("v1")) return undefined;
+  if (value.length > 512 || !value.startsWith("v1")) return undefined;
   try {
     const decoded: unknown = JSON.parse(Buffer.from(value.slice(2), "base64url").toString("utf8"));
     if (
@@ -777,12 +777,14 @@ export class DurableSessionAgent implements AcpAgent {
     }));
     this.#hooks.push(this.#context.on("commands/change", () => {
       for (const record of this.#sessions.values()) {
-        this.#queue(record, () =>
+        record.outputTail = record.outputTail.catch(() => undefined).then(() =>
           this.#connection.sessionUpdate({
             sessionId: String(record.handle.agent.id),
             update: { sessionUpdate: "available_commands_update", availableCommands: this.#commands(record.handle.agent) },
           }),
-        );
+        ).catch((error: unknown) => {
+          this.#diagnose("session/commands update", record.handle.agent.id, error);
+        });
       }
     }));
     this.#hooks.push(this.#context.on("approval/request", (request: ApprovalRequest, next: () => Promise<ApprovalOutcome>) => {
@@ -1409,7 +1411,9 @@ export class DurableSessionAgent implements AcpAgent {
         } catch (error) {
           if (!inflight.cancelled) {
             inflight.agentError = error;
-            this.#diagnose("session/command", record.handle.agent.id, error);
+            this.#diagnostics.write(
+              `sesori-deepseek-acp: session/command session=${record.handle.agent.id} command=${JSON.stringify(parsed.name)} category=execution_failed\n`,
+            );
           }
         }
         inflight.terminal.resolve();

@@ -1133,7 +1133,8 @@ export class DurableSessionAgent implements AcpAgent {
       throw new Error("DeepSeek provider catalog unavailable");
     }
     let invalidDescriptors = 0;
-    const validDescriptors = descriptors.filter((provider) => {
+    const validDescriptors: typeof descriptors = [];
+    for (const provider of descriptors) {
       const valid = validateProtocolValue({
         definition: "catalogResponse",
         value: {
@@ -1144,9 +1145,13 @@ export class DurableSessionAgent implements AcpAgent {
           failures: [],
         },
       }).valid;
-      if (!valid) invalidDescriptors += 1;
-      return valid;
-    }).slice(0, 64);
+      if (!valid) {
+        invalidDescriptors += 1;
+        continue;
+      }
+      validDescriptors.push(provider);
+      if (validDescriptors.length === 64) break;
+    }
     if (invalidDescriptors > 0) {
       this.#diagnostics.write("sesori-deepseek-acp: deepseek/catalog provider-descriptors category=invalid\n");
     }

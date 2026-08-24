@@ -1150,12 +1150,18 @@ describe("durable ACP sessions", () => {
   it("omits malformed and excess providers before catalog fan-out", async () => {
     const state = services();
     const listModels = vi.fn(async (provider: string) => [{ id: "model", name: provider }]);
+    const descriptors = [
+      { id: "", name: "Blank" },
+      { id: "x".repeat(257), name: "Oversized" },
+      ...Array.from({ length: 64 }, (_, index) => ({ id: `provider-${index}`, name: `Provider ${index}` })),
+    ];
+    Object.defineProperty(descriptors, 66, {
+      get: () => {
+        throw new Error("excess provider inspected");
+      },
+    });
     state.contextServices.set("llm", {
-      listProviders: () => [
-        { id: "", name: "Blank" },
-        { id: "x".repeat(257), name: "Oversized" },
-        ...Array.from({ length: 65 }, (_, index) => ({ id: `provider-${index}`, name: `Provider ${index}` })),
-      ],
+      listProviders: () => descriptors,
       listModels,
       resolveModelInfo: async () => ({}),
     });

@@ -63,6 +63,20 @@
     }
   },
   {
+    "definition": "catalogResponse",
+    "value": {
+      "agent": {
+        "id": "deepseek",
+        "name": "DeepSeek",
+        "primary": true
+      },
+      "providers": [],
+      "defaultSelectionId": "v1A",
+      "commands": [],
+      "failures": []
+    }
+  },
+  {
     "definition": "historyRequest",
     "value": {
       "sessionId": "session-1",

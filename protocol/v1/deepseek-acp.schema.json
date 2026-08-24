@@ -16,7 +16,7 @@
       "type": "string",
       "minLength": 3,
       "maxLength": 512,
-      "pattern": "^v1[A-Za-z0-9_-]+$"
+      "pattern": "^v1(?:[A-Za-z0-9_-]{2,3}|(?:[A-Za-z0-9_-]{4})+(?:[A-Za-z0-9_-]{2,3})?)$"
     },
     "absolutePath": {
       "type": "string",

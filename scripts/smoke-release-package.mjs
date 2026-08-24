@@ -18,12 +18,9 @@ function timeout(promise, operation, milliseconds = requestTimeoutMilliseconds) 
 
 function launcherCommand({ launcher, target, arguments_ }) {
   if (!target.startsWith("windows-")) return { command: launcher, arguments_ };
-  const commandLine = [launcher, ...arguments_]
-    .map((value) => `"${value.replaceAll('"', '""')}"`)
-    .join(" ");
   return {
     command: process.env.ComSpec ?? "cmd.exe",
-    arguments_: ["/d", "/s", "/c", commandLine],
+    arguments_: ["/d", "/c", "call", launcher, ...arguments_],
   };
 }
 

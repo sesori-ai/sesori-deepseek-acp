@@ -270,8 +270,7 @@ function smokeEnvironment({ home, packageRoot, windows }) {
 function runPackagedLauncher({ packageRoot, target, arguments_, environment }) {
   const launcher = launcherPath(packageRoot, target);
   if (!target.startsWith("windows-")) return run(launcher, arguments_, { capture: true, env: environment });
-  const command = [launcher, ...arguments_].map((value) => `"${value.replaceAll('"', '""')}"`).join(" ");
-  return run(process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", command], {
+  return run(process.env.ComSpec ?? "cmd.exe", ["/d", "/c", "call", launcher, ...arguments_], {
     capture: true,
     env: environment,
   });

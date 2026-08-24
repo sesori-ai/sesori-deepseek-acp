@@ -217,6 +217,12 @@ describe("DeepSeek runtime composition", () => {
       diagnostics: { write: (message) => diagnostics.push(message) },
     });
     try {
+      const listed = await agent.listSessions({});
+      expect(listed.sessions).toEqual([
+        expect.objectContaining({ sessionId: String(sessionId) }),
+      ]);
+      expect(listed.sessions[0]).not.toHaveProperty("title");
+
       const history = await agent.extMethod("deepseek/session/history", {
         sessionId: String(sessionId),
       });
@@ -242,7 +248,12 @@ describe("DeepSeek runtime composition", () => {
           cwd: project,
           mcpServers: [],
         }),
-      ).resolves.toEqual({ configOptions: [] });
+      ).resolves.toMatchObject({
+        configOptions: [
+          { id: "deepseek.model", category: "model" },
+          { id: "deepseek.reasoning_effort", category: "thought_level" },
+        ],
+      });
       expect(updates).toContainEqual({
         sessionId: String(sessionId),
         update: {

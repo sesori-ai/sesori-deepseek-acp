@@ -161,7 +161,14 @@
                       }
                     },
                     "defaultReasoningEffort": {
-                      "$ref": "#/$defs/nonblank"
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/nonblank"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
                     },
                     "supportsImages": {
                       "type": "boolean"

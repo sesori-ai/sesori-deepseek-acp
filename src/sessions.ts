@@ -20,14 +20,20 @@ import {
   type PromptRequest,
   type PromptResponse,
   type SessionInfo,
+  type SessionConfigOption,
   type SessionNotification,
+  type SetSessionConfigOptionRequest,
+  type SetSessionConfigOptionResponse,
   type StopReason,
   type ToolCallContent,
 } from "@agentclientprotocol/sdk";
 import type { Context } from "@deepseek-ai/cordis";
 import type { Agent, AgentHandle } from "@deepseek-ai/dsh-agent";
-import { isImageAdmissionError } from "@deepseek-ai/dsh-attachment";
-import { freezeMessage, MessageId, type ContentBlock, type TokenUsage, type UserMessage } from "@deepseek-ai/dsh-llm";
+import type {} from "@deepseek-ai/dsh-agent-default-model";
+import { isImageAdmissionError, type EncodedImageAttachment } from "@deepseek-ai/dsh-attachment";
+import { parseCommand } from "@deepseek-ai/dsh-commands";
+import type {} from "@deepseek-ai/dsh-commands/types";
+import { freezeMessage, MessageId, ReasoningEffortId, type ContentBlock, type LlmCallConfig, type ReasoningEffortId as ReasoningEffort, type TokenUsage, type UserMessage } from "@deepseek-ai/dsh-llm";
 import type { ApprovalOutcome, ApprovalRequest } from "@deepseek-ai/dsh-user-approval";
 import type {} from "@deepseek-ai/dsh-llm-retry/types";
 import type {} from "@deepseek-ai/dsh-compaction/types";
@@ -39,7 +45,7 @@ import {
 } from "@deepseek-ai/dsh-session";
 import { isAppendSurfaceEvent } from "@deepseek-ai/dsh-session/surface";
 import type { SessionInspection } from "@deepseek-ai/dsh-session-persistence";
-import { foldSessionTitle } from "@deepseek-ai/dsh-session-title";
+import { SessionTitleInvalidError } from "@deepseek-ai/dsh-session-title";
 import { createInitializeResponse, INITIALIZE_METADATA_KEY } from "./protocol.js";
 import { validateProtocolValue } from "./schema.js";
 
@@ -50,9 +56,68 @@ const MAX_PATH_LENGTH = 4096;
 const MAX_SESSION_ID_LENGTH = 256;
 const MAX_MESSAGE_ID_LENGTH = 256;
 const PROMPT_METADATA_KEY = "sesori.ai/deepseek";
+const MODEL_CONFIG_ID = "deepseek.model";
+const REASONING_CONFIG_ID = "deepseek.reasoning_effort";
+
+interface CatalogModel {
+  id: string;
+  upstreamModelId: string;
+  name: string;
+  reasoningEfforts: string[];
+  defaultReasoningEffort: string | null;
+  supportsImages: boolean;
+}
+
+interface ModelSelection {
+  provider: string;
+  model: string;
+  reasoningEffort?: ReasoningEffort;
+}
+
+interface ModelSelectionRef {
+  current: ModelSelection | undefined;
+  assembled: ModelSelection | undefined;
+}
+
+function installSelection(agentContext: Context, selection: ModelSelectionRef): void {
+  agentContext.on("system-prompt/assemble", async (_assembly, _context, next) => {
+    const selected = selection.current;
+    const assembled = await next();
+    selection.assembled = selected;
+    if (selected === undefined) return assembled;
+    return {
+      ...assembled,
+      variables: { ...assembled.variables, provider: selected.provider, model: selected.model },
+    };
+  });
+  agentContext.on("agent/request", async (_payload, next): Promise<LlmCallConfig> => {
+    const resolved = await next();
+    const selected = selection.assembled;
+    if (selected === undefined) return resolved;
+    const { reasoningEffort: _inheritedEffort, ...rest } = resolved;
+    return {
+      ...rest,
+      provider: selected.provider,
+      model: selected.model,
+      ...(selected.reasoningEffort === undefined ? {} : { reasoningEffort: selected.reasoningEffort }),
+    };
+  });
+}
+
+interface CatalogResponse {
+  agent: { id: "deepseek"; name: "DeepSeek"; primary: true };
+  providers: { id: string; name: string; models: CatalogModel[] }[];
+  defaultSelectionId: string | null;
+  commands: { name: string; description: string }[];
+  failures: { providerId: string; category: string; message: string }[];
+}
 
 function assistantMessageId(sessionId: string, turn: number, step: number): string {
   return `deepseek-assistant-${createHash("sha256").update(`${sessionId}\0${turn}\0${step}`).digest("base64url").slice(0, 24)}`;
+}
+
+function commandMessageId(sessionId: string, commandId: string): string {
+  return `deepseek-command-${createHash("sha256").update(`${sessionId}\0${commandId}`).digest("base64url").slice(0, 24)}`;
 }
 
 function promptMessageId(params: PromptRequest): string {
@@ -87,6 +152,7 @@ interface InflightPrompt {
   queued: boolean;
   cancelled: boolean;
   settling: boolean;
+  command: boolean;
   outputError?: unknown;
   agentError?: unknown;
   readonly usageByStep: Map<number, TokenUsage>;
@@ -94,9 +160,46 @@ interface InflightPrompt {
 
 interface SessionRecord {
   readonly handle: AgentHandle;
+  readonly selection: ModelSelectionRef;
   readonly toolCalls: Map<string, { name: string; arguments: string }>;
   outputTail: Promise<void>;
   inflight: InflightPrompt | undefined;
+}
+
+function selectionId(selection: Pick<ModelSelection, "provider" | "model">): string {
+  const id = `v1${Buffer.from(JSON.stringify([selection.provider, selection.model])).toString("base64url")}`;
+  if (id.length > 512) throw new Error("DeepSeek model selection id exceeds protocol bounds");
+  return id;
+}
+
+function decodeSelectionId(value: string): Pick<ModelSelection, "provider" | "model"> | undefined {
+  if (value.length > 512 || !value.startsWith("v1")) return undefined;
+  try {
+    const decoded: unknown = JSON.parse(Buffer.from(value.slice(2), "base64url").toString("utf8"));
+    if (
+      !Array.isArray(decoded) ||
+      decoded.length !== 2 ||
+      decoded.some((item) => typeof item !== "string" || item.length === 0)
+    ) {
+      return undefined;
+    }
+    const selection = { provider: decoded[0] as string, model: decoded[1] as string };
+    return selectionId(selection) === value ? selection : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function commandPrompt(prompt: PromptRequest["prompt"]): { line: string; images: EncodedImageAttachment[] } | undefined {
+  let line: string | undefined;
+  const images: EncodedImageAttachment[] = [];
+  for (const block of prompt) {
+    if (block.type === "text" && line === undefined) line = block.text;
+    else if (block.type === "image") {
+      images.push({ mediaType: block.mimeType as EncodedImageAttachment["mediaType"], data: block.data });
+    } else return undefined;
+  }
+  return line === undefined || parseCommand(line) === undefined ? undefined : { line, images };
 }
 
 function promptUsage(usages: Iterable<TokenUsage>): PromptResponse["usage"] {
@@ -268,21 +371,15 @@ function headerMetadata(header: SessionHeader): Record<string, unknown> {
   };
 }
 
-function sessionInfo(args: {
-  header: SessionHeader;
-  events?: readonly SessionEvent[];
-}): SessionInfo {
-  if (args.header.cwd === undefined || !isAbsolute(args.header.cwd)) {
+function sessionInfo(header: SessionHeader): SessionInfo {
+  if (header.cwd === undefined || !isAbsolute(header.cwd)) {
     throw internalError("persisted session has no valid working directory");
   }
-  const title = args.events === undefined ? undefined : foldSessionTitle(args.events);
-  const updatedAt = args.events?.at(-1)?.time ?? title?.updatedAt ?? args.header.createdAt;
   return {
-    sessionId: String(args.header.id),
-    cwd: args.header.cwd,
-    updatedAt: new Date(updatedAt).toISOString(),
-    ...(title === undefined ? {} : { title: title.title }),
-    _meta: { [INITIALIZE_METADATA_KEY]: headerMetadata(args.header) },
+    sessionId: String(header.id),
+    cwd: header.cwd,
+    updatedAt: new Date(header.createdAt).toISOString(),
+    _meta: { [INITIALIZE_METADATA_KEY]: headerMetadata(header) },
   };
 }
 
@@ -292,17 +389,8 @@ function historyRequest(params: Record<string, unknown>): HistoryRequest {
   return params as unknown as HistoryRequest;
 }
 
-async function admitPrompt(args: {
-  context: Context;
-  prompt: PromptRequest["prompt"];
-  signal: AbortSignal;
-}): Promise<UserMessage["content"]> {
-  const images = args.prompt.filter((block) => block.type === "image");
-  const attachments = args.context.get("attachments") as
-    | { saveImages(inputs: readonly { data: Uint8Array; mediaType: string }[]): Promise<readonly unknown[]> }
-    | undefined;
-  if (images.length > 0 && attachments === undefined) throw invalidParams("image prompts are unavailable");
-  const inputs = images.map((image) => {
+function promptImages(prompt: PromptRequest["prompt"]): EncodedImageAttachment[] {
+  return prompt.filter((block) => block.type === "image").map((image) => {
     if (image.uri !== undefined && image.uri !== null) throw invalidParams("image URLs are not supported");
     if (!["image/png", "image/jpeg", "image/webp", "image/gif"].includes(image.mimeType)) {
       throw invalidParams("unsupported image media type");
@@ -310,8 +398,21 @@ async function admitPrompt(args: {
     if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(image.data)) {
       throw invalidParams("invalid image base64");
     }
-    return { data: Buffer.from(image.data, "base64"), mediaType: image.mimeType };
+    return { data: image.data, mediaType: image.mimeType as EncodedImageAttachment["mediaType"] };
   });
+}
+
+async function admitPrompt(args: {
+  context: Context;
+  prompt: PromptRequest["prompt"];
+  signal: AbortSignal;
+}): Promise<UserMessage["content"]> {
+  const images = promptImages(args.prompt);
+  const attachments = args.context.get("attachments") as
+    | { saveImages(inputs: readonly { data: Uint8Array; mediaType: string }[]): Promise<readonly unknown[]> }
+    | undefined;
+  if (images.length > 0 && attachments === undefined) throw invalidParams("image prompts are unavailable");
+  const inputs = images.map((image) => ({ data: Buffer.from(image.data, "base64"), mediaType: image.mediaType }));
   args.signal.throwIfAborted();
   const refs = inputs.length === 0 ? [] : await withAbort(attachments!.saveImages(inputs), args.signal);
   args.signal.throwIfAborted();
@@ -324,10 +425,10 @@ async function admitPrompt(args: {
 }
 
 function messageBoundary(event: SessionEvent): boolean {
+  if (event.type === "command/done") return event.data.text !== undefined;
   return (
     isAppendSurfaceEvent(event) &&
-    ((event.type === "user/message" && event.data.source.kind === "user") ||
-      event.type === "assistant/message")
+    ((event.type === "user/message" && event.data.source.kind === "user") || event.type === "assistant/message")
   );
 }
 
@@ -559,6 +660,14 @@ async function projectSessionEvent(args: EventProjection, event: SessionEvent): 
     await args.emitUpdate(update);
     return;
   }
+  if (event.type === "command/done" && event.data.text !== undefined) {
+    await args.emitUpdate({
+      sessionUpdate: "agent_message_chunk",
+      messageId: commandMessageId(args.sessionId, String(event.data.commandId)),
+      content: { type: "text", text: event.data.text },
+    });
+    return;
+  }
   if (event.type === "todo/write") {
     await args.emitUpdate({
       sessionUpdate: "plan",
@@ -657,10 +766,22 @@ export class DurableSessionAgent implements AcpAgent {
     this.#hooks.push(this.#context.on("agent/error", ({ agent, turn, error }) => {
       const record = this.#ownedRecord(agent);
       const inflight = record?.inflight;
-      if (record === undefined || inflight === undefined || !inflight.queued || inflight.turn !== turn) return;
+      if (record === undefined || inflight === undefined || !inflight.queued || (!inflight.command && inflight.turn !== turn)) return;
       inflight.agentError = error;
       inflight.terminal.resolve();
       this.#settle(record, inflight);
+    }));
+    this.#hooks.push(this.#context.on("commands/change", () => {
+      for (const record of this.#sessions.values()) {
+        record.outputTail = record.outputTail.catch(() => undefined).then(() =>
+          this.#connection.sessionUpdate({
+            sessionId: String(record.handle.agent.id),
+            update: { sessionUpdate: "available_commands_update", availableCommands: this.#commands(record.handle.agent) },
+          }),
+        ).catch((error: unknown) => {
+          this.#diagnose("session/commands update", record.handle.agent.id, error);
+        });
+      }
     }));
     this.#hooks.push(this.#context.on("approval/request", (request: ApprovalRequest, next: () => Promise<ApprovalOutcome>) => {
       const record = this.#ownedRecord(request.agent);
@@ -727,7 +848,7 @@ export class DurableSessionAgent implements AcpAgent {
         .filter((header) => cursor === undefined || afterCursor(header, cursor));
       const page = filtered.slice(0, LIST_PAGE_SIZE);
       return {
-        sessions: page.map((header) => sessionInfo({ header })),
+        sessions: page.map(sessionInfo),
         ...(filtered.length > LIST_PAGE_SIZE && page.at(-1) !== undefined
           ? { nextCursor: encodeCursor(page.at(-1) as SessionHeader) }
           : {}),
@@ -747,22 +868,40 @@ export class DurableSessionAgent implements AcpAgent {
     void creationDone.promise.catch(() => undefined);
     this.#creations.add(creationDone.promise);
     let handle: AgentHandle | undefined;
+    let selection: ModelSelectionRef | undefined;
     let cleanupFailure: { error: unknown } | undefined;
     try {
-      handle = await this.#context.agents.create({ sessionId, meta: { cwd: params.cwd } });
+      handle = await this.#context.agents.create({
+        sessionId,
+        meta: { cwd: params.cwd },
+        setup: (agentContext) => {
+          selection = this.#installSelection(agentContext);
+        },
+      });
       if (this.#closed) throw new Error("adapter disposed during session creation");
       if (handle.agent.session.id !== sessionId || this.#sessions.has(sessionId)) {
         throw new Error("agent factory returned a duplicate or mismatched session id");
       }
-      this.#sessions.set(sessionId, {
+      if (selection === undefined) throw new Error("agent setup did not install model selection");
+      const record: SessionRecord = {
         handle,
+        selection,
         toolCalls: new Map(),
         outputTail: Promise.resolve(),
         inflight: undefined,
-      });
-      return { sessionId: String(sessionId), configOptions: [] };
+      };
+      this.#sessions.set(sessionId, record);
+      await this.#sendCommands(record);
+      const configOptions = await this.#configOptions(record);
+      if (this.#closed || this.#sessions.get(sessionId) !== record) {
+        throw new Error("adapter ownership changed during session creation");
+      }
+      return { sessionId: String(sessionId), configOptions };
     } catch (error) {
-      await handle?.dispose().catch((disposeError: unknown) => {
+      const adopted = this.#sessions.get(sessionId)?.handle === handle;
+      await handle?.dispose().then(() => {
+        if (adopted) this.#sessions.delete(sessionId);
+      }).catch((disposeError: unknown) => {
         cleanupFailure = { error: disposeError };
         this.#diagnose("session/new cleanup", sessionId, disposeError);
       });
@@ -792,6 +931,7 @@ export class DurableSessionAgent implements AcpAgent {
     let adopted = false;
     let resumed = false;
     let handle: AgentHandle | undefined;
+    let selection: ModelSelectionRef | undefined;
     let cleanupFailure: { error: unknown } | undefined;
     try {
       const inspection = await this.#inspect(sessionId);
@@ -813,17 +953,25 @@ export class DurableSessionAgent implements AcpAgent {
           throw new Error("owned session is no longer registered");
         }
         handle = resident.handle;
+        selection = resident.selection;
       } else {
         if (this.#context.agents.get(sessionId) !== undefined) {
           throw new Error("session is already owned outside this ACP connection");
         }
-        handle = await this.#context.agents.resume({ resumeSessionId: sessionId });
+        handle = await this.#context.agents.resume({
+          resumeSessionId: sessionId,
+          setup: (agentContext) => {
+            selection = this.#installSelection(agentContext);
+          },
+        });
         resumed = true;
         if (this.#closed || this.#sessions.has(sessionId)) {
           throw new Error("adapter ownership changed during session load");
         }
+        if (selection === undefined) throw new Error("agent setup did not install model selection");
         this.#sessions.set(sessionId, {
           handle,
+          selection,
           toolCalls: new Map(),
           outputTail: Promise.resolve(),
           inflight: undefined,
@@ -831,11 +979,19 @@ export class DurableSessionAgent implements AcpAgent {
         adopted = true;
       }
       for (const update of updates) await this.#connection.sessionUpdate(update);
-      return { configOptions: [] };
+      const record = this.#sessions.get(sessionId);
+      if (record === undefined) throw new Error("loaded session was not adopted");
+      await this.#sendCommands(record, true);
+      const configOptions = await this.#configOptions(record);
+      if (this.#closed || this.#sessions.get(sessionId) !== record) {
+        throw new Error("adapter ownership changed during session load");
+      }
+      return { configOptions };
     } catch (error) {
       if ((adopted || resumed) && handle !== undefined) {
-        if (adopted) this.#sessions.delete(sessionId);
-        await handle.dispose().catch((disposeError: unknown) => {
+        await handle.dispose().then(() => {
+          if (adopted) this.#sessions.delete(sessionId);
+        }).catch((disposeError: unknown) => {
           cleanupFailure = { error: disposeError };
           this.#diagnose("session/load cleanup", sessionId, disposeError);
         });
@@ -866,9 +1022,17 @@ export class DurableSessionAgent implements AcpAgent {
 
   async #closeSession(sessionId: SessionId): Promise<CloseSessionResponse> {
     const loading = this.#loads.get(sessionId);
-    if (loading !== undefined) await loading;
+    let loadFailure: unknown;
+    if (loading !== undefined) {
+      await loading.catch((error: unknown) => {
+        loadFailure = error;
+      });
+    }
     const record = this.#sessions.get(sessionId);
-    if (record === undefined) return {};
+    if (record === undefined) {
+      if (loadFailure !== undefined) throw loadFailure;
+      return {};
+    }
     this.#sessions.delete(sessionId);
     try {
       await this.#disposeRecord(record);
@@ -882,9 +1046,273 @@ export class DurableSessionAgent implements AcpAgent {
     }
   }
 
-  async extMethod(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
-    if (method !== "deepseek/session/history") throw RequestError.methodNotFound(method);
+  #installSelection(agentContext: Context): ModelSelectionRef {
+    const agent = agentContext.agent;
+    if (agent === undefined) throw new Error("agent setup has no scoped agent");
+    const defaults = agentContext.get("agentDefaultModel") as
+      | { currentSelection(): ModelSelection }
+      | undefined;
+    if (defaults === undefined) throw new Error("default model service is unavailable");
+    let selected: ModelSelection | undefined;
+    const selection: ModelSelectionRef = {
+      get current(): ModelSelection {
+        if (selected !== undefined) return selected;
+        const logged = agent.session.requestHeader()?.config;
+        if (logged === undefined) {
+          try {
+            return defaults.currentSelection();
+          } catch {
+            throw new Error("default model selection unavailable");
+          }
+        }
+        return {
+          provider: logged.provider,
+          model: logged.model,
+          ...(logged.reasoningEffort === undefined ? {} : { reasoningEffort: logged.reasoningEffort }),
+        };
+      },
+      set current(value: ModelSelection | undefined) {
+        selected = value;
+      },
+      assembled: undefined,
+    };
+    installSelection(agentContext, selection);
+    return selection;
+  }
+
+  #sendCommands(record: SessionRecord, emitEmpty = false): Promise<void> {
+    const availableCommands = this.#commands(record.handle.agent);
+    if (!emitEmpty && availableCommands.length === 0) return Promise.resolve();
+    return this.#connection.sessionUpdate({
+      sessionId: String(record.handle.agent.id),
+      update: { sessionUpdate: "available_commands_update", availableCommands },
+    });
+  }
+
+  #commands(agent?: Agent): { name: string; description: string; input?: { hint: string } }[] {
+    try {
+      const commands = this.#context.get("commands") as
+        | { list(agent: Agent): readonly { name: string; description: string; input?: { hint: string } }[] }
+        | undefined;
+      if (commands === undefined) throw new Error("command service is unavailable");
+      // The pinned registry treats an absent scope as its global command view.
+      const descriptors = commands.list(agent ?? (undefined as unknown as Agent));
+      const catalogCommands = descriptors.map((command) => ({ name: command.name, description: command.description }));
+      if (!validateProtocolValue({
+        definition: "catalogResponse",
+        value: {
+          agent: { id: "deepseek", name: "DeepSeek", primary: true },
+          providers: [],
+          defaultSelectionId: null,
+          commands: catalogCommands,
+          failures: [],
+        },
+      }).valid) throw new Error("command catalog exceeds protocol bounds");
+      return descriptors.map((command) => ({
+        name: command.name,
+        description: command.description,
+        ...(command.input === undefined ? {} : { input: { hint: command.input.hint } }),
+      }));
+    } catch {
+      this.#diagnostics.write("sesori-deepseek-acp: commands/list category=unavailable\n");
+      return [];
+    }
+  }
+
+  async #catalog(): Promise<CatalogResponse> {
+    const llm = this.#context.get("llm") as Context["llm"] | undefined;
+    const defaults = this.#context.get("agentDefaultModel") as
+      | { currentSelection(): ModelSelection }
+      | undefined;
+    if (llm === undefined || defaults === undefined) throw new Error("model catalog services are unavailable");
+    let descriptors: ReturnType<typeof llm.listProviders>;
+    try {
+      descriptors = llm.listProviders();
+    } catch {
+      this.#diagnostics.write("sesori-deepseek-acp: deepseek/catalog providers category=unavailable\n");
+      throw new Error("DeepSeek provider catalog unavailable");
+    }
+    let invalidDescriptors = 0;
+    const validDescriptors: typeof descriptors = [];
+    for (const provider of descriptors) {
+      const valid = validateProtocolValue({
+        definition: "catalogResponse",
+        value: {
+          agent: { id: "deepseek", name: "DeepSeek", primary: true },
+          providers: [{ id: provider.id, name: provider.name, models: [] }],
+          defaultSelectionId: null,
+          commands: [],
+          failures: [],
+        },
+      }).valid;
+      if (!valid) {
+        invalidDescriptors += 1;
+        continue;
+      }
+      validDescriptors.push(provider);
+      if (validDescriptors.length === 64) break;
+    }
+    if (invalidDescriptors > 0) {
+      this.#diagnostics.write("sesori-deepseek-acp: deepseek/catalog provider-descriptors category=invalid\n");
+    }
+    const providers = await Promise.all(
+      validDescriptors.map(async (provider) => {
+        try {
+          const models = await llm.listModels(provider.id);
+          if (models.length > 256) throw new Error("provider model catalog exceeds protocol bounds");
+          const entries: CatalogModel[] = await Promise.all(
+            models.map(async (model) => {
+              const resolved = await llm.resolveModelInfo(provider.id, model.id);
+              return {
+                id: selectionId({ provider: provider.id, model: model.id }),
+                upstreamModelId: model.id,
+                name: model.name,
+                reasoningEfforts: resolved.reasoning?.efforts.map((effort) => String(effort.id)) ?? [],
+                defaultReasoningEffort:
+                  resolved.reasoning?.defaultEffort === undefined
+                    ? null
+                    : String(resolved.reasoning.defaultEffort),
+                supportsImages: resolved.inputModalities?.includes("image") === true,
+              };
+            }),
+          );
+          const completed = { id: provider.id, name: provider.name, models: entries };
+          if (!validateProtocolValue({
+            definition: "catalogResponse",
+            value: {
+              agent: { id: "deepseek", name: "DeepSeek", primary: true },
+              providers: [completed],
+              defaultSelectionId: null,
+              commands: [],
+              failures: [],
+            },
+          }).valid) throw new Error("provider catalog exceeds protocol bounds");
+          return { provider: completed };
+        } catch {
+          this.#diagnostics.write(
+            `sesori-deepseek-acp: deepseek/catalog provider provider=${JSON.stringify(provider.id)} category=unavailable\n`,
+          );
+          return {
+            failure: {
+              providerId: provider.id,
+              category: "unavailable",
+              message: "Provider catalog unavailable",
+            },
+          };
+        }
+      }),
+    );
+    let defaultSelectionId: string | null = null;
+    try {
+      defaultSelectionId = selectionId(defaults.currentSelection());
+    } catch {
+      this.#diagnostics.write("sesori-deepseek-acp: deepseek/catalog default-selection category=unavailable\n");
+    }
+    const response: CatalogResponse = {
+      agent: { id: "deepseek", name: "DeepSeek", primary: true },
+      providers: providers.flatMap((item) =>
+        "provider" in item && item.provider.models.length > 0 ? [item.provider] : [],
+      ),
+      defaultSelectionId,
+      commands: this.#commands().map(({ name, description }) => ({ name, description })),
+      failures: providers.flatMap((item) => ("failure" in item ? [item.failure] : [])),
+    };
+    if (!validateProtocolValue({ definition: "catalogResponse", value: response }).valid) {
+      throw new Error("DeepSeek catalog response exceeds protocol bounds");
+    }
+    return response;
+  }
+
+  async #configOptions(record: SessionRecord, catalog?: CatalogResponse): Promise<SessionConfigOption[]> {
+    catalog ??= await this.#catalog();
+    if (catalog.providers.length === 0) return [];
+    const current = record.selection.current;
+    if (current === undefined) throw new Error("session has no model selection");
+    let selectedId: string;
+    try {
+      selectedId = selectionId(current);
+    } catch {
+      return [];
+    }
+    const selectedModel = catalog.providers
+      .flatMap((provider) => provider.models)
+      .find((model) => model.id === selectedId);
+    const options: SessionConfigOption[] = [
+      {
+        type: "select",
+        id: MODEL_CONFIG_ID,
+        name: "Model",
+        category: "model",
+        currentValue: selectedId,
+        options: catalog.providers.map((provider) => ({
+          group: provider.id,
+          name: provider.name,
+          options: provider.models.map((model) => ({ value: model.id, name: model.name })),
+        })),
+      },
+    ];
+    const currentEffort = current.reasoningEffort ?? selectedModel?.defaultReasoningEffort;
+    if (selectedModel !== undefined && currentEffort != null && selectedModel.reasoningEfforts.length > 0) {
+      options.push({
+        type: "select",
+        id: REASONING_CONFIG_ID,
+        name: "Reasoning effort",
+        category: "thought_level",
+        currentValue: String(currentEffort),
+        options: selectedModel.reasoningEfforts.map((effort) => ({ value: effort, name: effort })),
+      });
+    }
+    return options;
+  }
+
+  async setSessionConfigOption(params: SetSessionConfigOptionRequest): Promise<SetSessionConfigOptionResponse> {
     this.#assertOpen();
+    if (typeof params.value !== "string") throw invalidParams("DeepSeek config options require a selection value");
+    const sessionId = parseSessionId(params.sessionId);
+    if (this.#loads.has(sessionId)) throw invalidParams("session load is in progress");
+    const record = this.#sessions.get(sessionId);
+    if (record === undefined) throw invalidParams("unknown session");
+    if (record.inflight !== undefined) throw invalidParams("a prompt is in flight for this session");
+    const catalog = await this.#catalog();
+    if (this.#loads.has(sessionId)) throw invalidParams("session load is in progress");
+    if (this.#sessions.get(sessionId) !== record) throw invalidParams("unknown session");
+    if (record.inflight !== undefined) throw invalidParams("a prompt is in flight for this session");
+    const current = record.selection.current;
+    if (current === undefined) throw internalError("session has no model selection");
+    if (params.configId === MODEL_CONFIG_ID) {
+      const decoded = decodeSelectionId(params.value);
+      const model = catalog.providers.flatMap((provider) => provider.models).find((item) => item.id === params.value);
+      if (decoded === undefined || model === undefined) throw invalidParams("unknown DeepSeek model selection");
+      record.selection.current = {
+        ...decoded,
+        ...(model.defaultReasoningEffort === null
+          ? {}
+          : { reasoningEffort: ReasoningEffortId(model.defaultReasoningEffort) }),
+      };
+    } else if (params.configId === REASONING_CONFIG_ID) {
+      const model = catalog.providers
+        .flatMap((provider) => provider.models)
+        .find((item) => item.id === selectionId(current));
+      if (model === undefined || !model.reasoningEfforts.includes(params.value)) {
+        throw invalidParams("unknown DeepSeek reasoning effort");
+      }
+      record.selection.current = { ...current, reasoningEffort: ReasoningEffortId(params.value) };
+    } else {
+      throw invalidParams("unknown DeepSeek config option");
+    }
+    return { configOptions: await this.#configOptions(record, catalog) };
+  }
+
+  async extMethod(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+    this.#assertOpen();
+    if (method === "deepseek/catalog") {
+      if (!validateProtocolValue({ definition: "catalogRequest", value: params }).valid) {
+        throw invalidParams("invalid DeepSeek catalog request");
+      }
+      return (await this.#catalog()) as unknown as Record<string, unknown>;
+    }
+    if (method === "deepseek/session/rename") return this.#rename(params);
+    if (method !== "deepseek/session/history") throw RequestError.methodNotFound(method);
     const request = historyRequest(params);
     const sessionId = parseSessionId(request.sessionId);
     try {
@@ -915,6 +1343,112 @@ export class DurableSessionAgent implements AcpAgent {
     }
   }
 
+  async #rename(params: Record<string, unknown>): Promise<Record<string, unknown>> {
+    if (!validateProtocolValue({ definition: "renameRequest", value: params }).valid) {
+      throw invalidParams("invalid DeepSeek rename request");
+    }
+    const sessionId = parseSessionId(params.sessionId as string);
+    const loading = this.#loads.get(sessionId);
+    if (loading !== undefined) await loading;
+    const closing = this.#closes.get(sessionId);
+    if (closing !== undefined) await closing;
+    this.#assertOpen();
+    const titles = this.#context.get("sessionTitle") as
+      | { rename(session: Agent["session"], title: string): { title: string } }
+      | undefined;
+    if (titles === undefined) throw internalError("session title service is unavailable");
+    const record = this.#sessions.get(sessionId);
+    if (record !== undefined) {
+      try {
+        const renamed = titles.rename(record.handle.agent.session, params.title as string);
+        if (!(await this.#context.sessions.flush(record.handle.agent.session))) {
+          throw new Error("session persistence did not participate in rename");
+        }
+        await record.outputTail.catch((error: unknown) => {
+          this.#diagnose("deepseek/session/rename update", sessionId, error);
+        });
+        return this.#renameResponse(renamed.title);
+      } catch (error) {
+        this.#diagnose("deepseek/session/rename", sessionId, error);
+        if (error instanceof SessionTitleInvalidError) throw invalidParams("invalid DeepSeek session title");
+        throw internalError("unable to rename DeepSeek session");
+      }
+    }
+    const transition = Promise.withResolvers<void>();
+    void transition.promise.catch(() => undefined);
+    this.#loads.set(sessionId, transition.promise);
+    let handle: AgentHandle | undefined;
+    let selection: ModelSelectionRef | undefined;
+    let cleanupFailure: unknown;
+    let operationFailure: RequestError | undefined;
+    let response: Record<string, unknown> | undefined;
+    try {
+      try {
+        if (this.#context.agents.get(sessionId) !== undefined) {
+          throw invalidParams("session is already being used outside this ACP connection");
+        }
+        await this.#inspect(sessionId);
+        handle = await this.#context.agents.resume({
+          resumeSessionId: sessionId,
+          setup: (agentContext) => {
+            selection = this.#installSelection(agentContext);
+          },
+        });
+        if (this.#closed || this.#sessions.has(sessionId)) {
+          throw new Error("adapter ownership changed during session rename");
+        }
+        const renamed = titles.rename(handle.agent.session, params.title as string);
+        if (!(await this.#context.sessions.flush(handle.agent.session))) {
+          throw new Error("session persistence did not participate in rename");
+        }
+        await this.#connection.sessionUpdate({
+          sessionId: String(sessionId),
+          update: { sessionUpdate: "session_info_update", title: renamed.title },
+        }).catch((error: unknown) => {
+          this.#diagnose("deepseek/session/rename update", sessionId, error);
+        });
+        response = this.#renameResponse(renamed.title);
+      } catch (error) {
+        this.#diagnose("deepseek/session/rename", sessionId, error);
+        operationFailure =
+          error instanceof SessionTitleInvalidError || error instanceof RequestError
+            ? error instanceof SessionTitleInvalidError
+              ? invalidParams("invalid DeepSeek session title")
+              : error
+            : internalError("unable to rename DeepSeek session");
+      }
+      await handle?.dispose().catch((error: unknown) => {
+        cleanupFailure = error;
+        this.#diagnose("deepseek/session/rename cleanup", sessionId, error);
+        if (selection !== undefined && !this.#closed && !this.#sessions.has(sessionId)) {
+          this.#sessions.set(sessionId, {
+            handle: handle!,
+            selection,
+            toolCalls: new Map(),
+            outputTail: Promise.resolve(),
+            inflight: undefined,
+          });
+        }
+      });
+      if (cleanupFailure !== undefined) throw internalError("unable to release renamed DeepSeek session");
+      if (operationFailure !== undefined) throw operationFailure;
+      if (response === undefined) throw internalError("DeepSeek rename did not produce a response");
+      return response;
+    } finally {
+      if (this.#loads.get(sessionId) === transition.promise) this.#loads.delete(sessionId);
+      if (cleanupFailure === undefined) transition.resolve();
+      else transition.reject(cleanupFailure);
+    }
+  }
+
+  #renameResponse(title: string): Record<string, unknown> {
+    const response = { title };
+    if (!validateProtocolValue({ definition: "renameResponse", value: response }).valid) {
+      throw new Error("DeepSeek rename response exceeds protocol bounds");
+    }
+    return response;
+  }
+
   async prompt(params: PromptRequest): Promise<PromptResponse> {
     this.#assertOpen();
     const sessionId = parseSessionId(params.sessionId);
@@ -930,10 +1464,47 @@ export class DurableSessionAgent implements AcpAgent {
       queued: false,
       cancelled: false,
       settling: false,
+      command: false,
       usageByStep: new Map(),
     };
     record.inflight = inflight;
     try {
+      const candidate = commandPrompt(params.prompt);
+      const parsed = candidate === undefined ? undefined : parseCommand(candidate.line);
+      if (parsed !== undefined) candidate!.images = promptImages(params.prompt);
+      const commands = this.#context.get("commands") as
+        | {
+            find(agent: Agent, name: string): unknown;
+            execute(agent: Agent, line: string, images: readonly EncodedImageAttachment[], signal: AbortSignal): Promise<unknown>;
+          }
+        | undefined;
+      if (commands === undefined) throw new Error("command service is unavailable");
+      if (parsed !== undefined && commands.find(record.handle.agent, parsed.name) !== undefined) {
+        inflight.command = true;
+        inflight.queued = true;
+        try {
+          const execution = await withAbort(commands.execute(
+            record.handle.agent,
+            candidate!.line,
+            candidate!.images,
+            inflight.controller.signal,
+          ), inflight.controller.signal);
+          if (execution === undefined) throw new Error("advertised DeepSeek command disappeared during admission");
+          inflight.endReason = { kind: "completed" };
+        } catch (error) {
+          if (!inflight.cancelled) {
+            inflight.agentError = error;
+            this.#diagnostics.write(
+              `sesori-deepseek-acp: session/command session=${record.handle.agent.id} command=${JSON.stringify(parsed.name)} category=execution_failed\n`,
+            );
+          }
+        }
+        inflight.terminal.resolve();
+        inflight.admission.resolve();
+        this.#settle(record, inflight);
+        const stopReason = await inflight.completion.promise;
+        return { stopReason };
+      }
       const messageId = promptMessageId(params);
       const content = await admitPrompt({
         context: this.#context,
@@ -999,7 +1570,7 @@ export class DurableSessionAgent implements AcpAgent {
 
   #projectEvent(record: SessionRecord, event: SessionEvent): void {
     const sessionId = String(record.handle.agent.id);
-    this.#queue(record, () =>
+    const project = () =>
       projectSessionEvent(
         {
           context: this.#context,
@@ -1025,8 +1596,14 @@ export class DurableSessionAgent implements AcpAgent {
           },
         },
         event,
-      ),
-    );
+      );
+    if (event.type === "session/title") {
+      record.outputTail = record.outputTail.catch(() => undefined).then(project).catch((error: unknown) => {
+        this.#diagnose("session/title update", record.handle.agent.id, error);
+      });
+      return;
+    }
+    this.#queue(record, project);
   }
 
   #settle(record: SessionRecord, inflight: InflightPrompt): void {

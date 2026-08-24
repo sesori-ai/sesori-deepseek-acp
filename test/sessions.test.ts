@@ -1,6 +1,7 @@
 import type { AgentSideConnection, SessionNotification } from "@agentclientprotocol/sdk";
 import type { Context } from "@deepseek-ai/cordis";
-import type { AgentHandle } from "@deepseek-ai/dsh-agent";
+import type { Agent, AgentHandle } from "@deepseek-ai/dsh-agent";
+import { CommandId } from "@deepseek-ai/dsh-commands";
 import { SessionId, type SessionEvent, type SessionHeader } from "@deepseek-ai/dsh-session";
 import { describe, expect, it, vi } from "vitest";
 import { DurableSessionAgent } from "../src/sessions.ts";
@@ -75,11 +76,28 @@ function services(): SessionServices {
   const live = new Map<string, AgentHandle>();
   const listeners = new Map<string, ((...args: never[]) => unknown)[]>();
   const contextServices = new Map<string, unknown>();
+  let context: Context;
   let questionProvider: { ask(request: unknown): Promise<unknown> } | undefined;
-  const makeHandle = (meta: SessionHeader, sessionEvents: readonly SessionEvent[]): AgentHandle => {
+  const makeHandle = async (
+    meta: SessionHeader,
+    sessionEvents: readonly SessionEvent[],
+    setup?: (context: Context) => void | Promise<void>,
+  ): Promise<AgentHandle> => {
+    const storedEvents = [...sessionEvents];
     const agent = {
       id: meta.id,
-      session: { id: meta.id, header: meta, events: sessionEvents },
+      session: {
+        id: meta.id,
+        header: meta,
+        events: storedEvents,
+        requestHeader: () => undefined,
+        append: (type: string, data: unknown) => {
+          const event = { type, seq: storedEvents.length, time: Date.now(), data } as unknown as SessionEvent;
+          storedEvents.push(event);
+          (context as unknown as { __emit(name: string, ...args: unknown[]): void }).__emit("session/event", agent.session, event);
+          return event;
+        },
+      },
       status: "idle",
       followup: vi.fn((message: unknown) => {
         for (const listener of listeners.get("agent/inbox/claimed") ?? []) listener({ agent, message, turn: 1 } as never);
@@ -87,6 +105,9 @@ function services(): SessionServices {
       cancel: vi.fn(),
       whenIdle: vi.fn(async () => undefined),
     };
+    const agentContext = Object.assign(Object.create(context), { agent });
+    Object.assign(agent, { ctx: agentContext });
+    await setup?.(agentContext as Context);
     const handle = {
       agent,
       dispose: vi.fn(async () => {
@@ -96,15 +117,15 @@ function services(): SessionServices {
     live.set(String(meta.id), handle);
     return handle;
   };
-  const create = vi.fn(async (options: { sessionId: string; meta: { cwd: string } }) => {
-    return makeHandle(header({ id: options.sessionId, cwd: options.meta.cwd }), []);
+  const create = vi.fn(async (options: { sessionId: string; meta: { cwd: string }; setup?: (context: Context) => void }) => {
+    return makeHandle(header({ id: options.sessionId, cwd: options.meta.cwd }), [], options.setup);
   });
-  const resume = vi.fn(async (options: { resumeSessionId: string }) => {
+  const resume = vi.fn(async (options: { resumeSessionId: string; setup?: (context: Context) => void }) => {
     const inspection = inspections.get(options.resumeSessionId);
     if (inspection === undefined) throw new Error("not found");
-    return makeHandle(inspection.meta, inspection.events);
+    return makeHandle(inspection.meta, inspection.events, options.setup);
   });
-  const context = {
+  context = {
     on: (name: string, listener: (...args: never[]) => unknown) => {
       listeners.set(name, [...(listeners.get(name) ?? []), listener]);
       return () => undefined;
@@ -115,15 +136,32 @@ function services(): SessionServices {
       get: (id: string) => live.get(id)?.agent,
     },
     sessions: { flush: vi.fn(async () => true) },
+    llm: {
+      listProviders: () => [],
+      listModels: async () => [],
+      resolveModelInfo: async () => {
+        throw new Error("model unavailable");
+      },
+    },
+    agentDefaultModel: { currentSelection: () => ({ provider: "synthetic", model: "synthetic" }) },
+    commands: { list: () => [], find: () => undefined },
+    sessionTitle: {
+      rename: (session: { append(type: string, data: unknown): unknown }, title: string) => {
+        session.append("session/title", { title, messageSeqs: [], source: { kind: "user" } });
+        return { title, seq: 0, updatedAt: Date.now() };
+      },
+    },
     sessionPersistence: {
       list: vi.fn(async () => [...headers]),
       inspect: vi.fn(async (id: string) => {
         const inspection = inspections.get(id);
-        if (inspection === undefined) throw new Error("not found");
-        return inspection;
+        if (inspection !== undefined) return inspection;
+        const meta = headers.find((candidate) => candidate.id === id);
+        if (meta === undefined) throw new Error("not found");
+        return { meta, events: [] };
       }),
     },
-    get: (name: string) => contextServices.get(name),
+    get: (name: string) => contextServices.get(name) ?? (context as unknown as Record<string, unknown>)[name],
     __emit: (name: string, ...args: unknown[]) => {
       for (const listener of listeners.get(name) ?? []) listener(...(args as never[]));
     },
@@ -298,6 +336,30 @@ describe("durable ACP sessions", () => {
     );
   });
 
+  it("lists only bounded headers and accepts omitted persisted titles", async () => {
+    const state = services();
+    for (let index = 0; index < 101; index += 1) {
+      const meta = header({ id: `titled-${String(index).padStart(3, "0")}`, cwd: "/project", createdAt: index });
+      state.headers.push(meta);
+      state.inspections.set(String(meta.id), {
+        meta,
+        events: [{
+          type: "session/title",
+          seq: 0,
+          time: index + 1_000,
+          data: { title: `Title ${index}`, messageSeqs: [], source: { kind: "user" } },
+        }] as SessionEvent[],
+      });
+    }
+
+    const listed = await state.agent.listSessions({});
+
+    expect(listed.sessions).toHaveLength(100);
+    expect(listed.sessions[0]).not.toHaveProperty("title");
+    expect(state.context.sessionPersistence.inspect).not.toHaveBeenCalled();
+    expect(state.resume).not.toHaveBeenCalled();
+  });
+
   it("paginates session headers with an opaque stable cursor", async () => {
     const state = services();
     for (let index = 0; index < 101; index += 1) {
@@ -390,6 +452,10 @@ describe("durable ACP sessions", () => {
           content: { type: "text", text: "answer" },
         },
       },
+      {
+        sessionId: "cold",
+        update: { sessionUpdate: "available_commands_update", availableCommands: [] },
+      },
     ]);
 
     await state.agent.loadSession({ sessionId: "cold", cwd: "/project", mcpServers: [] });
@@ -465,9 +531,10 @@ describe("durable ACP sessions", () => {
       agent: { session: { id: meta.id, header: meta, events: [] } },
       dispose,
     } as unknown as AgentHandle;
-    state.resume.mockImplementationOnce(async () => {
+    state.resume.mockImplementationOnce(async (options) => {
       resumed.resolve();
       await release.promise;
+      await options.setup?.(Object.assign(Object.create(state.context), { agent: handle.agent }));
       state.live.set("raced", handle);
       return handle;
     });
@@ -494,6 +561,28 @@ describe("durable ACP sessions", () => {
     expect(state.live.has("raced")).toBe(false);
   });
 
+  it("cleans up when owner disposal wins during loaded config discovery", async () => {
+    const state = services();
+    const meta = header({ id: "load-config-race", cwd: "/project" });
+    state.headers.push(meta);
+    state.inspections.set("load-config-race", { meta, events: [] });
+    const lookup = Promise.withResolvers<unknown>();
+    state.contextServices.set("llm", {
+      listProviders: () => [{ id: "provider", name: "Provider" }],
+      listModels: () => lookup.promise,
+      resolveModelInfo: async () => ({}),
+    });
+
+    const loading = state.agent.loadSession({ sessionId: "load-config-race", cwd: "/project", mcpServers: [] });
+    await expect.poll(() => state.resume.mock.calls.length).toBe(1);
+    const disposal = state.agent.dispose();
+    lookup.resolve([{ id: "model", name: "Model" }]);
+
+    await expect(loading).rejects.toThrow("unable to load DeepSeek session");
+    await disposal;
+    expect(state.live.has("load-config-race")).toBe(false);
+  });
+
   it("reports failed resumed-handle cleanup through owner disposal", async () => {
     const state = services();
     const meta = header({ id: "failed-cleanup", cwd: "/project" });
@@ -508,9 +597,10 @@ describe("durable ACP sessions", () => {
       agent: { session: { id: meta.id, header: meta, events: [] } },
       dispose,
     } as unknown as AgentHandle;
-    state.resume.mockImplementationOnce(async () => {
+    state.resume.mockImplementationOnce(async (options) => {
       resumed.resolve();
       await release.promise;
+      await options.setup?.(Object.assign(Object.create(state.context), { agent: handle.agent }));
       state.live.set("failed-cleanup", handle);
       return handle;
     });
@@ -529,6 +619,31 @@ describe("durable ACP sessions", () => {
     expect(state.diagnostics.join("\n")).toContain("synthetic load cleanup failure");
   });
 
+  it("degrades command enumeration failure while loading", async () => {
+    const state = services();
+    const meta = header({ id: "load-cleanup", cwd: "/project" });
+    state.headers.push(meta);
+    state.inspections.set("load-cleanup", { meta, events: [] });
+    state.contextServices.set("commands", {
+      list: () => {
+        throw new Error("synthetic command failure");
+      },
+    });
+    const originalResume = state.resume.getMockImplementation() as (...args: unknown[]) => Promise<AgentHandle>;
+    state.resume.mockImplementationOnce(async (...args: unknown[]) => {
+      const handle = await originalResume(...args);
+      vi.mocked(handle.dispose).mockRejectedValueOnce(new Error("synthetic load cleanup failure"));
+      return handle;
+    });
+
+    await expect(
+      state.agent.loadSession({ sessionId: "load-cleanup", cwd: "/project", mcpServers: [] }),
+    ).resolves.toEqual({ configOptions: [] });
+    expect(state.live.has("load-cleanup")).toBe(true);
+    expect(state.diagnostics.join("\n")).toContain("commands/list category=unavailable");
+    expect(state.diagnostics.join("\n")).not.toContain("synthetic command failure");
+  });
+
   it("makes close wait for an in-flight load ownership transition", async () => {
     const state = services();
     const meta = header({ id: "closing-load", cwd: "/project" });
@@ -543,9 +658,10 @@ describe("durable ACP sessions", () => {
       agent: { session: { id: meta.id, header: meta, events: [] } },
       dispose,
     } as unknown as AgentHandle;
-    state.resume.mockImplementationOnce(async () => {
+    state.resume.mockImplementationOnce(async (options) => {
       resumed.resolve();
       await release.promise;
+      await options.setup?.(Object.assign(Object.create(state.context), { agent: handle.agent }));
       state.live.set("closing-load", handle);
       return handle;
     });
@@ -681,6 +797,61 @@ describe("durable ACP sessions", () => {
     expect(state.diagnostics.join("\n")).toContain("synthetic cleanup failure");
   });
 
+  it("removes a failed new session record after cleaning up its handle", async () => {
+    const state = services();
+    state.contextServices.set("llm", {
+      listProviders: () => {
+        throw new Error("synthetic catalog failure");
+      },
+    });
+
+    await expect(state.agent.newSession({ cwd: "/project", mcpServers: [] })).rejects.toThrow(
+      "unable to create DeepSeek session",
+    );
+    const sessionId = state.create.mock.calls[0]![0].sessionId as string;
+    const handle = await state.create.mock.results[0]!.value as AgentHandle;
+    expect(state.live.has(sessionId)).toBe(false);
+
+    await expect(state.agent.closeSession({ sessionId })).resolves.toEqual({});
+    expect(handle.dispose).toHaveBeenCalledOnce();
+  });
+
+  it("cleans up when owner disposal wins after new-session output", async () => {
+    const state = services();
+    const output = Promise.withResolvers<void>();
+    state.contextServices.set("commands", {
+      list: () => [{ name: "compact", description: "Compact" }],
+    });
+    state.sessionUpdate.mockReturnValueOnce(output.promise);
+    const creating = state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    await expect.poll(() => state.sessionUpdate.mock.calls.length).toBe(1);
+
+    const disposal = state.agent.dispose();
+    output.resolve();
+
+    await expect(creating).rejects.toThrow("unable to create DeepSeek session");
+    await disposal;
+    expect(state.live.size).toBe(0);
+  });
+
+  it("retains an adopted new session when failure cleanup disposal fails", async () => {
+    const state = services();
+    state.contextServices.set("commands", {
+      list: () => [{ name: "compact", description: "Compact" }],
+    });
+    const commandUpdate = Promise.withResolvers<void>();
+    state.sessionUpdate.mockReturnValueOnce(commandUpdate.promise);
+    const creating = state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    await expect.poll(() => state.live.size).toBe(1);
+    const [sessionId, handle] = [...state.live.entries()][0]!;
+    vi.mocked(handle.dispose).mockRejectedValueOnce(new Error("synthetic cleanup failure"));
+    commandUpdate.reject(new Error("synthetic command update failure"));
+
+    await expect(creating).rejects.toThrow("unable to create DeepSeek session");
+    await expect(state.agent.closeSession({ sessionId })).resolves.toEqual({});
+    expect(handle.dispose).toHaveBeenCalledTimes(2);
+  });
+
   it("rejects control characters in session ids before diagnostics", async () => {
     const state = services();
 
@@ -715,6 +886,35 @@ describe("durable ACP sessions", () => {
     });
     expect(previous).toMatchObject({ hasMore: false });
     expect(previous.updates).toHaveLength(1);
+  });
+
+  it("counts command results as history message boundaries", async () => {
+    const state = services();
+    const meta = header({ id: "command-history", cwd: "/project" });
+    state.headers.push(meta);
+    state.inspections.set("command-history", {
+      meta,
+      events: [
+        ...events(),
+        {
+          type: "command/done",
+          seq: 2,
+          time: 30,
+          data: { commandId: CommandId("command-1"), kind: "success", text: "Compacted" },
+        } as SessionEvent,
+      ],
+    });
+
+    const page = await state.agent.extMethod("deepseek/session/history", {
+      sessionId: "command-history",
+      maxMessages: 1,
+    });
+
+    expect(page.hasMore).toBe(true);
+    expect(page.nextBeforeSeq).toBe(2);
+    expect(page.updates).toEqual([
+      expect.objectContaining({ update: expect.objectContaining({ content: { type: "text", text: "Compacted" } }) }),
+    ]);
   });
 
   it("rejects cwd conflicts and unknown required history events", async () => {
@@ -863,6 +1063,766 @@ describe("durable ACP sessions", () => {
         totalTokens: 16,
       },
     });
+  });
+
+  it("exposes opaque catalogs and applies exact model and reasoning selections", async () => {
+    const state = services();
+    const secret = "SENTINEL_PROVIDER_CREDENTIAL";
+    state.contextServices.set("llm", {
+      listProviders: () => [
+        { id: "gateway/東京", name: "Gateway 東京" },
+        { id: "broken", name: "Broken" },
+      ],
+      listModels: async (provider: string) => {
+        if (provider === "broken") throw new Error(secret);
+        return [
+          { provider, id: "models/code/pro", name: "Code / Pro" },
+          { provider, id: "模型/vision", name: "Vision 模型" },
+        ];
+      },
+      resolveModelInfo: async (provider: string, model: string) => ({
+        provider,
+        id: model,
+        name: model,
+        inputModalities: model.includes("vision") ? ["text", "image"] : ["text"],
+        reasoning: {
+          efforts: [
+            { id: "low", name: "Low" },
+            { id: "high", name: "High" },
+          ],
+          defaultEffort: "high",
+        },
+      }),
+    });
+    state.contextServices.set("agentDefaultModel", {
+      currentSelection: () => ({ provider: "gateway/東京", model: "models/code/pro", reasoningEffort: "low" }),
+    });
+    state.contextServices.set("commands", {
+      list: () => [{ name: "compact", description: "Compact context" }],
+      find: () => undefined,
+    });
+
+    const catalog = await state.agent.extMethod("deepseek/catalog", { cwd: "/project" });
+    const providers = catalog.providers as { id: string; models: { id: string; upstreamModelId: string; supportsImages: boolean }[] }[];
+    expect(providers).toHaveLength(1);
+    expect(providers[0]?.models.map((model) => model.upstreamModelId)).toEqual([
+      "models/code/pro",
+      "模型/vision",
+    ]);
+    expect(providers[0]?.models.every((model) => model.id.startsWith("v1") && !model.id.includes("/"))).toBe(true);
+    expect(providers[0]?.models[1]?.supportsImages).toBe(true);
+    expect(catalog.failures).toEqual([
+      { providerId: "broken", category: "unavailable", message: "Provider catalog unavailable" },
+    ]);
+    expect(JSON.stringify(catalog)).not.toContain(secret);
+    expect(state.diagnostics).toContain(
+      "sesori-deepseek-acp: deepseek/catalog provider provider=\"broken\" category=unavailable\n",
+    );
+    expect(state.diagnostics.join("\n")).not.toContain(secret);
+
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    expect(created.configOptions?.map((option) => option.id)).toEqual([
+      "deepseek.model",
+      "deepseek.reasoning_effort",
+    ]);
+    const nextModel = providers[0]!.models[1]!.id;
+    const selected = await state.agent.setSessionConfigOption!({
+      sessionId: created.sessionId,
+      configId: "deepseek.model",
+      value: nextModel,
+    });
+    expect(selected.configOptions[0]?.currentValue).toBe(nextModel);
+    const reasoning = await state.agent.setSessionConfigOption!({
+      sessionId: created.sessionId,
+      configId: "deepseek.reasoning_effort",
+      value: "low",
+    });
+    expect(reasoning.configOptions[1]?.currentValue).toBe("low");
+    await expect(
+      state.agent.setSessionConfigOption!({
+        sessionId: created.sessionId,
+        configId: "deepseek.reasoning_effort",
+        value: "invented",
+      }),
+    ).rejects.toThrow("unknown DeepSeek reasoning effort");
+  });
+
+  it("omits malformed and excess providers before catalog fan-out", async () => {
+    const state = services();
+    const listModels = vi.fn(async (provider: string) => [{ id: "model", name: provider }]);
+    const descriptors = [
+      { id: "", name: "Blank" },
+      { id: "x".repeat(257), name: "Oversized" },
+      ...Array.from({ length: 64 }, (_, index) => ({ id: `provider-${index}`, name: `Provider ${index}` })),
+    ];
+    Object.defineProperty(descriptors, 66, {
+      get: () => {
+        throw new Error("excess provider inspected");
+      },
+    });
+    state.contextServices.set("llm", {
+      listProviders: () => descriptors,
+      listModels,
+      resolveModelInfo: async () => ({}),
+    });
+
+    const catalog = await state.agent.extMethod("deepseek/catalog", { cwd: "/project" });
+
+    expect(catalog.providers).toHaveLength(64);
+    expect(catalog.failures).toEqual([]);
+    expect(listModels).toHaveBeenCalledTimes(64);
+    expect(listModels).not.toHaveBeenCalledWith("");
+    expect(listModels).not.toHaveBeenCalledWith("x".repeat(257));
+    expect(listModels).not.toHaveBeenCalledWith("provider-64");
+    expect(state.diagnostics.join("\n")).toContain("provider-descriptors category=invalid");
+    expect(state.diagnostics.join("\n")).not.toContain("x".repeat(257));
+  });
+
+  it("sanitizes default selection failures in catalog and session diagnostics", async () => {
+    const state = services();
+    const secret = "SENTINEL_DEFAULT_MODEL_CREDENTIAL";
+    state.contextServices.set("agentDefaultModel", {
+      currentSelection: () => {
+        throw new Error(secret);
+      },
+    });
+    state.contextServices.set("llm", {
+      listProviders: () => [{ id: "provider", name: "Provider" }],
+      listModels: async () => [{ id: "model", name: "Model" }],
+      resolveModelInfo: async () => ({}),
+    });
+
+    const catalog = await state.agent.extMethod("deepseek/catalog", { cwd: "/project" });
+    await expect(state.agent.newSession({ cwd: "/project", mcpServers: [] })).rejects.toThrow(
+      "unable to create DeepSeek session",
+    );
+
+    expect(catalog.defaultSelectionId).toBeNull();
+    expect(state.diagnostics.join("\n")).toContain("default-selection category=unavailable");
+    expect(state.diagnostics.join("\n")).toContain("default model selection unavailable");
+    expect(state.diagnostics.join("\n")).not.toContain(secret);
+  });
+
+  it("sanitizes provider enumeration failures", async () => {
+    const state = services();
+    const secret = "SENTINEL_PROVIDER_ENUMERATION";
+    state.contextServices.set("llm", {
+      listProviders: () => {
+        throw new Error(secret);
+      },
+    });
+
+    await expect(state.agent.extMethod("deepseek/catalog", { cwd: "/project" })).rejects.toThrow();
+
+    expect(state.diagnostics.join("\n")).toContain("deepseek/catalog providers category=unavailable");
+    expect(state.diagnostics.join("\n")).not.toContain(secret);
+  });
+
+  it("classifies a provider with more than 256 models as unavailable", async () => {
+    const state = services();
+    state.contextServices.set("llm", {
+      listProviders: () => [
+        { id: "oversized", name: "Oversized" },
+        { id: "working", name: "Working" },
+      ],
+      listModels: async (provider: string) => provider === "oversized"
+        ? Array.from({ length: 257 }, (_, index) => ({ id: `model-${index}`, name: `Model ${index}` }))
+        : [{ id: "model", name: "Model" }],
+      resolveModelInfo: async () => ({}),
+    });
+
+    const catalog = await state.agent.extMethod("deepseek/catalog", { cwd: "/project" });
+
+    expect(catalog.providers).toEqual([expect.objectContaining({ id: "working" })]);
+    expect(catalog.failures).toEqual([
+      { providerId: "oversized", category: "unavailable", message: "Provider catalog unavailable" },
+    ]);
+  });
+
+  it("classifies nested provider schema violations independently", async () => {
+    const state = services();
+    state.contextServices.set("llm", {
+      listProviders: () => [{ id: "broken", name: "Broken" }, { id: "working", name: "Working" }],
+      listModels: async () => [{ id: "model", name: "Model" }],
+      resolveModelInfo: async (provider: string) => provider === "broken"
+        ? { reasoning: { efforts: [{ id: "low" }, { id: "low" }], defaultEffort: "low" } }
+        : {},
+    });
+
+    const catalog = await state.agent.extMethod("deepseek/catalog", { cwd: "/project" });
+
+    expect(catalog.providers).toEqual([expect.objectContaining({ id: "working" })]);
+    expect(catalog.failures).toEqual([
+      { providerId: "broken", category: "unavailable", message: "Provider catalog unavailable" },
+    ]);
+  });
+
+  it("classifies a provider with oversized generated selection ids as unavailable", async () => {
+    const state = services();
+    state.contextServices.set("llm", {
+      listProviders: () => [
+        { id: "oversized", name: "Oversized" },
+        { id: "working", name: "Working" },
+      ],
+      listModels: async (provider: string) => [{ id: provider === "oversized" ? "x".repeat(512) : "model", name: "Model" }],
+      resolveModelInfo: async () => ({}),
+    });
+    state.contextServices.set("agentDefaultModel", {
+      currentSelection: () => ({ provider: "working", model: "model" }),
+    });
+
+    const catalog = await state.agent.extMethod("deepseek/catalog", { cwd: "/project" });
+
+    expect(catalog.providers).toEqual([expect.objectContaining({ id: "working" })]);
+    expect(catalog.failures).toEqual([
+      { providerId: "oversized", category: "unavailable", message: "Provider catalog unavailable" },
+    ]);
+  });
+
+  it("degrades config options when current selection exceeds opaque bounds", async () => {
+    const state = services();
+    state.contextServices.set("llm", {
+      listProviders: () => [
+        { id: "oversized", name: "Oversized" },
+        { id: "working", name: "Working" },
+      ],
+      listModels: async (provider: string) => [{ id: provider === "oversized" ? "x".repeat(512) : "model", name: "Model" }],
+      resolveModelInfo: async () => ({}),
+    });
+    state.contextServices.set("agentDefaultModel", {
+      currentSelection: () => ({ provider: "oversized", model: "x".repeat(512) }),
+    });
+
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const loaded = await state.agent.loadSession({ sessionId: created.sessionId, cwd: "/project", mcpServers: [] });
+
+    expect(created.configOptions).toEqual([]);
+    expect(loaded.configOptions).toEqual([]);
+    const catalog = await state.agent.extMethod("deepseek/catalog", { cwd: "/project" });
+    expect(catalog).toMatchObject({
+      defaultSelectionId: null,
+      providers: [expect.objectContaining({ id: "working" })],
+      failures: [{ providerId: "oversized", category: "unavailable", message: "Provider catalog unavailable" }],
+    });
+  });
+
+  it("rejects oversized opaque model selections before decoding", async () => {
+    const state = services();
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const oversized = `v1${"A".repeat(511)}`;
+    const from = vi.spyOn(Buffer, "from");
+
+    await expect(
+      state.agent.setSessionConfigOption!({
+        sessionId: created.sessionId,
+        configId: "deepseek.model",
+        value: oversized,
+      }),
+    ).rejects.toThrow("unknown DeepSeek model selection");
+
+    expect(from.mock.calls.some(([value]) => value === oversized.slice(2))).toBe(false);
+    from.mockRestore();
+  });
+
+  it("keeps config options usable when selected model is absent from a partial catalog", async () => {
+    const state = services();
+    state.contextServices.set("llm", {
+      listProviders: () => [{ id: "surviving", name: "Surviving" }],
+      listModels: async () => [{ id: "available", name: "Available" }],
+      resolveModelInfo: async () => ({ reasoning: { efforts: [{ id: "low" }], defaultEffort: "low" } }),
+    });
+    state.contextServices.set("agentDefaultModel", {
+      currentSelection: () => ({ provider: "missing", model: "selected", reasoningEffort: "high" }),
+    });
+
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+
+    expect(created.configOptions).toEqual([
+      expect.objectContaining({ id: "deepseek.model", currentValue: expect.any(String) }),
+    ]);
+  });
+
+  it("reuses the fetched catalog when returning a changed config selection", async () => {
+    const state = services();
+    const listProviders = vi.fn(() => [{ id: "provider", name: "Provider" }]);
+    state.contextServices.set("llm", {
+      listProviders,
+      listModels: async () => [{ id: "first", name: "First" }, { id: "second", name: "Second" }],
+      resolveModelInfo: async () => ({}),
+    });
+    state.contextServices.set("agentDefaultModel", {
+      currentSelection: () => ({ provider: "provider", model: "first" }),
+    });
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const catalog = await state.agent.extMethod("deepseek/catalog", { cwd: "/project" });
+    const nextModel = (catalog.providers as { models: { id: string }[] }[])[0]!.models[1]!.id;
+    listProviders.mockClear();
+
+    await state.agent.setSessionConfigOption!({
+      sessionId: created.sessionId,
+      configId: "deepseek.model",
+      value: nextModel,
+    });
+
+    expect(listProviders).toHaveBeenCalledOnce();
+  });
+
+  it("rejects config mutation while a prompt is in flight before and after catalog lookup", async () => {
+    const state = services();
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const execution = Promise.withResolvers<unknown>();
+    state.contextServices.set("commands", {
+      list: () => [{ name: "hold", description: "Hold" }],
+      find: () => ({}),
+      execute: () => execution.promise,
+    });
+    const prompting = state.agent.prompt({
+      sessionId: created.sessionId,
+      prompt: [{ type: "text", text: "/hold" }],
+    });
+    await Promise.resolve();
+
+    await expect(state.agent.setSessionConfigOption!({
+      sessionId: created.sessionId,
+      configId: "deepseek.model",
+      value: "unknown",
+    })).rejects.toThrow("a prompt is in flight for this session");
+
+    execution.resolve({});
+    state.invoke("command/done", state.live.get(created.sessionId)!.agent, { kind: "completed" });
+    await prompting;
+
+    const lookup = Promise.withResolvers<unknown>();
+    state.contextServices.set("llm", {
+      listProviders: () => [{ id: "provider", name: "Provider" }],
+      listModels: () => lookup.promise,
+      resolveModelInfo: async () => ({}),
+    });
+    const changing = state.agent.setSessionConfigOption!({
+      sessionId: created.sessionId,
+      configId: "deepseek.model",
+      value: "unknown",
+    });
+    await Promise.resolve();
+    const secondExecution = Promise.withResolvers<unknown>();
+    state.contextServices.set("commands", {
+      list: () => [{ name: "hold", description: "Hold" }],
+      find: () => ({}),
+      execute: () => secondExecution.promise,
+    });
+    const secondPrompt = state.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "/hold" }] });
+    await Promise.resolve();
+    lookup.resolve([]);
+
+    await expect(changing).rejects.toThrow("a prompt is in flight for this session");
+    secondExecution.resolve({});
+    state.invoke("command/done", state.live.get(created.sessionId)!.agent, { kind: "completed" });
+    await secondPrompt;
+  });
+
+  it("rejects config mutation while session load starts during catalog lookup", async () => {
+    const state = services();
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const lookup = Promise.withResolvers<unknown>();
+    state.contextServices.set("llm", {
+      listProviders: () => [{ id: "provider", name: "Provider" }],
+      listModels: () => lookup.promise,
+      resolveModelInfo: async () => ({}),
+    });
+    const changing = state.agent.setSessionConfigOption!({
+      sessionId: created.sessionId,
+      configId: "deepseek.model",
+      value: "unknown",
+    });
+    await Promise.resolve();
+    const inspection = Promise.withResolvers<{ meta: SessionHeader; events: readonly SessionEvent[] }>();
+    vi.mocked(state.context.sessionPersistence.inspect).mockReturnValueOnce(inspection.promise);
+    const loading = state.agent.loadSession({ sessionId: created.sessionId, cwd: "/project", mcpServers: [] });
+    lookup.resolve([]);
+
+    await expect(changing).rejects.toThrow("session load is in progress");
+    inspection.resolve({ meta: header({ id: created.sessionId, cwd: "/project" }), events: [] });
+    await loading;
+  });
+
+  it("rejects config mutation when ownership changes during catalog lookup", async () => {
+    const state = services();
+    state.contextServices.set("llm", {
+      listProviders: () => [{ id: "provider", name: "Provider" }],
+      listModels: async () => [{ id: "first", name: "First" }, { id: "second", name: "Second" }],
+      resolveModelInfo: async () => ({}),
+    });
+    state.contextServices.set("agentDefaultModel", {
+      currentSelection: () => ({ provider: "provider", model: "first" }),
+    });
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const catalog = await state.agent.extMethod("deepseek/catalog", { cwd: "/project" });
+    const nextModel = (catalog.providers as { models: { id: string }[] }[])[0]!.models[1]!.id;
+    const lookup = Promise.withResolvers<unknown>();
+    state.contextServices.set("llm", {
+      listProviders: () => [{ id: "provider", name: "Provider" }],
+      listModels: () => lookup.promise,
+      resolveModelInfo: async () => ({}),
+    });
+    const changing = state.agent.setSessionConfigOption!({
+      sessionId: created.sessionId,
+      configId: "deepseek.model",
+      value: nextModel,
+    });
+    await Promise.resolve();
+    await state.agent.closeSession({ sessionId: created.sessionId });
+    lookup.resolve([{ id: "second", name: "Second" }]);
+
+    await expect(changing).rejects.toThrow("unknown session");
+  });
+
+  it("degrades malformed command discovery without leaking diagnostics", async () => {
+    const state = services();
+    const secret = "SENTINEL_COMMAND_DISCOVERY";
+    state.contextServices.set("commands", {
+      list: () => [{ name: "bad command", description: secret }],
+      find: () => undefined,
+    });
+
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const catalog = await state.agent.extMethod("deepseek/catalog", { cwd: "/project" });
+    state.invoke("commands/change");
+    await expect.poll(() => state.updates.length).toBe(1);
+
+    expect(created.configOptions).toEqual([]);
+    expect(catalog.commands).toEqual([]);
+    expect(state.updates.at(-1)).toMatchObject({
+      update: { sessionUpdate: "available_commands_update", availableCommands: [] },
+    });
+    expect(state.diagnostics.join("\n")).toContain("commands/list category=unavailable");
+    expect(state.diagnostics.join("\n")).not.toContain(secret);
+  });
+
+  it("sanitizes command enumeration exceptions across session paths", async () => {
+    const state = services();
+    const secret = "SENTINEL_COMMAND_ENUMERATION";
+    state.contextServices.set("commands", {
+      list: () => {
+        throw new Error(secret);
+      },
+      find: () => undefined,
+    });
+
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    await state.agent.loadSession({ sessionId: created.sessionId, cwd: "/project", mcpServers: [] });
+    state.invoke("commands/change");
+    await Promise.resolve();
+
+    expect(state.diagnostics.join("\n")).toContain("commands/list category=unavailable");
+    expect(state.diagnostics.join("\n")).not.toContain(secret);
+  });
+
+  it("clears stale commands when a loaded session has none", async () => {
+    const state = services();
+    const meta = header({ id: "no-commands", cwd: "/project" });
+    state.headers.push(meta);
+    state.inspections.set("no-commands", { meta, events: [] });
+
+    await state.agent.loadSession({ sessionId: "no-commands", cwd: "/project", mcpServers: [] });
+
+    expect(state.updates).toContainEqual({
+      sessionId: "no-commands",
+      update: { sessionUpdate: "available_commands_update", availableCommands: [] },
+    });
+  });
+
+  it("routes only exact advertised slash commands away from the model", async () => {
+    const state = services();
+    const execute = vi.fn(async (agent: Agent, _line: string) => {
+      agent.session.append("command/done", {
+        commandId: CommandId("command-1"),
+        kind: "success",
+        text: "Compacted",
+      });
+      return { commandId: "command-1", result: { kind: "success", text: "Compacted" } };
+    });
+    state.contextServices.set("commands", {
+      list: () => [{ name: "compact", description: "Compact context" }],
+      find: (_agent: Agent, name: string) => (name === "compact" ? {} : undefined),
+      execute,
+    });
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const handle = state.live.get(created.sessionId)!;
+    state.updates.length = 0;
+
+    await expect(
+      state.agent.prompt({
+        sessionId: created.sessionId,
+        prompt: [
+          { type: "text", text: "/compact now" },
+          { type: "image", data: "not-base64", mimeType: "image/png" },
+        ],
+      }),
+    ).rejects.toThrow("invalid image base64");
+    expect(execute).not.toHaveBeenCalled();
+
+    await expect(
+      state.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "/compact now" }] }),
+    ).resolves.toEqual({ stopReason: "end_turn" });
+    expect(execute).toHaveBeenCalledOnce();
+    expect(handle.agent.followup).not.toHaveBeenCalled();
+    expect(state.updates).toContainEqual({
+      sessionId: created.sessionId,
+      update: expect.objectContaining({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "Compacted" },
+      }),
+    });
+
+    const prose = state.agent.prompt({
+      sessionId: created.sessionId,
+      prompt: [{ type: "text", text: "/compacting is ordinary prose" }],
+    });
+    await expect.poll(() => vi.mocked(handle.agent.followup).mock.calls.length).toBe(1);
+    state.invoke("session/event", handle.agent.session, {
+      type: "turn/end",
+      data: { turn: 1, reason: { kind: "completed" } },
+    });
+    await expect(prose).resolves.toEqual({ stopReason: "end_turn" });
+    expect(execute).toHaveBeenCalledOnce();
+  });
+
+  it("sanitizes command execution errors in diagnostics", async () => {
+    const state = services();
+    const secret = "SENTINEL_COMMAND_ARGUMENT";
+    state.contextServices.set("commands", {
+      list: () => [{ name: "login", description: "Login" }],
+      find: () => ({}),
+      execute: async () => {
+        throw new Error(`login failed for ${secret}`);
+      },
+    });
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+
+    await expect(
+      state.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: `/login ${secret}` }] }),
+    ).rejects.toThrow("turn output failed");
+
+    expect(state.diagnostics).toContain(
+      `sesori-deepseek-acp: session/command session=${created.sessionId} command="login" category=execution_failed\n`,
+    );
+    expect(state.diagnostics.join("\n")).not.toContain(secret);
+    expect(state.diagnostics.join("\n")).not.toContain("login failed for");
+  });
+
+  it("settles cancellation when a command ignores its abort signal", async () => {
+    const state = services();
+    const execution = Promise.withResolvers<unknown>();
+    state.contextServices.set("commands", {
+      list: () => [{ name: "hang", description: "Hang" }],
+      find: () => ({}),
+      execute: () => execution.promise,
+    });
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const prompt = state.agent.prompt({
+      sessionId: created.sessionId,
+      prompt: [{ type: "text", text: "/hang" }],
+    });
+    await Promise.resolve();
+
+    await state.agent.cancel({ sessionId: created.sessionId });
+    await expect(prompt).resolves.toEqual({ stopReason: "cancelled" });
+  });
+
+  it("renames live and cold sessions through the title owner", async () => {
+    const state = services();
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    await expect(
+      state.agent.extMethod("deepseek/session/rename", {
+        sessionId: created.sessionId,
+        title: "Live title",
+      }),
+    ).resolves.toEqual({ title: "Live title" });
+    expect(state.updates.at(-1)).toMatchObject({
+      sessionId: created.sessionId,
+      update: { sessionUpdate: "session_info_update", title: "Live title" },
+    });
+
+    const meta = header({ id: "cold-rename", cwd: "/project" });
+    state.headers.push(meta);
+    state.inspections.set("cold-rename", { meta, events: [] });
+    await expect(
+      state.agent.extMethod("deepseek/session/rename", {
+        sessionId: "cold-rename",
+        title: "Cold title",
+      }),
+    ).resolves.toEqual({ title: "Cold title" });
+    expect(state.resume).toHaveBeenCalledWith(expect.objectContaining({ resumeSessionId: "cold-rename" }));
+    expect(state.live.has("cold-rename")).toBe(false);
+  });
+
+  it("blocks concurrent operations during cold rename inspection", async () => {
+    const state = services();
+    const meta = header({ id: "rename-inspecting", cwd: "/project" });
+    state.headers.push(meta);
+    state.inspections.set("rename-inspecting", { meta, events: [] });
+    const inspection = Promise.withResolvers<{ meta: SessionHeader; events: readonly SessionEvent[] }>();
+    vi.mocked(state.context.sessionPersistence.inspect).mockReturnValueOnce(inspection.promise);
+    const renaming = state.agent.extMethod("deepseek/session/rename", {
+      sessionId: "rename-inspecting",
+      title: "Cold title",
+    });
+    await expect.poll(() => vi.mocked(state.context.sessionPersistence.inspect).mock.calls.length).toBe(1);
+
+    await expect(
+      state.agent.prompt({ sessionId: "rename-inspecting", prompt: [{ type: "text", text: "question" }] }),
+    ).rejects.toThrow("session load is in progress");
+    inspection.resolve({ meta, events: [] });
+    await expect(renaming).resolves.toEqual({ title: "Cold title" });
+  });
+
+  it("clears cold rename transition after inspection failure so retry works", async () => {
+    const state = services();
+    const meta = header({ id: "rename-retry", cwd: "/project" });
+    state.headers.push(meta);
+    state.inspections.set("rename-retry", { meta, events: [] });
+    vi.mocked(state.context.sessionPersistence.inspect).mockRejectedValueOnce(new Error("synthetic inspect failure"));
+
+    await expect(
+      state.agent.extMethod("deepseek/session/rename", { sessionId: "rename-retry", title: "First" }),
+    ).rejects.toThrow("unable to rename DeepSeek session");
+    await expect(
+      state.agent.extMethod("deepseek/session/rename", { sessionId: "rename-retry", title: "Second" }),
+    ).resolves.toEqual({ title: "Second" });
+  });
+
+  it("validates cold rename persistence before resuming", async () => {
+    const state = services();
+    const meta = header({ id: "unlisted-rename", cwd: "/project" });
+    state.inspections.set("unlisted-rename", { meta, events: [] });
+
+    await expect(
+      state.agent.extMethod("deepseek/session/rename", {
+        sessionId: "unlisted-rename",
+        title: "Cold title",
+      }),
+    ).rejects.toThrow("unknown session");
+    expect(state.resume).not.toHaveBeenCalled();
+  });
+
+  it("returns a persisted live rename when queued update delivery fails", async () => {
+    const state = services();
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    state.sessionUpdate.mockRejectedValueOnce(new Error("synthetic live rename update failure"));
+
+    await expect(
+      state.agent.extMethod("deepseek/session/rename", {
+        sessionId: created.sessionId,
+        title: "Persisted live title",
+      }),
+    ).resolves.toEqual({ title: "Persisted live title" });
+    expect(state.diagnostics.join("\n")).toContain("session/title update");
+    expect(state.diagnostics.join("\n")).toContain("synthetic live rename update failure");
+  });
+
+  it("keeps live rename updates ordered without failing a concurrent prompt", async () => {
+    const state = services();
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const handle = state.live.get(created.sessionId)!;
+    const first = Promise.withResolvers<void>();
+    state.sessionUpdate.mockImplementationOnce(() => first.promise);
+    const completion = state.agent.prompt({
+      sessionId: created.sessionId,
+      prompt: [{ type: "text", text: "question" }],
+    });
+    await expect.poll(() => vi.mocked(handle.agent.followup).mock.calls.length).toBe(1);
+    state.invoke("session/event", handle.agent.session, {
+      type: "assistant/chunk",
+      data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "answer" } },
+    });
+    state.invoke("session/event", handle.agent.session, {
+      type: "session/title",
+      data: { title: "Persisted live title" },
+    });
+    state.invoke("session/event", handle.agent.session, {
+      type: "turn/end",
+      data: { turn: 1, reason: { kind: "completed" } },
+    });
+    await expect.poll(() => state.sessionUpdate.mock.calls.length).toBe(1);
+
+    state.sessionUpdate.mockRejectedValueOnce(new Error("synthetic live title update failure"));
+    first.resolve();
+
+    await expect(completion).resolves.toEqual({ stopReason: "end_turn" });
+    await expect.poll(() => state.sessionUpdate.mock.calls.length).toBe(2);
+    expect(state.sessionUpdate.mock.calls[1]?.[0]).toMatchObject({
+      update: { sessionUpdate: "session_info_update", title: "Persisted live title" },
+    });
+    expect(state.diagnostics.join("\n")).toContain("session/title update");
+  });
+
+  it("returns a persisted cold rename when update delivery fails", async () => {
+    const state = services();
+    const meta = header({ id: "rename-update-failure", cwd: "/project" });
+    state.headers.push(meta);
+    state.inspections.set("rename-update-failure", { meta, events: [] });
+    state.sessionUpdate.mockRejectedValueOnce(new Error("synthetic rename update failure"));
+
+    await expect(
+      state.agent.extMethod("deepseek/session/rename", {
+        sessionId: "rename-update-failure",
+        title: "Persisted title",
+      }),
+    ).resolves.toEqual({ title: "Persisted title" });
+    expect(state.live.has("rename-update-failure")).toBe(false);
+    expect(state.diagnostics.join("\n")).toContain("deepseek/session/rename update session=rename-update-failure");
+    expect(state.diagnostics.join("\n")).toContain("synthetic rename update failure");
+  });
+
+  it("retains a cold rename handle when disposal fails so close can retry", async () => {
+    const state = services();
+    const meta = header({ id: "rename-cleanup", cwd: "/project" });
+    state.headers.push(meta);
+    state.inspections.set("rename-cleanup", { meta, events: [] });
+    const originalResume = state.resume.getMockImplementation() as (...args: unknown[]) => Promise<AgentHandle>;
+    state.resume.mockImplementationOnce(async (...args: unknown[]) => {
+      const handle = await originalResume(...args);
+      vi.mocked(handle.dispose).mockRejectedValueOnce(new Error("synthetic rename cleanup failure"));
+      return handle;
+    });
+
+    await expect(
+      state.agent.extMethod("deepseek/session/rename", {
+        sessionId: "rename-cleanup",
+        title: "Cold title",
+      }),
+    ).rejects.toThrow("unable to release renamed DeepSeek session");
+    const handle = state.live.get("rename-cleanup")!;
+
+    await expect(state.agent.closeSession({ sessionId: "rename-cleanup" })).resolves.toEqual({});
+    expect(handle.dispose).toHaveBeenCalledTimes(2);
+    expect(state.live.has("rename-cleanup")).toBe(false);
+  });
+
+  it("keeps command updates ordered without failing an active prompt", async () => {
+    const state = services();
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const handle = state.live.get(created.sessionId)!;
+    const first = Promise.withResolvers<void>();
+    state.sessionUpdate.mockImplementationOnce(() => first.promise);
+    const completion = state.agent.prompt({
+      sessionId: created.sessionId,
+      prompt: [{ type: "text", text: "question" }],
+    });
+    await expect.poll(() => vi.mocked(handle.agent.followup).mock.calls.length).toBe(1);
+
+    state.invoke("commands/change");
+    state.invoke("commands/change");
+    await expect.poll(() => state.sessionUpdate.mock.calls.length).toBe(1);
+    first.reject(new Error("synthetic command update failure"));
+    await expect.poll(() => state.sessionUpdate.mock.calls.length).toBe(2);
+    state.invoke("session/event", handle.agent.session, {
+      type: "turn/end",
+      data: { turn: 1, reason: { kind: "completed" } },
+    });
+
+    await expect(completion).resolves.toEqual({ stopReason: "end_turn" });
+    expect(state.diagnostics.join("\n")).toContain("session/commands update");
   });
 
   it("keeps later output moving after one client update fails", async () => {

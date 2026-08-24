@@ -1058,7 +1058,13 @@ export class DurableSessionAgent implements AcpAgent {
       get current(): ModelSelection {
         if (selected !== undefined) return selected;
         const logged = agent.session.requestHeader()?.config;
-        if (logged === undefined) return defaults.currentSelection();
+        if (logged === undefined) {
+          try {
+            return defaults.currentSelection();
+          } catch {
+            throw new Error("default model selection unavailable");
+          }
+        }
         return {
           provider: logged.provider,
           model: logged.model,
@@ -1126,8 +1132,26 @@ export class DurableSessionAgent implements AcpAgent {
       this.#diagnostics.write("sesori-deepseek-acp: deepseek/catalog providers category=unavailable\n");
       throw new Error("DeepSeek provider catalog unavailable");
     }
+    let invalidDescriptors = 0;
+    const validDescriptors = descriptors.filter((provider) => {
+      const valid = validateProtocolValue({
+        definition: "catalogResponse",
+        value: {
+          agent: { id: "deepseek", name: "DeepSeek", primary: true },
+          providers: [{ id: provider.id, name: provider.name, models: [] }],
+          defaultSelectionId: null,
+          commands: [],
+          failures: [],
+        },
+      }).valid;
+      if (!valid) invalidDescriptors += 1;
+      return valid;
+    }).slice(0, 64);
+    if (invalidDescriptors > 0) {
+      this.#diagnostics.write("sesori-deepseek-acp: deepseek/catalog provider-descriptors category=invalid\n");
+    }
     const providers = await Promise.all(
-      descriptors.map(async (provider) => {
+      validDescriptors.map(async (provider) => {
         try {
           const models = await llm.listModels(provider.id);
           if (models.length > 256) throw new Error("provider model catalog exceeds protocol bounds");
@@ -1176,7 +1200,9 @@ export class DurableSessionAgent implements AcpAgent {
     let defaultSelectionId: string | null = null;
     try {
       defaultSelectionId = selectionId(defaults.currentSelection());
-    } catch {}
+    } catch {
+      this.#diagnostics.write("sesori-deepseek-acp: deepseek/catalog default-selection category=unavailable\n");
+    }
     const response: CatalogResponse = {
       agent: { id: "deepseek", name: "DeepSeek", primary: true },
       providers: providers.flatMap((item) =>
@@ -1539,7 +1565,7 @@ export class DurableSessionAgent implements AcpAgent {
 
   #projectEvent(record: SessionRecord, event: SessionEvent): void {
     const sessionId = String(record.handle.agent.id);
-    this.#queue(record, () =>
+    const project = () =>
       projectSessionEvent(
         {
           context: this.#context,
@@ -1565,8 +1591,14 @@ export class DurableSessionAgent implements AcpAgent {
           },
         },
         event,
-      ),
-    );
+      );
+    if (event.type === "session/title") {
+      record.outputTail = record.outputTail.catch(() => undefined).then(project).catch((error: unknown) => {
+        this.#diagnose("session/title update", record.handle.agent.id, error);
+      });
+      return;
+    }
+    this.#queue(record, project);
   }
 
   #settle(record: SessionRecord, inflight: InflightPrompt): void {

@@ -1071,10 +1071,10 @@ describe("durable ACP sessions", () => {
     state.contextServices.set("llm", {
       listProviders: () => [
         { id: "gateway/東京", name: "Gateway 東京" },
-        { id: "broken\ninjected", name: "Broken" },
+        { id: "broken", name: "Broken" },
       ],
       listModels: async (provider: string) => {
-        if (provider === "broken\ninjected") throw new Error(secret);
+        if (provider === "broken") throw new Error(secret);
         return [
           { provider, id: "models/code/pro", name: "Code / Pro" },
           { provider, id: "模型/vision", name: "Vision 模型" },
@@ -1112,11 +1112,11 @@ describe("durable ACP sessions", () => {
     expect(providers[0]?.models.every((model) => model.id.startsWith("v1") && !model.id.includes("/"))).toBe(true);
     expect(providers[0]?.models[1]?.supportsImages).toBe(true);
     expect(catalog.failures).toEqual([
-      { providerId: "broken\ninjected", category: "unavailable", message: "Provider catalog unavailable" },
+      { providerId: "broken", category: "unavailable", message: "Provider catalog unavailable" },
     ]);
     expect(JSON.stringify(catalog)).not.toContain(secret);
     expect(state.diagnostics).toContain(
-      "sesori-deepseek-acp: deepseek/catalog provider provider=\"broken\\ninjected\" category=unavailable\n",
+      "sesori-deepseek-acp: deepseek/catalog provider provider=\"broken\" category=unavailable\n",
     );
     expect(state.diagnostics.join("\n")).not.toContain(secret);
 
@@ -1145,6 +1145,56 @@ describe("durable ACP sessions", () => {
         value: "invented",
       }),
     ).rejects.toThrow("unknown DeepSeek reasoning effort");
+  });
+
+  it("omits malformed and excess providers before catalog fan-out", async () => {
+    const state = services();
+    const listModels = vi.fn(async (provider: string) => [{ id: "model", name: provider }]);
+    state.contextServices.set("llm", {
+      listProviders: () => [
+        { id: "", name: "Blank" },
+        { id: "x".repeat(257), name: "Oversized" },
+        ...Array.from({ length: 65 }, (_, index) => ({ id: `provider-${index}`, name: `Provider ${index}` })),
+      ],
+      listModels,
+      resolveModelInfo: async () => ({}),
+    });
+
+    const catalog = await state.agent.extMethod("deepseek/catalog", { cwd: "/project" });
+
+    expect(catalog.providers).toHaveLength(64);
+    expect(catalog.failures).toEqual([]);
+    expect(listModels).toHaveBeenCalledTimes(64);
+    expect(listModels).not.toHaveBeenCalledWith("");
+    expect(listModels).not.toHaveBeenCalledWith("x".repeat(257));
+    expect(listModels).not.toHaveBeenCalledWith("provider-64");
+    expect(state.diagnostics.join("\n")).toContain("provider-descriptors category=invalid");
+    expect(state.diagnostics.join("\n")).not.toContain("x".repeat(257));
+  });
+
+  it("sanitizes default selection failures in catalog and session diagnostics", async () => {
+    const state = services();
+    const secret = "SENTINEL_DEFAULT_MODEL_CREDENTIAL";
+    state.contextServices.set("agentDefaultModel", {
+      currentSelection: () => {
+        throw new Error(secret);
+      },
+    });
+    state.contextServices.set("llm", {
+      listProviders: () => [{ id: "provider", name: "Provider" }],
+      listModels: async () => [{ id: "model", name: "Model" }],
+      resolveModelInfo: async () => ({}),
+    });
+
+    const catalog = await state.agent.extMethod("deepseek/catalog", { cwd: "/project" });
+    await expect(state.agent.newSession({ cwd: "/project", mcpServers: [] })).rejects.toThrow(
+      "unable to create DeepSeek session",
+    );
+
+    expect(catalog.defaultSelectionId).toBeNull();
+    expect(state.diagnostics.join("\n")).toContain("default-selection category=unavailable");
+    expect(state.diagnostics.join("\n")).toContain("default model selection unavailable");
+    expect(state.diagnostics.join("\n")).not.toContain(secret);
   });
 
   it("sanitizes provider enumeration failures", async () => {
@@ -1660,8 +1710,44 @@ describe("durable ACP sessions", () => {
         title: "Persisted live title",
       }),
     ).resolves.toEqual({ title: "Persisted live title" });
-    expect(state.diagnostics.join("\n")).toContain("deepseek/session/rename update");
+    expect(state.diagnostics.join("\n")).toContain("session/title update");
     expect(state.diagnostics.join("\n")).toContain("synthetic live rename update failure");
+  });
+
+  it("keeps live rename updates ordered without failing a concurrent prompt", async () => {
+    const state = services();
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const handle = state.live.get(created.sessionId)!;
+    const first = Promise.withResolvers<void>();
+    state.sessionUpdate.mockImplementationOnce(() => first.promise);
+    const completion = state.agent.prompt({
+      sessionId: created.sessionId,
+      prompt: [{ type: "text", text: "question" }],
+    });
+    await expect.poll(() => vi.mocked(handle.agent.followup).mock.calls.length).toBe(1);
+    state.invoke("session/event", handle.agent.session, {
+      type: "assistant/chunk",
+      data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "answer" } },
+    });
+    state.invoke("session/event", handle.agent.session, {
+      type: "session/title",
+      data: { title: "Persisted live title" },
+    });
+    state.invoke("session/event", handle.agent.session, {
+      type: "turn/end",
+      data: { turn: 1, reason: { kind: "completed" } },
+    });
+    await expect.poll(() => state.sessionUpdate.mock.calls.length).toBe(1);
+
+    state.sessionUpdate.mockRejectedValueOnce(new Error("synthetic live title update failure"));
+    first.resolve();
+
+    await expect(completion).resolves.toEqual({ stopReason: "end_turn" });
+    await expect.poll(() => state.sessionUpdate.mock.calls.length).toBe(2);
+    expect(state.sessionUpdate.mock.calls[1]?.[0]).toMatchObject({
+      update: { sessionUpdate: "session_info_update", title: "Persisted live title" },
+    });
+    expect(state.diagnostics.join("\n")).toContain("session/title update");
   });
 
   it("returns a persisted cold rename when update delivery fails", async () => {

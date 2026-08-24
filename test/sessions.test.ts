@@ -1128,6 +1128,33 @@ describe("durable ACP sessions", () => {
     ]);
   });
 
+  it("degrades config options when current selection exceeds opaque bounds", async () => {
+    const state = services();
+    state.contextServices.set("llm", {
+      listProviders: () => [
+        { id: "oversized", name: "Oversized" },
+        { id: "working", name: "Working" },
+      ],
+      listModels: async (provider: string) => [{ id: provider === "oversized" ? "x".repeat(512) : "model", name: "Model" }],
+      resolveModelInfo: async () => ({}),
+    });
+    state.contextServices.set("agentDefaultModel", {
+      currentSelection: () => ({ provider: "oversized", model: "x".repeat(512) }),
+    });
+
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const loaded = await state.agent.loadSession({ sessionId: created.sessionId, cwd: "/project", mcpServers: [] });
+
+    expect(created.configOptions).toEqual([]);
+    expect(loaded.configOptions).toEqual([]);
+    const catalog = await state.agent.extMethod("deepseek/catalog", { cwd: "/project" });
+    expect(catalog).toMatchObject({
+      defaultSelectionId: null,
+      providers: [expect.objectContaining({ id: "working" })],
+      failures: [{ providerId: "oversized", category: "unavailable", message: "Provider catalog unavailable" }],
+    });
+  });
+
   it("rejects oversized opaque model selections before decoding", async () => {
     const state = services();
     const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });

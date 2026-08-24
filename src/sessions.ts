@@ -1137,12 +1137,16 @@ export class DurableSessionAgent implements AcpAgent {
         }
       }),
     );
+    let defaultSelectionId: string | null = null;
+    try {
+      defaultSelectionId = selectionId(defaults.currentSelection());
+    } catch {}
     const response: CatalogResponse = {
       agent: { id: "deepseek", name: "DeepSeek", primary: true },
       providers: providers.flatMap((item) =>
         "provider" in item && item.provider.models.length > 0 ? [item.provider] : [],
       ),
-      defaultSelectionId: selectionId(defaults.currentSelection()),
+      defaultSelectionId,
       commands: this.#commands().map(({ name, description }) => ({ name, description })),
       failures: providers.flatMap((item) => ("failure" in item ? [item.failure] : [])),
     };
@@ -1157,7 +1161,12 @@ export class DurableSessionAgent implements AcpAgent {
     if (catalog.providers.length === 0) return [];
     const current = record.selection.current;
     if (current === undefined) throw new Error("session has no model selection");
-    const selectedId = selectionId(current);
+    let selectedId: string;
+    try {
+      selectedId = selectionId(current);
+    } catch {
+      return [];
+    }
     const selectedModel = catalog.providers
       .flatMap((provider) => provider.models)
       .find((model) => model.id === selectedId);

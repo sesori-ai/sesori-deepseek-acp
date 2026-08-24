@@ -1,4 +1,5 @@
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,6 +8,7 @@ import assert from "node:assert/strict";
 import {
   nodeAssetName,
   releaseArchiveName,
+  removePackageManagerLinks,
   targetDefinitions,
   verifyChecksumManifest,
 } from "./package-release.mjs";
@@ -39,6 +41,21 @@ test("Node checksum verification requires one exact official entry", () => {
     assetName: "node-v24.19.0-linux-x64.tar.xz",
     digest,
   }), /checksum mismatch/u);
+});
+
+test("package cleanup removes npm command symlinks", async () => {
+  const root = await mkdtemp(join(tmpdir(), "sesori-release-links-test-"));
+  try {
+    const bin = join(root, "node_modules", ".bin");
+    await mkdir(bin, { recursive: true });
+    await symlink("../tool/cli.js", join(bin, "tool"));
+
+    await removePackageManagerLinks(root);
+
+    assert.equal(existsSync(bin), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("release checksum aggregation rejects missing targets and emits sorted hashes", async () => {

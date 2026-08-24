@@ -768,6 +768,7 @@ export class DurableSessionAgent implements AcpAgent {
       const inflight = record?.inflight;
       if (record === undefined || inflight === undefined || !inflight.queued || (!inflight.command && inflight.turn !== turn)) return;
       inflight.agentError = error;
+      this.#diagnose("session agent", record.handle.agent.id, error);
       inflight.terminal.resolve();
       this.#settle(record, inflight);
     }));
@@ -1361,7 +1362,7 @@ export class DurableSessionAgent implements AcpAgent {
     if (record !== undefined) {
       try {
         const renamed = titles.rename(record.handle.agent.session, params.title as string);
-        if (!(await this.#context.sessions.flush(record.handle.agent.session))) {
+        if (!(await this.#flush(record.handle.agent.session))) {
           throw new Error("session persistence did not participate in rename");
         }
         await record.outputTail.catch((error: unknown) => {
@@ -1398,7 +1399,7 @@ export class DurableSessionAgent implements AcpAgent {
           throw new Error("adapter ownership changed during session rename");
         }
         const renamed = titles.rename(handle.agent.session, params.title as string);
-        if (!(await this.#context.sessions.flush(handle.agent.session))) {
+        if (!(await this.#flush(handle.agent.session))) {
           throw new Error("session persistence did not participate in rename");
         }
         await this.#connection.sessionUpdate({
@@ -1565,6 +1566,7 @@ export class DurableSessionAgent implements AcpAgent {
     record.outputTail = record.outputTail.catch(() => undefined).then(task);
     void record.outputTail.catch((error: unknown) => {
       if (inflight !== undefined) inflight.outputError ??= error;
+      this.#diagnose("session output", record.handle.agent.id, error);
     });
   }
 
@@ -1606,6 +1608,11 @@ export class DurableSessionAgent implements AcpAgent {
     this.#queue(record, project);
   }
 
+  async #flush(session: Agent["session"]): Promise<boolean> {
+    const sessions = this.#context.get("sessions") as Context["sessions"] | undefined;
+    return sessions !== undefined && sessions.flush(session);
+  }
+
   #settle(record: SessionRecord, inflight: InflightPrompt): void {
     if (inflight.settling) return;
     inflight.settling = true;
@@ -1616,7 +1623,7 @@ export class DurableSessionAgent implements AcpAgent {
         await record.handle.agent.whenIdle();
       }
       await record.outputTail;
-      if (inflight.queued && !(await this.#context.sessions.flush(record.handle.agent.session))) {
+      if (inflight.queued && !(await this.#flush(record.handle.agent.session))) {
         throw new Error("session persistence did not participate in prompt settlement");
       }
       if (record.inflight !== inflight) return;

@@ -41,7 +41,7 @@ describe("adapter CLI", () => {
     const result = await invoke({ argv: ["--version"] });
     expect(result).toEqual({
       exitCode: AdapterExitCode.Success,
-      stdout: "sesori-deepseek-acp/0.1.0-dev.1 deepseek-harness/0.1.1-rc.2 acp/1\n",
+      stdout: "sesori-deepseek-acp/0.1.0 deepseek-harness/0.1.1-rc.2 acp/1\n",
       stderr: "",
     });
     expect(packageJson.version).toBe(ADAPTER_VERSION);

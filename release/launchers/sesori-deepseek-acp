@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+case "$0" in
+  */*) LAUNCHER=$0 ;;
+  *) LAUNCHER=$(command -v "$0") ;;
+esac
+SCRIPT_DIR=$(CDPATH= cd -- "${LAUNCHER%/*}" && pwd -P)
+exec "$SCRIPT_DIR/node/bin/node" "$SCRIPT_DIR/dist/src/bin.js" "$@"

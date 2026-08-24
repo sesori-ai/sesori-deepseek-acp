@@ -327,10 +327,7 @@ async function archivePackage({ packageRoot, output, adapterVersion, target }) {
   const name = releaseArchiveName({ adapterVersion, target });
   const archive = join(output, name);
   if (target.startsWith("windows-")) {
-    runPowerShell("Compress-Archive -LiteralPath $env:SESORI_PACKAGE -DestinationPath $env:SESORI_ARCHIVE -CompressionLevel Optimal", {
-      SESORI_PACKAGE: packageRoot,
-      SESORI_ARCHIVE: archive,
-    });
+    run("tar", ["-a", "-cf", archive, "-C", dirname(packageRoot), basename(packageRoot)]);
   } else {
     run("tar", ["-czf", archive, "-C", dirname(packageRoot), basename(packageRoot)]);
   }
@@ -339,14 +336,7 @@ async function archivePackage({ packageRoot, output, adapterVersion, target }) {
 
 async function extractArchive({ archive, destination }) {
   await mkdir(destination, { recursive: true });
-  if (archive.endsWith(".zip")) {
-    runPowerShell("Expand-Archive -LiteralPath $env:SESORI_ARCHIVE -DestinationPath $env:SESORI_DESTINATION", {
-      SESORI_ARCHIVE: archive,
-      SESORI_DESTINATION: destination,
-    });
-  } else {
-    run("tar", ["-xf", archive, "-C", destination]);
-  }
+  run("tar", ["-xf", archive, "-C", destination]);
   const entries = await readdir(destination);
   if (entries.length !== 1 || entries[0] !== packageRootName) {
     throw new Error("Release archive must contain exactly one top-level package directory");

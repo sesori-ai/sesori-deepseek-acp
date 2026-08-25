@@ -29,6 +29,12 @@ export const targetDefinitions = Object.freeze({
   "windows-x64": { platform: "win32", arch: "x64", nodePlatform: "win", nodeArch: "x64" },
 });
 
+export async function removePackageManagerLinks(packageRoot) {
+  // npm's command shims are not used by the adapter and prevent Sesori's secure
+  // archive extractor from accepting an otherwise self-contained package tree.
+  await rm(join(packageRoot, "node_modules", ".bin"), { recursive: true, force: true });
+}
+
 async function readJson(path) {
   return JSON.parse(await readFile(path, "utf8"));
 }
@@ -380,6 +386,7 @@ export async function packageRelease({ target, output }) {
       await cp(join(repositoryRoot, directory), join(packageRoot, directory), { recursive: true });
     }
     runNpm(["ci", "--omit=dev"], { cwd: packageRoot });
+    await removePackageManagerLinks(packageRoot);
     runNpm(["ls", "--omit=dev", "--all"], { cwd: packageRoot, capture: true });
     const node = await installOfficialNode({ config, target, temporaryRoot, packageRoot });
     const launcherSource = join(repositoryRoot, "release", "launchers", target.startsWith("windows-") ? `${packageRootName}.cmd` : packageRootName);

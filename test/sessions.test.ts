@@ -430,6 +430,7 @@ describe("durable ACP sessions", () => {
     expect(state.updates).toEqual([
       {
         sessionId: "cold",
+        _meta: { "sesori.ai/deepseek": { messageCreatedAt: 10 } },
         update: {
           sessionUpdate: "user_message_chunk",
           messageId: "user-1",
@@ -438,6 +439,7 @@ describe("durable ACP sessions", () => {
       },
       {
         sessionId: "cold",
+        _meta: { "sesori.ai/deepseek": { messageCreatedAt: 20 } },
         update: {
           sessionUpdate: "agent_thought_chunk",
           messageId: projectedAssistantId,
@@ -446,6 +448,7 @@ describe("durable ACP sessions", () => {
       },
       {
         sessionId: "cold",
+        _meta: { "sesori.ai/deepseek": { messageCreatedAt: 20 } },
         update: {
           sessionUpdate: "agent_message_chunk",
           messageId: projectedAssistantId,
@@ -1022,6 +1025,124 @@ describe("durable ACP sessions", () => {
     expect(((replay.updates as SessionNotification[])[0]?.update as { messageId?: string } | undefined)?.messageId).toBe(liveId);
   });
 
+  it("keeps live message creation metadata on first contributing events", async () => {
+    const state = services();
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const session = state.live.get(created.sessionId)!.agent.session;
+
+    state.invoke("session/event", session, {
+      type: "assistant/chunk",
+      time: 100,
+      data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "first" } },
+    });
+    state.invoke("session/event", session, {
+      type: "assistant/chunk",
+      time: 200,
+      data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "later" } },
+    });
+    await expect.poll(() => state.updates.length).toBe(2);
+    const collidingCallId = (state.updates[0]?.update as { messageId?: string } | undefined)?.messageId;
+    if (collidingCallId === undefined) throw new Error("assistant update has no message id");
+    state.invoke("session/event", session, {
+      type: "tool/call",
+      time: 300,
+      data: { turn: 1, step: 1, callId: collidingCallId, name: "edit", arguments: "{}" },
+    });
+    state.invoke("session/event", session, {
+      type: "tool/result",
+      time: 400,
+      surfaceOp: "append",
+      data: {
+        turn: 1,
+        step: 1,
+        message: {
+          id: "result-1",
+          role: "user",
+          source: { kind: "tool", callId: collidingCallId, tool: "edit" },
+          content: [{ type: "tool-result", toolCallId: collidingCallId, content: [] }],
+        },
+      },
+    });
+    await expect.poll(() => state.updates.length).toBe(4);
+
+    expect(state.updates.map((update) => update._meta)).toEqual([
+      { "sesori.ai/deepseek": { messageCreatedAt: 100 } },
+      { "sesori.ai/deepseek": { messageCreatedAt: 100 } },
+      { "sesori.ai/deepseek": { messageCreatedAt: 300 } },
+      { "sesori.ai/deepseek": { messageCreatedAt: 300 } },
+    ]);
+  });
+
+  it("pre-scans replay assistant chunks and keeps tool call creation metadata", async () => {
+    const state = services();
+    const meta = header({ id: "timestamp-replay", cwd: "/project" });
+    state.headers.push(meta);
+    state.inspections.set("timestamp-replay", {
+      meta,
+      events: [
+        {
+          type: "assistant/chunk",
+          seq: 0,
+          time: 100,
+          data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "first" } },
+        },
+        {
+          type: "assistant/chunk",
+          seq: 1,
+          time: 200,
+          data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "later" } },
+        },
+        {
+          type: "assistant/message",
+          seq: 2,
+          time: 300,
+          surfaceOp: "append",
+          data: {
+            turn: 1,
+            step: 1,
+            message: {
+              id: "assistant-1",
+              role: "assistant",
+              source: { kind: "model", provider: "synthetic", model: "synthetic" },
+              content: [{ type: "text", text: "complete" }],
+            },
+          },
+        },
+        {
+          type: "tool/call",
+          seq: 3,
+          time: 400,
+          data: { turn: 1, step: 1, callId: "call-1", name: "edit", arguments: "{}" },
+        },
+        {
+          type: "tool/result",
+          seq: 4,
+          time: 500,
+          surfaceOp: "append",
+          data: {
+            turn: 1,
+            step: 1,
+            message: {
+              id: "result-1",
+              role: "user",
+              source: { kind: "tool", callId: "call-1", tool: "edit" },
+              content: [{ type: "tool-result", toolCallId: "call-1", content: [] }],
+            },
+          },
+        },
+      ] as unknown as SessionEvent[],
+    });
+
+    const response = await state.agent.extMethod("deepseek/session/history", {
+      sessionId: "timestamp-replay",
+    });
+    expect((response.updates as SessionNotification[]).map((update) => update._meta)).toEqual([
+      { "sesori.ai/deepseek": { messageCreatedAt: 100 } },
+      { "sesori.ai/deepseek": { messageCreatedAt: 400 } },
+      { "sesori.ai/deepseek": { messageCreatedAt: 400 } },
+    ]);
+  });
+
   it("returns max-token settlement with exact turn usage", async () => {
     const state = services();
     const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
@@ -1568,6 +1689,7 @@ describe("durable ACP sessions", () => {
     expect(handle.agent.followup).not.toHaveBeenCalled();
     expect(state.updates).toContainEqual({
       sessionId: created.sessionId,
+      _meta: { "sesori.ai/deepseek": { messageCreatedAt: expect.any(Number) } },
       update: expect.objectContaining({
         sessionUpdate: "agent_message_chunk",
         content: { type: "text", text: "Compacted" },
@@ -2424,6 +2546,7 @@ describe("durable ACP sessions", () => {
     expect(response.updates).toEqual([
       {
         sessionId: "tools",
+        _meta: { "sesori.ai/deepseek": { messageCreatedAt: 2 } },
         update: {
           sessionUpdate: "tool_call",
           toolCallId: "call-1",
@@ -2433,6 +2556,7 @@ describe("durable ACP sessions", () => {
       },
       {
         sessionId: "tools",
+        _meta: { "sesori.ai/deepseek": { messageCreatedAt: 2 } },
         update: {
           sessionUpdate: "tool_call_update",
           toolCallId: "call-1",

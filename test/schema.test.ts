@@ -46,6 +46,27 @@ describe("DeepSeek extension schema", () => {
     ).toBe(false);
   });
 
+  it.each([-1, 1.5, Number.MAX_SAFE_INTEGER + 1])(
+    "rejects invalid message creation time %s",
+    (messageCreatedAt) => {
+      expect(
+        validateProtocolValue({
+          definition: "historyResponse",
+          value: {
+            updates: [
+              {
+                sessionId: "session-1",
+                update: { sessionUpdate: "agent_message_chunk" },
+                _meta: { "sesori.ai/deepseek": { messageCreatedAt } },
+              },
+            ],
+            hasMore: false,
+          },
+        }).valid,
+      ).toBe(false);
+    },
+  );
+
   it("accepts POSIX, Windows drive, and UNC absolute paths", () => {
     for (const cwd of ["/synthetic/project", "C:\\synthetic\\project", "\\\\synthetic\\project"]) {
       expect(validateProtocolValue({ definition: "catalogRequest", value: { cwd } }).valid).toBe(true);

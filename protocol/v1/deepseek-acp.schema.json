@@ -277,10 +277,21 @@
       ],
       "properties": {
         "_meta": {
-          "type": [
-            "object",
-            "null"
-          ]
+          "type": "object",
+          "properties": {
+            "sesori.ai/deepseek": {
+              "type": "object",
+              "properties": {
+                "messageCreatedAt": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                }
+              },
+              "additionalProperties": true
+            }
+          },
+          "additionalProperties": true
         },
         "sessionId": {
           "$ref": "#/$defs/sessionId"

@@ -68,6 +68,7 @@ function adapterPatches(args: { paths: RuntimePaths; workspaceRoot: string }): P
       config: { mode: "workspace-write", workspaceRoot: args.workspaceRoot },
     },
     { id: "approval", config: { policy: "ask" } },
+    { insert: [{ id: "tool-ask-user", name: "@deepseek-ai/dsh-tool-ask-user" }] },
   ];
 }
 
@@ -85,9 +86,16 @@ function assertEntry(args: {
   id: string;
   config?: unknown;
   disabled?: boolean;
+  enabled?: boolean;
 }): void {
   const entry = findEntry({ entries: args.entries, id: args.id });
   if (args.disabled !== undefined && entry.disabled !== args.disabled) {
+    throw new AdapterError({
+      code: AdapterErrorCode.Readiness,
+      message: `The DeepSeek profile row ${args.id} has an unsafe enabled state`,
+    });
+  }
+  if (args.enabled === true && entry.disabled === true) {
     throw new AdapterError({
       code: AdapterErrorCode.Readiness,
       message: `The DeepSeek profile row ${args.id} has an unsafe enabled state`,
@@ -130,6 +138,7 @@ function assertComposition(args: {
     config: { mode: "workspace-write", workspaceRoot: args.workspaceRoot },
   });
   assertEntry({ entries: args.entries, id: "approval", config: { policy: "ask" } });
+  assertEntry({ entries: args.entries, id: "tool-ask-user", enabled: true });
 
   const forbidden = args.entries.find((entry) => {
     const name = entry.name ?? "";

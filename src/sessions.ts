@@ -467,8 +467,7 @@ function historyPage(args: {
     while (firstEventIndex > 0) {
       const candidate = eligible[firstEventIndex - 1];
       if (
-        candidate === undefined ||
-        !isAssistantContentChunk(candidate) ||
+        candidate?.type !== "assistant/chunk" ||
         candidate.data.turn !== boundary.data.turn ||
         candidate.data.step !== boundary.data.step
       ) break;

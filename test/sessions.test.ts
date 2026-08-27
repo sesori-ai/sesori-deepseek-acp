@@ -1093,8 +1093,26 @@ describe("durable ACP sessions", () => {
           data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "later" } },
         },
         {
-          type: "assistant/message",
+          type: "assistant/chunk",
           seq: 2,
+          time: 250,
+          data: {
+            turn: 1,
+            step: 1,
+            chunk: {
+              type: "usage",
+              usage: {
+                inputTokens: 10,
+                outputTokens: 4,
+                cacheReadTokens: 2,
+                reasoningTokens: 1,
+              },
+            },
+          },
+        },
+        {
+          type: "assistant/message",
+          seq: 3,
           time: 300,
           surfaceOp: "append",
           data: {
@@ -1110,13 +1128,13 @@ describe("durable ACP sessions", () => {
         },
         {
           type: "tool/call",
-          seq: 3,
+          seq: 4,
           time: 400,
           data: { turn: 1, step: 1, callId: "call-1", name: "edit", arguments: "{}" },
         },
         {
           type: "tool/result",
-          seq: 4,
+          seq: 5,
           time: 500,
           surfaceOp: "append",
           data: {
@@ -1132,7 +1150,7 @@ describe("durable ACP sessions", () => {
         },
         {
           type: "assistant/chunk",
-          seq: 5,
+          seq: 6,
           time: 600,
           data: {
             turn: 2,
@@ -1150,7 +1168,7 @@ describe("durable ACP sessions", () => {
         },
         {
           type: "assistant/message",
-          seq: 6,
+          seq: 7,
           time: 700,
           surfaceOp: "append",
           data: {

@@ -277,21 +277,28 @@
       ],
       "properties": {
         "_meta": {
-          "type": "object",
-          "properties": {
-            "sesori.ai/deepseek": {
+          "oneOf": [
+            {
               "type": "object",
               "properties": {
-                "messageCreatedAt": {
-                  "type": "integer",
-                  "minimum": 0,
-                  "maximum": 9007199254740991
+                "sesori.ai/deepseek": {
+                  "type": "object",
+                  "properties": {
+                    "messageCreatedAt": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    }
+                  },
+                  "additionalProperties": true
                 }
               },
               "additionalProperties": true
+            },
+            {
+              "type": "null"
             }
-          },
-          "additionalProperties": true
+          ]
         },
         "sessionId": {
           "$ref": "#/$defs/sessionId"

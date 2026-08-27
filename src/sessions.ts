@@ -433,6 +433,15 @@ function messageBoundary(event: SessionEvent): boolean {
   );
 }
 
+function isAssistantContentChunk(
+  event: SessionEvent,
+): event is Extract<SessionEvent, { type: "assistant/chunk" }> {
+  return (
+    event.type === "assistant/chunk" &&
+    (event.data.chunk.type === "text-delta" || event.data.chunk.type === "reasoning-delta")
+  );
+}
+
 function assertKnownEvents(events: readonly SessionEvent[]): void {
   const unknown = events.find(
     (event) => !KNOWN_SESSION_EVENT_TYPES.has(event.type) && event.ignorable !== true,
@@ -458,7 +467,8 @@ function historyPage(args: {
     while (firstEventIndex > 0) {
       const candidate = eligible[firstEventIndex - 1];
       if (
-        candidate?.type !== "assistant/chunk" ||
+        candidate === undefined ||
+        !isAssistantContentChunk(candidate) ||
         candidate.data.turn !== boundary.data.turn ||
         candidate.data.step !== boundary.data.step
       ) break;
@@ -765,7 +775,7 @@ async function replayUpdates(args: {
   const updates: SessionNotification[] = [];
   const messageCreatedAt = new Map<string, number>();
   for (const event of args.events) {
-    if (event.type !== "assistant/chunk" && event.type !== "assistant/message") continue;
+    if (!isAssistantContentChunk(event) && event.type !== "assistant/message") continue;
     const id = `assistant:${assistantMessageId(args.sessionId, event.data.turn, event.data.step)}`;
     const time = eventTime(event);
     if (time !== undefined && (messageCreatedAt.get(id) ?? Number.POSITIVE_INFINITY) > time) {

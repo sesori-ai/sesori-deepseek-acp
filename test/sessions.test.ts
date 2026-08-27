@@ -1130,6 +1130,40 @@ describe("durable ACP sessions", () => {
             },
           },
         },
+        {
+          type: "assistant/chunk",
+          seq: 5,
+          time: 600,
+          data: {
+            turn: 2,
+            step: 1,
+            chunk: {
+              type: "usage",
+              usage: {
+                inputTokens: 10,
+                outputTokens: 4,
+                cacheReadTokens: 2,
+                reasoningTokens: 1,
+              },
+            },
+          },
+        },
+        {
+          type: "assistant/message",
+          seq: 6,
+          time: 700,
+          surfaceOp: "append",
+          data: {
+            turn: 2,
+            step: 1,
+            message: {
+              id: "assistant-2",
+              role: "assistant",
+              source: { kind: "model", provider: "synthetic", model: "synthetic" },
+              content: [{ type: "text", text: "non-streamed" }],
+            },
+          },
+        },
       ] as unknown as SessionEvent[],
     });
 
@@ -1140,6 +1174,7 @@ describe("durable ACP sessions", () => {
       { "sesori.ai/deepseek": { messageCreatedAt: 100 } },
       { "sesori.ai/deepseek": { messageCreatedAt: 400 } },
       { "sesori.ai/deepseek": { messageCreatedAt: 400 } },
+      { "sesori.ai/deepseek": { messageCreatedAt: 700 } },
     ]);
   });
 

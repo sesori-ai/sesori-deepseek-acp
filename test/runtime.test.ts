@@ -56,6 +56,10 @@ describe("DeepSeek runtime composition", () => {
       workspaceRoot,
     });
     expect(entries.get("approval")?.config).toEqual({ policy: "ask" });
+    expect(entries.get("tool-ask-user")).toMatchObject({
+      name: "@deepseek-ai/dsh-tool-ask-user",
+    });
+    expect(entries.get("tool-ask-user")?.disabled).not.toBe(true);
     expect(entries.get("settings")?.config).toBeUndefined();
     expect(entries.get("credentials")?.config).toBeUndefined();
     expect([...entries.values()].some((entry) => entry.name === "@deepseek-ai/dsh-acp")).toBe(
@@ -121,6 +125,8 @@ describe("DeepSeek runtime composition", () => {
       const spills = context.get("spillStore") as { root: string };
 
       expect(context.get("sessions")).toBeDefined();
+      const tools = context.get("tools") as { schemas(): { name: string }[] };
+      expect(tools.schemas()).toContainEqual(expect.objectContaining({ name: "ask_user_question" }));
       expect(persistence.root).toBe(join(stateDir, "sessions"));
       const attachmentRelativePath = relative(join(stateDir, "attachments-home"), attachments.root);
       expect(isAbsolute(attachmentRelativePath)).toBe(false);
@@ -211,6 +217,7 @@ describe("DeepSeek runtime composition", () => {
       sessionUpdate: vi.fn(async (notification: SessionNotification) => {
         updates.push(notification);
       }),
+      extMethod: vi.fn(async () => ({})),
     } as unknown as AgentSideConnection;
     const diagnostics: string[] = [];
     const agent = new DurableSessionAgent({
@@ -233,6 +240,7 @@ describe("DeepSeek runtime composition", () => {
         updates: [
           {
             sessionId: String(sessionId),
+            _meta: { "sesori.ai/deepseek": { messageCreatedAt: 12 } },
             update: {
               sessionUpdate: "user_message_chunk",
               messageId: "restart-user",
@@ -258,12 +266,28 @@ describe("DeepSeek runtime composition", () => {
       });
       expect(updates).toContainEqual({
         sessionId: String(sessionId),
+        _meta: { "sesori.ai/deepseek": { messageCreatedAt: 12 } },
         update: {
           sessionUpdate: "user_message_chunk",
           messageId: "restart-user",
           content: { type: "text", text: "persisted question" },
         },
       });
+      const questionTool = (second.get("tools") as {
+        get(name: string): { execute(args: unknown, exec: unknown): Promise<unknown> } | undefined;
+      }).get("ask_user_question");
+      if (questionTool === undefined) throw new Error("ask_user_question was not registered");
+      vi.mocked(connection.extMethod).mockResolvedValueOnce({
+        answers: [{ questionId: "q1", selectedLabels: ["Yes"] }],
+      });
+      await expect(questionTool.execute(
+        { questions: [{ id: "q1", question: "Proceed?", options: [{ label: "Yes" }] }] },
+        { agent: second.agents.get(sessionId), signal: new AbortController().signal },
+      )).resolves.toEqual({ answers: [{ id: "q1", selected: ["Yes"] }] });
+      expect(connection.extMethod).toHaveBeenCalledWith(
+        "deepseek/ask_user_question",
+        expect.objectContaining({ sessionId: String(sessionId) }),
+      );
       await agent.closeSession({ sessionId: String(sessionId) });
       expect((await second.sessionPersistence.list()).map((item) => item.id)).toContain(sessionId);
       expect(diagnostics).toEqual([]);

@@ -162,6 +162,7 @@ interface SessionRecord {
   readonly handle: AgentHandle;
   readonly selection: ModelSelectionRef;
   readonly toolCalls: Map<string, { name: string; arguments: string }>;
+  readonly messageCreatedAt: Map<string, number>;
   outputTail: Promise<void>;
   inflight: InflightPrompt | undefined;
 }
@@ -432,6 +433,15 @@ function messageBoundary(event: SessionEvent): boolean {
   );
 }
 
+function isAssistantContentChunk(
+  event: SessionEvent,
+): event is Extract<SessionEvent, { type: "assistant/chunk" }> {
+  return (
+    event.type === "assistant/chunk" &&
+    (event.data.chunk.type === "text-delta" || event.data.chunk.type === "reasoning-delta")
+  );
+}
+
 function assertKnownEvents(events: readonly SessionEvent[]): void {
   const unknown = events.find(
     (event) => !KNOWN_SESSION_EVENT_TYPES.has(event.type) && event.ignorable !== true,
@@ -451,7 +461,19 @@ function historyPage(args: {
   const starts = eligible.flatMap((event, index) => (messageBoundary(event) ? [index] : []));
   if (starts.length === 0) return { events: [], hasMore: false };
   const selectedStartIndex = Math.max(0, starts.length - args.maxMessages);
-  const firstEventIndex = starts[selectedStartIndex] as number;
+  let firstEventIndex = starts[selectedStartIndex] as number;
+  const boundary = eligible[firstEventIndex];
+  if (boundary?.type === "assistant/message") {
+    while (firstEventIndex > 0) {
+      const candidate = eligible[firstEventIndex - 1];
+      if (
+        candidate?.type !== "assistant/chunk" ||
+        candidate.data.turn !== boundary.data.turn ||
+        candidate.data.step !== boundary.data.step
+      ) break;
+      firstEventIndex -= 1;
+    }
+  }
   const hasMore = selectedStartIndex > 0;
   const selected = eligible.slice(firstEventIndex);
   if (!hasMore) return { events: selected, hasMore: false };
@@ -507,40 +529,63 @@ interface EventProjection {
   agent?: Agent;
   mode: "live" | "replay";
   toolCalls: Map<string, { name: string; arguments: string }>;
-  emitUpdate(update: SessionNotification["update"]): Promise<void>;
+  messageCreatedAt: Map<string, number>;
+  emitUpdate(update: SessionNotification["update"], messageCreatedAt?: number): Promise<void>;
   emitStatus?(status: Record<string, unknown>): Promise<void>;
   diagnose(operation: string, error: unknown): void;
   onUsage?(turn: number, step: number, usage: TokenUsage): void;
   onTurnEnd?(turn: number, reason: unknown): void;
 }
 
+function eventTime(event: SessionEvent): number | undefined {
+  return Number.isSafeInteger(event.time) && event.time >= 0 ? event.time : undefined;
+}
+
+function firstMessageTime(args: EventProjection, id: string, time: number | undefined): number | undefined {
+  const existing = args.messageCreatedAt.get(id);
+  if (existing !== undefined) return existing;
+  if (time !== undefined) args.messageCreatedAt.set(id, time);
+  return time;
+}
+
 async function projectSessionEvent(args: EventProjection, event: SessionEvent): Promise<void> {
   if (!KNOWN_SESSION_EVENT_TYPES.has(event.type)) return;
+  if (event.type === "turn/start" && args.mode === "live") {
+    args.messageCreatedAt.clear();
+    return;
+  }
   if (event.type === "user/message" && isAppendSurfaceEvent(event)) {
     if (args.mode === "live" || event.data.source.kind !== "user") return;
     for (const block of event.data.content) {
       if (block.type !== "text" && block.type !== "image") {
         throw new Error("session history contains unsupported user content");
       }
-      await args.emitUpdate({
-        sessionUpdate: "user_message_chunk",
-        messageId: String(event.data.id),
-        content:
-          block.type === "text"
-            ? { type: "text", text: block.text }
-            : await imageContent({ context: args.context, attachment: block.attachment }),
-      });
+      await args.emitUpdate(
+        {
+          sessionUpdate: "user_message_chunk",
+          messageId: String(event.data.id),
+          content:
+            block.type === "text"
+              ? { type: "text", text: block.text }
+              : await imageContent({ context: args.context, attachment: block.attachment }),
+        },
+        eventTime(event),
+      );
     }
     return;
   }
   if (event.type === "assistant/chunk" && args.mode === "live") {
     const chunk = event.data.chunk;
     if (chunk.type === "text-delta" || chunk.type === "reasoning-delta") {
-      await args.emitUpdate({
-        sessionUpdate: chunk.type === "reasoning-delta" ? "agent_thought_chunk" : "agent_message_chunk",
-        messageId: assistantMessageId(args.sessionId, event.data.turn, event.data.step),
-        content: { type: "text", text: chunk.text },
-      });
+      const messageId = assistantMessageId(args.sessionId, event.data.turn, event.data.step);
+      await args.emitUpdate(
+        {
+          sessionUpdate: chunk.type === "reasoning-delta" ? "agent_thought_chunk" : "agent_message_chunk",
+          messageId,
+          content: { type: "text", text: chunk.text },
+        },
+        firstMessageTime(args, `assistant:${messageId}`, eventTime(event)),
+      );
     } else if (chunk.type === "usage") {
       args.onUsage?.(event.data.turn, event.data.step, chunk.usage);
     }
@@ -550,20 +595,24 @@ async function projectSessionEvent(args: EventProjection, event: SessionEvent): 
     if (event.data.usage !== undefined) {
       args.onUsage?.(event.data.turn, event.data.step, event.data.usage);
     }
+    const messageId = assistantMessageId(args.sessionId, event.data.turn, event.data.step);
     for (const block of event.data.message.content) {
       if (block.type === "tool-call") continue;
       if (block.type === "tool-result") {
         throw new Error("session history contains unsupported assistant tool-result content");
       }
       if (args.mode === "live" && block.type !== "image") continue;
-      await args.emitUpdate({
-        sessionUpdate: block.type === "reasoning" ? "agent_thought_chunk" : "agent_message_chunk",
-        messageId: assistantMessageId(args.sessionId, event.data.turn, event.data.step),
-        content:
-          block.type === "image"
-            ? await imageContent({ context: args.context, attachment: block.attachment })
-            : { type: "text", text: block.text },
-      });
+      await args.emitUpdate(
+        {
+          sessionUpdate: block.type === "reasoning" ? "agent_thought_chunk" : "agent_message_chunk",
+          messageId,
+          content:
+            block.type === "image"
+              ? await imageContent({ context: args.context, attachment: block.attachment })
+              : { type: "text", text: block.text },
+        },
+        firstMessageTime(args, `assistant:${messageId}`, eventTime(event)),
+      );
     }
     return;
   }
@@ -610,7 +659,7 @@ async function projectSessionEvent(args: EventProjection, event: SessionEvent): 
     } catch (error) {
       args.diagnose("tool/call presentation", toolPresentationError(error, "tool call presenter failed"));
     }
-    await args.emitUpdate(update);
+    await args.emitUpdate(update, firstMessageTime(args, `tool:${callId}`, eventTime(event)));
     return;
   }
   if (event.type === "tool/result" && isAppendSurfaceEvent(event)) {
@@ -657,15 +706,18 @@ async function projectSessionEvent(args: EventProjection, event: SessionEvent): 
         args.diagnose("tool/result presentation", toolPresentationError(error, "tool result presenter failed"));
       }
     }
-    await args.emitUpdate(update);
+    await args.emitUpdate(update, firstMessageTime(args, `tool:${callId}`, eventTime(event)));
     return;
   }
   if (event.type === "command/done" && event.data.text !== undefined) {
-    await args.emitUpdate({
-      sessionUpdate: "agent_message_chunk",
-      messageId: commandMessageId(args.sessionId, String(event.data.commandId)),
-      content: { type: "text", text: event.data.text },
-    });
+    await args.emitUpdate(
+      {
+        sessionUpdate: "agent_message_chunk",
+        messageId: commandMessageId(args.sessionId, String(event.data.commandId)),
+        content: { type: "text", text: event.data.text },
+      },
+      eventTime(event),
+    );
     return;
   }
   if (event.type === "todo/write") {
@@ -684,6 +736,7 @@ async function projectSessionEvent(args: EventProjection, event: SessionEvent): 
     return;
   }
   if (event.type === "turn/end" && args.mode === "live") {
+    args.messageCreatedAt.clear();
     args.onTurnEnd?.(event.data.turn, event.data.reason);
     return;
   }
@@ -719,13 +772,29 @@ async function replayUpdates(args: {
 }): Promise<SessionNotification[]> {
   assertKnownEvents(args.events);
   const updates: SessionNotification[] = [];
+  const messageCreatedAt = new Map<string, number>();
+  for (const event of args.events) {
+    if (!isAssistantContentChunk(event) && event.type !== "assistant/message") continue;
+    const id = `assistant:${assistantMessageId(args.sessionId, event.data.turn, event.data.step)}`;
+    const time = eventTime(event);
+    if (time !== undefined && !messageCreatedAt.has(id)) {
+      messageCreatedAt.set(id, time);
+    }
+  }
   const projection: EventProjection = {
     context: args.context,
     sessionId: args.sessionId,
     mode: "replay",
     toolCalls: new Map(),
-    emitUpdate: (update) => {
-      updates.push({ sessionId: args.sessionId, update });
+    messageCreatedAt,
+    emitUpdate: (update, messageTime) => {
+      updates.push({
+        sessionId: args.sessionId,
+        update,
+        ...(messageTime === undefined
+          ? {}
+          : { _meta: { "sesori.ai/deepseek": { messageCreatedAt: messageTime } } }),
+      });
       return Promise.resolve();
     },
     diagnose: args.diagnose,
@@ -890,6 +959,7 @@ export class DurableSessionAgent implements AcpAgent {
         handle,
         selection,
         toolCalls: new Map(),
+        messageCreatedAt: new Map(),
         outputTail: Promise.resolve(),
         inflight: undefined,
       };
@@ -976,6 +1046,7 @@ export class DurableSessionAgent implements AcpAgent {
           handle,
           selection,
           toolCalls: new Map(),
+          messageCreatedAt: new Map(),
           outputTail: Promise.resolve(),
           inflight: undefined,
         });
@@ -1428,6 +1499,7 @@ export class DurableSessionAgent implements AcpAgent {
             handle: handle!,
             selection,
             toolCalls: new Map(),
+            messageCreatedAt: new Map(),
             outputTail: Promise.resolve(),
             inflight: undefined,
           });
@@ -1582,7 +1654,14 @@ export class DurableSessionAgent implements AcpAgent {
           agent: record.handle.agent,
           mode: "live",
           toolCalls: record.toolCalls,
-          emitUpdate: (update) => this.#connection.sessionUpdate({ sessionId, update }),
+          messageCreatedAt: record.messageCreatedAt,
+          emitUpdate: (update, messageTime) => this.#connection.sessionUpdate({
+            sessionId,
+            update,
+            ...(messageTime === undefined
+              ? {}
+              : { _meta: { "sesori.ai/deepseek": { messageCreatedAt: messageTime } } }),
+          }),
           emitStatus: (status) => this.#connection.extNotification("deepseek/session/status", status),
           diagnose: (operation, error) => this.#diagnose(operation, record.handle.agent.id, error),
           onUsage: (turn, step, usage) => {

@@ -777,7 +777,7 @@ async function replayUpdates(args: {
     if (!isAssistantContentChunk(event) && event.type !== "assistant/message") continue;
     const id = `assistant:${assistantMessageId(args.sessionId, event.data.turn, event.data.step)}`;
     const time = eventTime(event);
-    if (time !== undefined && (messageCreatedAt.get(id) ?? Number.POSITIVE_INFINITY) > time) {
+    if (time !== undefined && !messageCreatedAt.has(id)) {
       messageCreatedAt.set(id, time);
     }
   }

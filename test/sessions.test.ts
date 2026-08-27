@@ -1083,13 +1083,13 @@ describe("durable ACP sessions", () => {
         {
           type: "assistant/chunk",
           seq: 0,
-          time: 100,
+          time: 200,
           data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "first" } },
         },
         {
           type: "assistant/chunk",
           seq: 1,
-          time: 200,
+          time: 100,
           data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "later" } },
         },
         {
@@ -1189,7 +1189,7 @@ describe("durable ACP sessions", () => {
       sessionId: "timestamp-replay",
     });
     expect((response.updates as SessionNotification[]).map((update) => update._meta)).toEqual([
-      { "sesori.ai/deepseek": { messageCreatedAt: 100 } },
+      { "sesori.ai/deepseek": { messageCreatedAt: 200 } },
       { "sesori.ai/deepseek": { messageCreatedAt: 400 } },
       { "sesori.ai/deepseek": { messageCreatedAt: 400 } },
       { "sesori.ai/deepseek": { messageCreatedAt: 700 } },

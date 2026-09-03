@@ -140,6 +140,15 @@ function continuableChildId(blocks: readonly ContentBlock[]): string | undefined
   return match?.[1];
 }
 
+/** Map the `subagent` tool's failed-result headline (`stopReasonError`) back to the closed stop-reason vocabulary. */
+function foregroundStopReason(blocks: readonly ContentBlock[]): SubagentStopReason {
+  const headline = blocks.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("").split("\n")[0] ?? "";
+  if (headline.includes("was cancelled")) return "aborted";
+  if (headline.includes("token limit")) return "max-tokens";
+  if (headline.includes("declined the task")) return "refusal";
+  return "error";
+}
+
 /** Map dsh's settlement notice wording (`settlementSummary`) back to its closed stop-reason vocabulary. */
 function settledStopReason(summary: string): SubagentStopReason {
   if (summary.includes("finished and will do no further work")) return "completed";
@@ -961,9 +970,10 @@ function replaySubagentResult(args: {
     const childSessionId = args.call.name === "subagent" ? continuableChildId(args.content) : undefined;
     if (childSessionId === undefined) return view;
     args.children?.continuable.set(childSessionId, { callId: args.callId, label: view.label });
+    args.children?.assigned.add(childSessionId);
     return { ...view, childSessionId };
   }
-  const ended = { stopReason: args.failed ? ("error" as const) : ("completed" as const) };
+  const ended = { stopReason: args.failed ? foregroundStopReason(args.content) : ("completed" as const) };
   const callTime = args.call.time;
   const resultTime = args.resultTime;
   const children = args.children;
@@ -1059,7 +1069,7 @@ async function replayUpdates(args: {
     messageCreatedAt,
     replayChildren: {
       headers: [...args.childHeaders].sort((left, right) => left.createdAt - right.createdAt),
-      assigned: new Set(),
+      assigned: new Set(priorContinuable(args.priorEvents).keys()),
       continuable: priorContinuable(args.priorEvents),
     },
     emitUpdate: (update, messageTime, subagent) => {
@@ -1169,7 +1179,7 @@ export class DurableSessionAgent implements AcpAgent {
       }
     }));
     this.#hooks.push(this.#context.on("approval/request", (request: ApprovalRequest, next: () => Promise<ApprovalOutcome>) => {
-      const record = this.#ownedRecord(request.agent);
+      const record = this.#interactiveRecord(request.agent);
       if (record === undefined || request.callId === undefined) return next();
       return withAbort(
         record.outputTail.then(() => {
@@ -1955,6 +1965,14 @@ export class DurableSessionAgent implements AcpAgent {
     return record?.handle.agent === agent ? record : undefined;
   }
 
+  /** The owned root or registered live child an interactive request (approval, question) belongs to. */
+  #interactiveRecord(agent: Agent): SessionRecord | ChildRecord | undefined {
+    const root = this.#ownedRecord(agent);
+    if (root !== undefined) return root;
+    const child = this.#children.get(agent.id);
+    return child?.agent === agent && !child.ended ? child : undefined;
+  }
+
   #lineageRecord(id: SessionId): SessionRecord | ChildRecord | undefined {
     return this.#sessions.get(id) ?? this.#children.get(id);
   }
@@ -2196,7 +2214,7 @@ export class DurableSessionAgent implements AcpAgent {
     if (request.agent === undefined) {
       throw new Error("question caller is not an owned root session");
     }
-    const record = this.#ownedRecord(request.agent);
+    const record = this.#interactiveRecord(request.agent);
     if (record === undefined) throw new Error("question caller is not an owned root session");
     const questionIds = new Set<string>();
     const questions = (request.questions ?? []).map((question) => {

@@ -2912,3 +2912,51 @@ describe("sub-agent lifecycle follow-ups", () => {
     ]);
   });
 });
+
+describe("sub-agent lifecycle second review", () => {
+  it("routes a registered child's approval to the client under the child session", async () => {
+    const state = services();
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const root = state.live.get(created.sessionId)!;
+    const child = await state.context.agents.create({ sessionId: SessionId("child-ask"), meta: { cwd: "/project" } });
+    (child.agent.session.header as { parentSession?: SessionId }).parentSession = root.agent.id;
+    state.invoke("subagent/start", { runId: "r", provider: "spawn", id: child.agent.id, local: true });
+    state.requestPermission.mockResolvedValueOnce({ outcome: { outcome: "selected", optionId: "allow-once" } });
+
+    await expect(state.invoke("approval/request", { agent: child.agent, callId: "call-x" }, async () => "unavailable")).resolves.toBe("allowed-once");
+    expect(state.requestPermission).toHaveBeenCalledWith(expect.objectContaining({ sessionId: "child-ask" }));
+  });
+
+  it("reserves named background children and keeps foreground stop reasons on replay", async () => {
+    const state = services();
+    const meta = header({ id: "mixed", cwd: "/project", createdAt: 1 });
+    state.headers.push(
+      meta,
+      { ...header({ id: "bg-child", cwd: "/project", createdAt: 12 }), parentSession: SessionId("mixed") } as SessionHeader,
+      { ...header({ id: "fg-child", cwd: "/project", createdAt: 14 }), parentSession: SessionId("mixed") } as SessionHeader,
+    );
+    const result = (seq: number, callId: string, text: string, isError = false) => ({
+      type: "tool/result",
+      seq,
+      time: seq * 10,
+      surfaceOp: "append",
+      sourceEventSeqs: [seq - 2],
+      data: { turn: 1, step: 1, message: { id: `r-${callId}`, role: "user", source: { kind: "tool", callId }, content: [{ type: "tool-result", toolCallId: callId, isError, content: [{ type: "text", text }] }] } },
+    });
+    state.inspections.set("mixed", {
+      meta,
+      events: [
+        { type: "user/message", seq: 0, time: 1, surfaceOp: "append", data: { id: "u", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "go" }] } },
+        { type: "tool/call", seq: 1, time: 10, data: { turn: 1, step: 1, callId: "bg", name: "subagent", arguments: JSON.stringify({ description: "Background", prompt: "p" }) } },
+        { type: "tool/call", seq: 2, time: 11, data: { turn: 1, step: 1, callId: "fg", name: "subagent", arguments: JSON.stringify({ description: "Foreground", prompt: "p", run_in_background: false }) } },
+        result(3, "bg", "started subagent bg-child"),
+        result(4, "fg", "subagent run was cancelled\nPartial output before the run ended:\nsecret", true),
+      ] as unknown as SessionEvent[],
+    });
+
+    const response = await state.agent.extMethod("deepseek/session/history", { sessionId: "mixed" });
+    const folds = (response.updates as SessionNotification[]).map((notification) => (notification._meta as { "sesori.ai/deepseek"?: { subagent?: unknown } } | undefined)?.["sesori.ai/deepseek"]?.subagent).filter((fold) => fold !== undefined);
+    expect(JSON.stringify(response)).not.toContain("secret");
+    expect(folds.at(-1)).toEqual({ label: "Foreground", mode: "foreground", childSessionId: "fg-child", ended: { stopReason: "aborted" } });
+  });
+});

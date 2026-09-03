@@ -1,19 +1,26 @@
 import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
+import schema from "../protocol/v2/deepseek-acp.schema.json" with { type: "json" };
+import { EXTENSION_PROTOCOL_VERSION } from "../src/protocol.ts";
 import {
   type FixtureEntry,
   validateFixtureCorpus,
   validateProtocolValue,
 } from "../src/schema.ts";
 
-const validPath = new URL("../protocol/v1/fixtures/valid.json", import.meta.url);
-const invalidPath = new URL("../protocol/v1/fixtures/invalid.json", import.meta.url);
+const validPath = new URL("../protocol/v2/fixtures/valid.json", import.meta.url);
+const invalidPath = new URL("../protocol/v2/fixtures/invalid.json", import.meta.url);
 
 async function fixture(args: { path: URL }): Promise<FixtureEntry[]> {
   return JSON.parse(await readFile(args.path, "utf8")) as FixtureEntry[];
 }
 
 describe("DeepSeek extension schema", () => {
+  it("serves the schema generation matching the advertised extension protocol version", () => {
+    expect(schema.$id).toBe(`https://sesori.ai/protocol/v${EXTENSION_PROTOCOL_VERSION}/deepseek-acp.schema.json`);
+    expect(validPath.pathname).toContain(`/protocol/v${EXTENSION_PROTOCOL_VERSION}/`);
+  });
+
   it("accepts every valid fixture", async () => {
     const results = validateFixtureCorpus({ corpus: await fixture({ path: validPath }) });
     expect(results).not.toHaveLength(0);

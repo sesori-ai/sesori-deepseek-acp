@@ -1,5 +1,5 @@
 import { Ajv2020, type ErrorObject, type ValidateFunction } from "ajv/dist/2020.js";
-import schema from "../protocol/v1/deepseek-acp.schema.json" with { type: "json" };
+import schema from "../protocol/v2/deepseek-acp.schema.json" with { type: "json" };
 
 export type ProtocolDefinition =
   | "initializeMetadata"

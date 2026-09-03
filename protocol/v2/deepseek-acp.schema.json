@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://sesori.ai/protocol/v1/deepseek-acp.schema.json",
-  "title": "Sesori DeepSeek ACP extension protocol v1",
+  "$id": "https://sesori.ai/protocol/v2/deepseek-acp.schema.json",
+  "title": "Sesori DeepSeek ACP extension protocol v2",
   "$defs": {
     "nonblank": {
       "type": "string",
@@ -44,7 +44,7 @@
       ],
       "properties": {
         "extensionProtocolVersion": {
-          "const": 1
+          "const": 2
         },
         "adapterVersion": {
           "type": "string",
@@ -288,6 +288,9 @@
                       "type": "integer",
                       "minimum": 0,
                       "maximum": 9007199254740991
+                    },
+                    "subagent": {
+                      "$ref": "#/$defs/subagentReplay"
                     }
                   },
                   "additionalProperties": true
@@ -651,6 +654,161 @@
           "$ref": "#/$defs/sessionStatusWarning"
         }
       ]
+    },
+    "subagentMode": {
+      "enum": [
+        "foreground",
+        "background"
+      ]
+    },
+    "subagentStopReason": {
+      "enum": [
+        "completed",
+        "aborted",
+        "error",
+        "max-tokens",
+        "refusal"
+      ]
+    },
+    "subagentSummary": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "\\S"
+    },
+    "subagentStarted": {
+      "type": "object",
+      "required": [
+        "kind",
+        "sessionId",
+        "childSessionId",
+        "toolCallId",
+        "label",
+        "mode"
+      ],
+      "properties": {
+        "kind": {
+          "const": "started"
+        },
+        "sessionId": {
+          "$ref": "#/$defs/sessionId"
+        },
+        "childSessionId": {
+          "$ref": "#/$defs/sessionId"
+        },
+        "toolCallId": {
+          "$ref": "#/$defs/nonblank"
+        },
+        "label": {
+          "$ref": "#/$defs/nonblank"
+        },
+        "mode": {
+          "$ref": "#/$defs/subagentMode"
+        }
+      },
+      "additionalProperties": false
+    },
+    "subagentStartedUncorrelated": {
+      "type": "object",
+      "required": [
+        "kind",
+        "sessionId",
+        "childSessionId",
+        "label",
+        "mode"
+      ],
+      "properties": {
+        "kind": {
+          "const": "startedUncorrelated"
+        },
+        "sessionId": {
+          "$ref": "#/$defs/sessionId"
+        },
+        "childSessionId": {
+          "$ref": "#/$defs/sessionId"
+        },
+        "label": {
+          "$ref": "#/$defs/nonblank"
+        },
+        "mode": {
+          "$ref": "#/$defs/subagentMode"
+        }
+      },
+      "additionalProperties": false
+    },
+    "subagentEnded": {
+      "type": "object",
+      "required": [
+        "kind",
+        "sessionId",
+        "childSessionId",
+        "stopReason"
+      ],
+      "properties": {
+        "kind": {
+          "const": "ended"
+        },
+        "sessionId": {
+          "$ref": "#/$defs/sessionId"
+        },
+        "childSessionId": {
+          "$ref": "#/$defs/sessionId"
+        },
+        "stopReason": {
+          "$ref": "#/$defs/subagentStopReason"
+        },
+        "summary": {
+          "$ref": "#/$defs/subagentSummary"
+        }
+      },
+      "additionalProperties": false
+    },
+    "subagentNotification": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/subagentStarted"
+        },
+        {
+          "$ref": "#/$defs/subagentStartedUncorrelated"
+        },
+        {
+          "$ref": "#/$defs/subagentEnded"
+        }
+      ]
+    },
+    "subagentReplay": {
+      "type": "object",
+      "required": [
+        "label",
+        "mode"
+      ],
+      "properties": {
+        "label": {
+          "$ref": "#/$defs/nonblank"
+        },
+        "mode": {
+          "$ref": "#/$defs/subagentMode"
+        },
+        "childSessionId": {
+          "$ref": "#/$defs/sessionId"
+        },
+        "ended": {
+          "type": "object",
+          "required": [
+            "stopReason"
+          ],
+          "properties": {
+            "stopReason": {
+              "$ref": "#/$defs/subagentStopReason"
+            },
+            "summary": {
+              "$ref": "#/$defs/subagentSummary"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

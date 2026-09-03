@@ -2842,3 +2842,73 @@ describe("sub-agent lifecycle", () => {
     ]);
   });
 });
+
+describe("sub-agent lifecycle follow-ups", () => {
+  it("retains a settled child while its background grandchild still resolves lineage through it", async () => {
+    const state = services();
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const root = state.live.get(created.sessionId)!;
+    const child = await state.context.agents.create({ sessionId: SessionId("mid"), meta: { cwd: "/project" } });
+    (child.agent.session.header as { parentSession?: SessionId }).parentSession = root.agent.id;
+    const grandchild = await state.context.agents.create({ sessionId: SessionId("leaf"), meta: { cwd: "/project" } });
+    (grandchild.agent.session.header as { parentSession?: SessionId }).parentSession = child.agent.id;
+    state.invoke("subagent/start", { runId: "r1", provider: "spawn", id: child.agent.id, local: true });
+    state.invoke("subagent/start", { runId: "r2", provider: "spawn", id: grandchild.agent.id, local: true });
+    state.invoke("subagent/end", { runId: "r1", provider: "spawn", id: child.agent.id, local: true, stopReason: "completed" });
+
+    await expect(
+      state.invokeFirst("agent/request", { agent: grandchild.agent, turn: 1, step: 1 }, async () => ({ provider: "x", model: "y" })),
+    ).resolves.toEqual({ provider: "synthetic", model: "synthetic" });
+    state.invoke("subagent/end", { runId: "r2", provider: "spawn", id: grandchild.agent.id, local: true, stopReason: "aborted" });
+    await expect.poll(() => state.extNotifications.length).toBe(4);
+    expect(state.extNotifications.map((item) => [item.params.kind, item.params.sessionId, item.params.childSessionId])).toEqual([
+      ["startedUncorrelated", String(root.agent.id), "mid"],
+      ["startedUncorrelated", "mid", "leaf"],
+      ["ended", String(root.agent.id), "mid"],
+      ["ended", "mid", "leaf"],
+    ]);
+  });
+
+  it("folds a settlement whose delegation call sits on an earlier history page", async () => {
+    const state = services();
+    const meta = header({ id: "paged", cwd: "/project", createdAt: 1 });
+    state.headers.push(meta);
+    const userMessage = (seq: number, id: string) => ({
+      type: "user/message",
+      seq,
+      time: seq,
+      surfaceOp: "append",
+      data: { id, role: "user", source: { kind: "user" }, content: [{ type: "text", text: "go" }] },
+    });
+    state.inspections.set("paged", {
+      meta,
+      events: [
+        userMessage(0, "u1"),
+        { type: "tool/call", seq: 1, time: 1, data: { turn: 1, step: 1, callId: "call-bg", name: "subagent", arguments: JSON.stringify({ description: "Paged child", prompt: "p" }) } },
+        {
+          type: "tool/result",
+          seq: 2,
+          time: 2,
+          surfaceOp: "append",
+          sourceEventSeqs: [1],
+          data: { turn: 1, step: 1, message: { id: "r1", role: "user", source: { kind: "tool", callId: "call-bg" }, content: [{ type: "tool-result", toolCallId: "call-bg", content: [{ type: "text", text: "started subagent paged-child" }] }] } },
+        },
+        userMessage(3, "u2"),
+        {
+          type: "user/message",
+          seq: 4,
+          time: 4,
+          surfaceOp: "append",
+          data: { id: "n1", role: "user", source: { kind: "subagent-settled", form: "notice", summary: "Background subagent paged-child finished and will do no further work unless you send it more.", senderSessionId: "paged-child" }, content: [{ type: "text", text: "closing" }] },
+        },
+      ] as unknown as SessionEvent[],
+    });
+
+    const response = await state.agent.extMethod("deepseek/session/history", { sessionId: "paged", maxMessages: 1 });
+    expect(response.hasMore).toBe(true);
+    expect((response.updates as SessionNotification[]).map((notification) => [notification.update.sessionUpdate, (notification._meta as { "sesori.ai/deepseek"?: { subagent?: unknown } } | undefined)?.["sesori.ai/deepseek"]?.subagent])).toEqual([
+      ["user_message_chunk", undefined],
+      ["tool_call_update", { label: "Paged child", mode: "background", childSessionId: "paged-child", ended: { stopReason: "completed" } }],
+    ]);
+  });
+});

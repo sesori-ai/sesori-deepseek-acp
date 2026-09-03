@@ -279,6 +279,8 @@ interface ChildRecord {
   readonly toolCalls: Map<string, ToolCallRecord>;
   readonly messageCreatedAt: Map<string, number>;
   outputTail: Promise<void>;
+  /** Settled, but retained because a registered descendant still resolves its lineage through it. */
+  ended: boolean;
 }
 
 /** The delegation tool call executing on the current async chain, read when dsh publishes `subagent/start`. */
@@ -999,10 +1001,42 @@ function updateMetadata(
   };
 }
 
+/**
+ * Continuable children started before the replayed page, so a settlement notice
+ * on this page still folds onto the call that started it on an earlier page.
+ */
+function priorContinuable(events: readonly SessionEvent[]): ReplayChildren["continuable"] {
+  const continuable: ReplayChildren["continuable"] = new Map();
+  const calls = new Map<string, ToolCallRecord>();
+  for (const event of events) {
+    if (event.type === "tool/call" && event.data.name === "subagent") {
+      calls.set(String(event.data.callId), { name: event.data.name, arguments: event.data.arguments });
+    } else if (event.type === "tool/result" && isAppendSurfaceEvent(event)) {
+      const result = event.data.message.content[0];
+      const callId = String(result.toolCallId);
+      const call = calls.get(callId);
+      calls.delete(callId);
+      const view = call === undefined ? undefined : replaySubagentCall(call.name, call.arguments);
+      const childSessionId = view?.mode === "background" ? continuableChildId(result.content) : undefined;
+      if (view !== undefined && childSessionId !== undefined) {
+        continuable.set(childSessionId, { callId, label: view.label });
+      }
+    } else if (event.type === "user/message" && isAppendSurfaceEvent(event)) {
+      const source = event.data.source as { kind: string; senderSessionId?: unknown };
+      if (source.kind === "subagent-settled" && typeof source.senderSessionId === "string") {
+        continuable.delete(source.senderSessionId);
+      }
+    }
+  }
+  return continuable;
+}
+
 async function replayUpdates(args: {
   context: Context;
   sessionId: string;
   events: readonly SessionEvent[];
+  /** Events of the same session that precede `events`, for correlation state older than the page. */
+  priorEvents: readonly SessionEvent[];
   childHeaders: readonly SessionHeader[];
   diagnose: (operation: string, error: unknown) => void;
 }): Promise<SessionNotification[]> {
@@ -1026,7 +1060,7 @@ async function replayUpdates(args: {
     replayChildren: {
       headers: [...args.childHeaders].sort((left, right) => left.createdAt - right.createdAt),
       assigned: new Set(),
-      continuable: new Map(),
+      continuable: priorContinuable(args.priorEvents),
     },
     emitUpdate: (update, messageTime, subagent) => {
       updates.push({ sessionId: args.sessionId, update, ...updateMetadata(messageTime, subagent) });
@@ -1298,6 +1332,7 @@ export class DurableSessionAgent implements AcpAgent {
         context: this.#context,
         sessionId: String(sessionId),
         events: inspection.events,
+        priorEvents: [],
         childHeaders: await this.#childHeaders(sessionId, inspection.events),
         diagnose: (operation, error) => this.#diagnose(operation, sessionId, error),
       });
@@ -1388,9 +1423,9 @@ export class DurableSessionAgent implements AcpAgent {
       return {};
     }
     this.#sessions.delete(sessionId);
-    this.#releaseOrphanedChildren();
     try {
       await this.#disposeRecord(record);
+      this.#releaseOrphanedChildren();
       return {};
     } catch (error) {
       if (!this.#closed && !this.#sessions.has(sessionId)) {
@@ -1682,6 +1717,9 @@ export class DurableSessionAgent implements AcpAgent {
           context: this.#context,
           sessionId: request.sessionId,
           events: page.events,
+          priorEvents: inspection.events.filter(
+            (event) => page.events[0] !== undefined && event.seq < page.events[0].seq,
+          ),
           childHeaders: await this.#childHeaders(sessionId, page.events),
           diagnose: (operation, error) => this.#diagnose(operation, sessionId, error),
         }),
@@ -1934,6 +1972,23 @@ export class DurableSessionAgent implements AcpAgent {
     return undefined;
   }
 
+  /**
+   * Drop a settled child once nothing below it is registered, then re-check its
+   * settled ancestors: a background grandchild may outlive the child that
+   * started it, and its model selection and `ended` notification still resolve
+   * through that lineage.
+   */
+  #releaseSettled(id: SessionId): void {
+    let cursor = this.#children.get(id);
+    while (cursor !== undefined && cursor.ended) {
+      const current = cursor;
+      const descendant = [...this.#children.values()].some((child) => child.parentId === current.agent.id);
+      if (descendant) return;
+      this.#children.delete(current.agent.id);
+      cursor = this.#children.get(current.parentId);
+    }
+  }
+
   #releaseOrphanedChildren(): void {
     for (const childId of this.#children.keys()) {
       if (this.#rootOf(childId) === undefined) this.#children.delete(childId);
@@ -1970,7 +2025,9 @@ export class DurableSessionAgent implements AcpAgent {
             toolCalls: new Map(),
             messageCreatedAt: new Map(),
             outputTail: Promise.resolve(),
+            ended: false,
           };
+    record.ended = false;
     this.#children.set(info.id, record);
     const correlated = scope !== undefined && scope.agentId === parentId ? scope : undefined;
     const view = correlated?.view ?? descriptorView(child.session.events);
@@ -1989,9 +2046,10 @@ export class DurableSessionAgent implements AcpAgent {
 
   #childEnded(info: SubagentRunEndInfo): void {
     const record = this.#children.get(info.id);
-    if (record === undefined) return;
-    this.#children.delete(info.id);
+    if (record === undefined || record.ended) return;
+    record.ended = true;
     const parent = this.#lineageRecord(record.parentId);
+    this.#releaseSettled(info.id);
     if (parent === undefined) return;
     const summary = subagentSummary(info.lastAssistantMessage);
     // Every queued child update precedes its `ended` notification.
@@ -2251,9 +2309,13 @@ export class DurableSessionAgent implements AcpAgent {
       ...this.#closes.values(),
     ]);
     const records = [...this.#sessions.values()];
+    const childTails = [...this.#children.values()].map((child) => child.outputTail);
     this.#sessions.clear();
     this.#children.clear();
-    const outcomes = await Promise.allSettled(records.map((record) => this.#disposeRecord(record)));
+    const outcomes = await Promise.allSettled([
+      ...records.map((record) => this.#disposeRecord(record)),
+      ...childTails,
+    ]);
     const failures = [...transitionOutcomes, ...outcomes].flatMap((outcome) =>
       outcome.status === "rejected" ? [outcome.reason] : [],
     );

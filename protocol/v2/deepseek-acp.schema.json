@@ -778,6 +778,38 @@
         }
       },
       "additionalProperties": false
+    },
+    "subagentInterruptRequest": {
+      "type": "object",
+      "required": [
+        "sessionId",
+        "childSessionId"
+      ],
+      "properties": {
+        "sessionId": {
+          "$ref": "#/$defs/sessionId"
+        },
+        "childSessionId": {
+          "$ref": "#/$defs/sessionId"
+        }
+      },
+      "additionalProperties": false
+    },
+    "subagentInterruptResponse": {
+      "type": "object",
+      "required": [
+        "result"
+      ],
+      "properties": {
+        "result": {
+          "enum": [
+            "interrupted",
+            "not_cancellable",
+            "unknown_child"
+          ]
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

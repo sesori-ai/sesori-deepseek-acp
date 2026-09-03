@@ -13,7 +13,9 @@ export type ProtocolDefinition =
   | "askUserQuestionRequest"
   | "askUserQuestionResponse"
   | "sessionStatusNotification"
-  | "subagentNotification";
+  | "subagentNotification"
+  | "subagentInterruptRequest"
+  | "subagentInterruptResponse";
 
 export interface FixtureEntry {
   definition: ProtocolDefinition;
@@ -43,6 +45,8 @@ const definitions: readonly ProtocolDefinition[] = [
   "askUserQuestionResponse",
   "sessionStatusNotification",
   "subagentNotification",
+  "subagentInterruptRequest",
+  "subagentInterruptResponse",
 ];
 const definitionSet = new Set<string>(definitions);
 const ajv = new Ajv2020({ allErrors: true, strict: true });

@@ -305,5 +305,30 @@
       ],
       "hasMore": false
     }
+  },
+  {
+    "definition": "subagentInterruptRequest",
+    "value": {
+      "sessionId": "session-1",
+      "childSessionId": "child-1"
+    }
+  },
+  {
+    "definition": "subagentInterruptResponse",
+    "value": {
+      "result": "interrupted"
+    }
+  },
+  {
+    "definition": "subagentInterruptResponse",
+    "value": {
+      "result": "not_cancellable"
+    }
+  },
+  {
+    "definition": "subagentInterruptResponse",
+    "value": {
+      "result": "unknown_child"
+    }
   }
 ]

@@ -2973,3 +2973,38 @@ describe("sub-agent lifecycle second review", () => {
     expect(folds.at(-1)).toEqual({ label: "Foreground", mode: "foreground", childSessionId: "fg-child", ended: { stopReason: "aborted" } });
   });
 });
+
+describe("sub-agent interrupt", () => {
+  async function registered(state: SessionServices, childId: string, mode: "continuable" | "one-shot") {
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const root = state.live.get(created.sessionId)!;
+    const child = await state.context.agents.create({ sessionId: SessionId(childId), meta: { cwd: "/project" } });
+    (child.agent.session.header as { parentSession?: SessionId }).parentSession = root.agent.id;
+    child.agent.session.append("subagent/descriptor", { version: 2, mode, provider: "spawn", label: "Child" });
+    state.invoke("subagent/start", { runId: "r", provider: "spawn", id: child.agent.id, local: true });
+    return { root, child };
+  }
+
+  it("interrupts a continuable child with user authority scoped to its parent", async () => {
+    const state = services();
+    const interrupt = vi.fn();
+    state.contextServices.set("subagents", { interrupt });
+    const { root } = await registered(state, "child-cont", "continuable");
+
+    await expect(state.agent.extMethod("deepseek/subagent/interrupt", { sessionId: String(root.agent.id), childSessionId: "child-cont" })).resolves.toEqual({ result: "interrupted" });
+    expect(interrupt).toHaveBeenCalledWith("child-cont", { kind: "user", parentSessionId: root.agent.id });
+  });
+
+  it("reports one-shot children as not cancellable and foreign children as unknown", async () => {
+    const state = services();
+    const interrupt = vi.fn();
+    state.contextServices.set("subagents", { interrupt });
+    const { root } = await registered(state, "child-once", "one-shot");
+
+    await expect(state.agent.extMethod("deepseek/subagent/interrupt", { sessionId: String(root.agent.id), childSessionId: "child-once" })).resolves.toEqual({ result: "not_cancellable" });
+    await expect(state.agent.extMethod("deepseek/subagent/interrupt", { sessionId: String(root.agent.id), childSessionId: "nobody" })).resolves.toEqual({ result: "unknown_child" });
+    await expect(state.agent.extMethod("deepseek/subagent/interrupt", { sessionId: "other-root", childSessionId: "child-once" })).resolves.toEqual({ result: "unknown_child" });
+    await expect(state.agent.extMethod("deepseek/subagent/interrupt", { sessionId: String(root.agent.id) })).rejects.toThrow("invalid DeepSeek sub-agent interrupt request");
+    expect(interrupt).not.toHaveBeenCalled();
+  });
+});

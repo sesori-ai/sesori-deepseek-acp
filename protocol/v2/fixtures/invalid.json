@@ -288,5 +288,25 @@
       "label": "Probe child",
       "mode": "background"
     }
+  },
+  {
+    "definition": "subagentInterruptRequest",
+    "value": {
+      "sessionId": "session-1"
+    }
+  },
+  {
+    "definition": "subagentInterruptRequest",
+    "value": {
+      "sessionId": "session-1",
+      "childSessionId": "child-1",
+      "force": true
+    }
+  },
+  {
+    "definition": "subagentInterruptResponse",
+    "value": {
+      "result": "killed"
+    }
   }
 ]

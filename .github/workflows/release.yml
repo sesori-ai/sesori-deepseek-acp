@@ -31,7 +31,7 @@ jobs:
         shell: bash
         run: |
           protocol_source_commit=$(node -p "require('./release/config.json').protocolSourceCommit")
-          git diff --exit-code "$protocol_source_commit" -- protocol
+          git diff --exit-code "$protocol_source_commit" -- protocol/v1
 
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:

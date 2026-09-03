@@ -13,6 +13,7 @@ import {
 } from "../src/runtime.ts";
 import { serveStdio } from "../src/server.ts";
 import { DurableSessionAgent } from "../src/sessions.ts";
+import { createMemorySubagentBindingStore } from "../src/subagent_bindings.ts";
 
 const originalDshHome = process.env.DSH_HOME;
 const originalApiKey = process.env.DEEPSEEK_API_KEY;
@@ -224,6 +225,7 @@ describe("DeepSeek runtime composition", () => {
       context: second,
       connection,
       diagnostics: { write: (message) => diagnostics.push(message) },
+      bindings: createMemorySubagentBindingStore(),
     });
     try {
       const listed = await agent.listSessions({});

@@ -708,34 +708,6 @@
       },
       "additionalProperties": false
     },
-    "subagentStartedUncorrelated": {
-      "type": "object",
-      "required": [
-        "kind",
-        "sessionId",
-        "childSessionId",
-        "label",
-        "mode"
-      ],
-      "properties": {
-        "kind": {
-          "const": "startedUncorrelated"
-        },
-        "sessionId": {
-          "$ref": "#/$defs/sessionId"
-        },
-        "childSessionId": {
-          "$ref": "#/$defs/sessionId"
-        },
-        "label": {
-          "$ref": "#/$defs/nonblank"
-        },
-        "mode": {
-          "$ref": "#/$defs/subagentMode"
-        }
-      },
-      "additionalProperties": false
-    },
     "subagentEnded": {
       "type": "object",
       "required": [
@@ -767,9 +739,6 @@
       "oneOf": [
         {
           "$ref": "#/$defs/subagentStarted"
-        },
-        {
-          "$ref": "#/$defs/subagentStartedUncorrelated"
         },
         {
           "$ref": "#/$defs/subagentEnded"

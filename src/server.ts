@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import { Readable, Writable } from "node:stream";
 import {
   AgentSideConnection,
@@ -7,6 +8,7 @@ import {
 import type { Context, Fiber } from "@deepseek-ai/cordis";
 import { bootRuntime, RUNTIME_READY_KEY } from "./runtime.js";
 import { DurableSessionAgent } from "./sessions.js";
+import { createFileSubagentBindingStore, type SubagentBindingStore } from "./subagent_bindings.js";
 
 export interface DiagnosticWriter {
   write(message: string): unknown;
@@ -58,6 +60,7 @@ export function startAcpServer(args: {
   stream: Stream;
   diagnostics: DiagnosticWriter;
   context: Context;
+  bindings: SubagentBindingStore;
 }): AcpServer {
   const restoreDiagnostics = installAcpDiagnosticSanitizer({ diagnostics: args.diagnostics });
   try {
@@ -67,6 +70,7 @@ export function startAcpServer(args: {
         context: args.context,
         connection: activeConnection,
         diagnostics: args.diagnostics,
+        bindings: args.bindings,
       });
       return agent;
     }, args.stream);
@@ -123,6 +127,7 @@ export async function serveStdio(args: {
               stream,
               diagnostics: args.diagnostics,
               context: transportContext,
+              bindings: createFileSubagentBindingStore({ root: join(args.stateDir, "subagent-bindings") }),
             });
             connection = server.connection;
             const activeServer = server;

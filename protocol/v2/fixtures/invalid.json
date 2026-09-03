@@ -278,5 +278,15 @@
       ],
       "hasMore": false
     }
+  },
+  {
+    "definition": "subagentNotification",
+    "value": {
+      "kind": "startedUncorrelated",
+      "sessionId": "session-1",
+      "childSessionId": "child-1",
+      "label": "Probe child",
+      "mode": "background"
+    }
   }
 ]

@@ -261,16 +261,6 @@
   {
     "definition": "subagentNotification",
     "value": {
-      "kind": "startedUncorrelated",
-      "sessionId": "session-1",
-      "childSessionId": "child-2",
-      "label": "Probe child",
-      "mode": "background"
-    }
-  },
-  {
-    "definition": "subagentNotification",
-    "value": {
       "kind": "ended",
       "sessionId": "session-1",
       "childSessionId": "child-1",

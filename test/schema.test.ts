@@ -96,7 +96,7 @@ describe("DeepSeek extension schema", () => {
       validateProtocolValue({
         definition: "initializeMetadata",
         value: {
-          extensionProtocolVersion: 1,
+          extensionProtocolVersion: 2,
           adapterVersion: "0.1.0",
           harnessVersion: "0.1.1-rc.2",
           persistenceOwner: "sesori",

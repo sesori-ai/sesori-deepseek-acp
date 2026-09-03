@@ -2,7 +2,7 @@
   {
     "definition": "initializeMetadata",
     "value": {
-      "extensionProtocolVersion": 2,
+      "extensionProtocolVersion": 1,
       "adapterVersion": "0.1.0",
       "harnessVersion": "0.1.1",
       "persistenceOwner": "sesori"
@@ -215,6 +215,68 @@
     "value": {
       "sessionId": "session-1",
       "kind": "future_status"
+    }
+  },
+  {
+    "definition": "subagentNotification",
+    "value": {
+      "kind": "started",
+      "sessionId": "session-1",
+      "childSessionId": "child-1",
+      "label": "Probe child",
+      "mode": "foreground"
+    }
+  },
+  {
+    "definition": "subagentNotification",
+    "value": {
+      "kind": "started",
+      "sessionId": "session-1",
+      "childSessionId": "child-1",
+      "toolCallId": "call-1",
+      "label": "Probe child",
+      "mode": "detached"
+    }
+  },
+  {
+    "definition": "subagentNotification",
+    "value": {
+      "kind": "ended",
+      "sessionId": "session-1",
+      "childSessionId": "child-1",
+      "stopReason": "vanished"
+    }
+  },
+  {
+    "definition": "subagentNotification",
+    "value": {
+      "kind": "ended",
+      "sessionId": "session-1",
+      "childSessionId": "child-1",
+      "stopReason": "completed",
+      "summary": "   "
+    }
+  },
+  {
+    "definition": "historyResponse",
+    "value": {
+      "updates": [
+        {
+          "sessionId": "session-1",
+          "update": {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "call-1"
+          },
+          "_meta": {
+            "sesori.ai/deepseek": {
+              "subagent": {
+                "mode": "background"
+              }
+            }
+          }
+        }
+      ],
+      "hasMore": false
     }
   }
 ]

@@ -122,7 +122,7 @@ describe("ACP server", () => {
       authMethods: [],
       _meta: {
         [INITIALIZE_METADATA_KEY]: {
-          extensionProtocolVersion: 1,
+          extensionProtocolVersion: 2,
           adapterVersion: ADAPTER_VERSION,
           harnessVersion: DEEPSEEK_HARNESS_VERSION,
           persistenceOwner: "sesori",

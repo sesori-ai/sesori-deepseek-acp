@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import { isAbsolute } from "node:path";
 import {
@@ -46,6 +47,8 @@ import {
 import { isAppendSurfaceEvent } from "@deepseek-ai/dsh-session/surface";
 import type { SessionInspection } from "@deepseek-ai/dsh-session-persistence";
 import { SessionTitleInvalidError } from "@deepseek-ai/dsh-session-title";
+import type { SubagentRunEndInfo, SubagentRunInfo } from "@deepseek-ai/dsh-subagent";
+import type {} from "@deepseek-ai/dsh-tools";
 import { createInitializeResponse, INITIALIZE_METADATA_KEY } from "./protocol.js";
 import { validateProtocolValue } from "./schema.js";
 
@@ -58,6 +61,102 @@ const MAX_MESSAGE_ID_LENGTH = 256;
 const PROMPT_METADATA_KEY = "sesori.ai/deepseek";
 const MODEL_CONFIG_ID = "deepseek.model";
 const REASONING_CONFIG_ID = "deepseek.reasoning_effort";
+const SUBAGENT_NOTIFICATION_METHOD = "deepseek/subagent";
+const MAX_SUBAGENT_LABEL_LENGTH = 256;
+const MAX_SUBAGENT_SUMMARY_LENGTH = 512;
+
+type SubagentMode = "foreground" | "background";
+type SubagentStopReason = "completed" | "aborted" | "error" | "max-tokens" | "refusal";
+
+/** Delegation tools of the pinned dsh profile and the mode each uses when `run_in_background` is omitted. */
+const SUBAGENT_TOOL_DEFAULT_MODES: ReadonlyMap<string, SubagentMode> = new Map([
+  ["subagent", "background"],
+  ["subagent_fork", "foreground"],
+]);
+const SUBAGENT_STOP_REASONS: ReadonlySet<string> = new Set<SubagentStopReason>([
+  "completed",
+  "aborted",
+  "error",
+  "max-tokens",
+  "refusal",
+]);
+
+interface SubagentCallView {
+  label: string;
+  mode: SubagentMode;
+}
+
+interface SubagentReplayMeta {
+  label: string;
+  mode: SubagentMode;
+  childSessionId?: string;
+  ended?: { stopReason: SubagentStopReason; summary?: string };
+}
+
+function boundedText(value: unknown, maxLength: number): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const text = value.trim().slice(0, maxLength);
+  return /\S/u.test(text) ? text : undefined;
+}
+
+function subagentCallView(name: string, args: unknown): SubagentCallView | undefined {
+  const defaultMode = SUBAGENT_TOOL_DEFAULT_MODES.get(name);
+  if (defaultMode === undefined) return undefined;
+  const record = typeof args === "object" && args !== null ? (args as Record<string, unknown>) : {};
+  const background = record.run_in_background;
+  return {
+    label: boundedText(record.description, MAX_SUBAGENT_LABEL_LENGTH) ?? name,
+    mode: typeof background === "boolean" ? (background ? "background" : "foreground") : defaultMode,
+  };
+}
+
+function subagentStopReason(value: string): SubagentStopReason {
+  return SUBAGENT_STOP_REASONS.has(value) ? (value as SubagentStopReason) : "error";
+}
+
+function subagentSummary(blocks: readonly ContentBlock[] | undefined): string | undefined {
+  if (blocks === undefined) return undefined;
+  return boundedText(
+    blocks.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("\n"),
+    MAX_SUBAGENT_SUMMARY_LENGTH,
+  );
+}
+
+/** The durable identity a child's own log records after `subagent/start`; used only when no executing call is known. */
+function descriptorView(events: readonly SessionEvent[]): SubagentCallView {
+  const descriptor = events.findLast(
+    (event): event is Extract<SessionEvent, { type: "subagent/descriptor" }> => event.type === "subagent/descriptor",
+  );
+  return {
+    label: boundedText(descriptor?.data.label, MAX_SUBAGENT_LABEL_LENGTH) ?? "subagent",
+    mode: descriptor?.data.mode === "continuable" ? "background" : "foreground",
+  };
+}
+
+/** The `subagent` tool renders a continuable start as `started subagent <id>`; the id is the child session id. */
+function continuableChildId(blocks: readonly ContentBlock[]): string | undefined {
+  const text = blocks.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("");
+  const match = /^started subagent (\S+)$/u.exec(text.trim());
+  return match?.[1];
+}
+
+/** Map dsh's settlement notice wording (`settlementSummary`) back to its closed stop-reason vocabulary. */
+function settledStopReason(summary: string): SubagentStopReason {
+  if (summary.includes("finished and will do no further work")) return "completed";
+  if (summary.includes("was stopped before it finished")) return "aborted";
+  if (summary.includes("ran out of room")) return "max-tokens";
+  if (summary.includes("declined the task")) return "refusal";
+  return "error";
+}
+
+interface ReplayChildren {
+  /** Persisted children of the replayed session, oldest first. */
+  headers: SessionHeader[];
+  /** Child ids already attributed to a foreground call. */
+  assigned: Set<string>;
+  /** Continuable child id to the parent call that started it, for the later settlement notice. */
+  continuable: Map<string, { callId: string; label: string }>;
+}
 
 interface CatalogModel {
   id: string;
@@ -158,13 +257,35 @@ interface InflightPrompt {
   readonly usageByStep: Map<number, TokenUsage>;
 }
 
+interface ToolCallRecord {
+  name: string;
+  arguments: string;
+  time?: number;
+}
+
 interface SessionRecord {
   readonly handle: AgentHandle;
   readonly selection: ModelSelectionRef;
-  readonly toolCalls: Map<string, { name: string; arguments: string }>;
+  readonly toolCalls: Map<string, ToolCallRecord>;
   readonly messageCreatedAt: Map<string, number>;
   outputTail: Promise<void>;
   inflight: InflightPrompt | undefined;
+}
+
+/** A live dsh child whose direct parent is an owned root or another registered child. */
+interface ChildRecord {
+  readonly agent: Agent;
+  readonly parentId: SessionId;
+  readonly toolCalls: Map<string, ToolCallRecord>;
+  readonly messageCreatedAt: Map<string, number>;
+  outputTail: Promise<void>;
+}
+
+/** The delegation tool call executing on the current async chain, read when dsh publishes `subagent/start`. */
+interface SubagentCallScope {
+  readonly callId: string;
+  readonly agentId: SessionId;
+  readonly view: SubagentCallView;
 }
 
 function selectionId(selection: Pick<ModelSelection, "provider" | "model">): string {
@@ -528,9 +649,14 @@ interface EventProjection {
   sessionId: string;
   agent?: Agent;
   mode: "live" | "replay";
-  toolCalls: Map<string, { name: string; arguments: string }>;
+  toolCalls: Map<string, ToolCallRecord>;
   messageCreatedAt: Map<string, number>;
-  emitUpdate(update: SessionNotification["update"], messageCreatedAt?: number): Promise<void>;
+  replayChildren?: ReplayChildren;
+  emitUpdate(
+    update: SessionNotification["update"],
+    messageCreatedAt?: number,
+    subagent?: SubagentReplayMeta,
+  ): Promise<void>;
   emitStatus?(status: Record<string, unknown>): Promise<void>;
   diagnose(operation: string, error: unknown): void;
   onUsage?(turn: number, step: number, usage: TokenUsage): void;
@@ -555,7 +681,26 @@ async function projectSessionEvent(args: EventProjection, event: SessionEvent): 
     return;
   }
   if (event.type === "user/message" && isAppendSurfaceEvent(event)) {
-    if (args.mode === "live" || event.data.source.kind !== "user") return;
+    if (args.mode === "live") return;
+    const source = event.data.source as { kind: string; senderSessionId?: unknown; summary?: unknown };
+    if (source.kind === "subagent-settled") {
+      const childSessionId = typeof source.senderSessionId === "string" ? source.senderSessionId : undefined;
+      const started = childSessionId === undefined ? undefined : args.replayChildren?.continuable.get(childSessionId);
+      if (childSessionId === undefined || started === undefined) return;
+      args.replayChildren?.continuable.delete(childSessionId);
+      await args.emitUpdate(
+        { sessionUpdate: "tool_call_update", toolCallId: started.callId, status: "completed" },
+        eventTime(event),
+        {
+          label: started.label,
+          mode: "background",
+          childSessionId,
+          ended: { stopReason: settledStopReason(typeof source.summary === "string" ? source.summary : "") },
+        },
+      );
+      return;
+    }
+    if (source.kind !== "user") return;
     for (const block of event.data.content) {
       if (block.type !== "text" && block.type !== "image") {
         throw new Error("session history contains unsupported user content");
@@ -618,13 +763,19 @@ async function projectSessionEvent(args: EventProjection, event: SessionEvent): 
   }
   if (event.type === "tool/call") {
     const callId = String(event.data.callId);
-    args.toolCalls.set(callId, { name: event.data.name, arguments: event.data.arguments });
+    const time = eventTime(event);
+    args.toolCalls.set(callId, {
+      name: event.data.name,
+      arguments: event.data.arguments,
+      ...(time === undefined ? {} : { time }),
+    });
     const update: Extract<SessionNotification["update"], { sessionUpdate: "tool_call" }> = {
       sessionUpdate: "tool_call",
       toolCallId: callId,
       title: event.data.name,
       status: "in_progress",
     };
+    const subagent = args.mode === "replay" ? replaySubagentCall(event.data.name, event.data.arguments) : undefined;
     try {
       const tools = args.context.get("tools") as
         | { get(name: string, agent?: Agent): { presentCall?(value: unknown): unknown } | undefined }
@@ -659,7 +810,7 @@ async function projectSessionEvent(args: EventProjection, event: SessionEvent): 
     } catch (error) {
       args.diagnose("tool/call presentation", toolPresentationError(error, "tool call presenter failed"));
     }
-    await args.emitUpdate(update, firstMessageTime(args, `tool:${callId}`, eventTime(event)));
+    await args.emitUpdate(update, firstMessageTime(args, `tool:${callId}`, time), subagent);
     return;
   }
   if (event.type === "tool/result" && isAppendSurfaceEvent(event)) {
@@ -706,7 +857,19 @@ async function projectSessionEvent(args: EventProjection, event: SessionEvent): 
         args.diagnose("tool/result presentation", toolPresentationError(error, "tool result presenter failed"));
       }
     }
-    await args.emitUpdate(update, firstMessageTime(args, `tool:${callId}`, eventTime(event)));
+    const subagent =
+      args.mode === "replay" && call !== undefined
+        ? replaySubagentResult({
+            sessionId: args.sessionId,
+            callId,
+            call,
+            content: result.content,
+            failed: update.status === "failed",
+            resultTime: eventTime(event),
+            children: args.replayChildren,
+          })
+        : undefined;
+    await args.emitUpdate(update, firstMessageTime(args, `tool:${callId}`, eventTime(event)), subagent);
     return;
   }
   if (event.type === "command/done" && event.data.text !== undefined) {
@@ -764,10 +927,83 @@ async function projectSessionEvent(args: EventProjection, event: SessionEvent): 
   }
 }
 
+function replaySubagentCall(name: string, rawArguments: string): SubagentReplayMeta | undefined {
+  if (!SUBAGENT_TOOL_DEFAULT_MODES.has(name)) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = parseToolArguments(rawArguments);
+  } catch {
+    parsed = undefined;
+  }
+  return subagentCallView(name, parsed);
+}
+
+/**
+ * Fold what the parent log alone says about a delegation once its tool result
+ * lands. A continuable child is named by the result text and settles later; a
+ * foreground child settles with the result but is never named, so it is
+ * attributed to the persisted child created inside the call window.
+ */
+function replaySubagentResult(args: {
+  sessionId: string;
+  callId: string;
+  call: ToolCallRecord;
+  content: readonly ContentBlock[];
+  failed: boolean;
+  resultTime: number | undefined;
+  children: ReplayChildren | undefined;
+}): SubagentReplayMeta | undefined {
+  const view = replaySubagentCall(args.call.name, args.call.arguments);
+  if (view === undefined) return undefined;
+  if (view.mode === "background") {
+    const childSessionId = args.call.name === "subagent" ? continuableChildId(args.content) : undefined;
+    if (childSessionId === undefined) return view;
+    args.children?.continuable.set(childSessionId, { callId: args.callId, label: view.label });
+    return { ...view, childSessionId };
+  }
+  const ended = { stopReason: args.failed ? ("error" as const) : ("completed" as const) };
+  const callTime = args.call.time;
+  const resultTime = args.resultTime;
+  const children = args.children;
+  const candidate =
+    callTime === undefined || resultTime === undefined || children === undefined
+      ? undefined
+      : children.headers.find(
+          (header) =>
+            !children.assigned.has(String(header.id)) &&
+            String(header.parentSession) === args.sessionId &&
+            header.createdAt >= callTime &&
+            header.createdAt <= resultTime,
+        );
+  if (candidate === undefined || children === undefined) return { ...view, ended };
+  children.assigned.add(String(candidate.id));
+  return { ...view, childSessionId: String(candidate.id), ended };
+}
+
+function hasSubagentCall(events: readonly SessionEvent[]): boolean {
+  return events.some((event) => event.type === "tool/call" && SUBAGENT_TOOL_DEFAULT_MODES.has(event.data.name));
+}
+
+function updateMetadata(
+  messageTime: number | undefined,
+  subagent: SubagentReplayMeta | undefined,
+): Pick<SessionNotification, "_meta"> {
+  if (messageTime === undefined && subagent === undefined) return {};
+  return {
+    _meta: {
+      [PROMPT_METADATA_KEY]: {
+        ...(messageTime === undefined ? {} : { messageCreatedAt: messageTime }),
+        ...(subagent === undefined ? {} : { subagent }),
+      },
+    },
+  };
+}
+
 async function replayUpdates(args: {
   context: Context;
   sessionId: string;
   events: readonly SessionEvent[];
+  childHeaders: readonly SessionHeader[];
   diagnose: (operation: string, error: unknown) => void;
 }): Promise<SessionNotification[]> {
   assertKnownEvents(args.events);
@@ -787,14 +1023,13 @@ async function replayUpdates(args: {
     mode: "replay",
     toolCalls: new Map(),
     messageCreatedAt,
-    emitUpdate: (update, messageTime) => {
-      updates.push({
-        sessionId: args.sessionId,
-        update,
-        ...(messageTime === undefined
-          ? {}
-          : { _meta: { "sesori.ai/deepseek": { messageCreatedAt: messageTime } } }),
-      });
+    replayChildren: {
+      headers: [...args.childHeaders].sort((left, right) => left.createdAt - right.createdAt),
+      assigned: new Set(),
+      continuable: new Map(),
+    },
+    emitUpdate: (update, messageTime, subagent) => {
+      updates.push({ sessionId: args.sessionId, update, ...updateMetadata(messageTime, subagent) });
       return Promise.resolve();
     },
     diagnose: args.diagnose,
@@ -811,6 +1046,8 @@ export class DurableSessionAgent implements AcpAgent {
   readonly #creations = new Set<Promise<void>>();
   readonly #loads = new Map<SessionId, Promise<void>>();
   readonly #closes = new Map<SessionId, Promise<CloseSessionResponse>>();
+  readonly #children = new Map<SessionId, ChildRecord>();
+  readonly #callScope = new AsyncLocalStorage<SubagentCallScope | undefined>();
   readonly #hooks: (() => void)[] = [];
   #closed = false;
   #disposal: Promise<void> | undefined;
@@ -825,8 +1062,50 @@ export class DurableSessionAgent implements AcpAgent {
     this.#diagnostics = args.diagnostics;
     this.#hooks.push(this.#context.on("session/event", (session, event: SessionEvent) => {
       const record = this.#sessions.get(session.id);
-      if (record?.handle.agent.session !== session) return;
-      this.#projectEvent(record, event);
+      if (record?.handle.agent.session === session) {
+        this.#projectEvent(record, event);
+        return;
+      }
+      const child = this.#children.get(session.id);
+      if (child?.agent.session === session) this.#projectChildEvent(child, event);
+    }));
+    this.#hooks.push(this.#context.on("tools/execute", (exec, next) => {
+      const agent = exec.agent;
+      if (agent === undefined || this.#lineageRecord(agent.id) === undefined) return next();
+      const view = subagentCallView(exec.name, exec.arguments);
+      // Every owned execution opens its own scope so a stale delegation scope inherited by an
+      // async chain (a child's wake-up, a later `send_message`) never correlates a new start.
+      return this.#callScope.run(
+        view === undefined ? undefined : { callId: String(exec.callId), agentId: agent.id, view },
+        next,
+      );
+    }));
+    this.#hooks.push(this.#context.on("subagent/start", (info: SubagentRunInfo) => {
+      this.#childStarted(info);
+    }));
+    this.#hooks.push(this.#context.on("subagent/end", (info: SubagentRunEndInfo) => {
+      this.#childEnded(info);
+    }));
+    this.#hooks.push(this.#context.on("agent/request", async ({ agent }, next): Promise<LlmCallConfig> => {
+      const resolved = await next();
+      const root = this.#children.has(agent.id) ? this.#rootOf(agent.id) : undefined;
+      if (root === undefined) return resolved;
+      // dsh children inherit only `AgentOptions`, which owned roots never set; give descendants
+      // the owning root's live selection instead so they can run at all.
+      let selected: ModelSelection | undefined;
+      try {
+        selected = root.selection.current;
+      } catch {
+        return resolved;
+      }
+      if (selected === undefined) return resolved;
+      const { reasoningEffort: _inheritedEffort, ...rest } = resolved;
+      return {
+        ...rest,
+        provider: selected.provider,
+        model: selected.model,
+        ...(selected.reasoningEffort === undefined ? {} : { reasoningEffort: selected.reasoningEffort }),
+      };
     }));
     this.#hooks.push(this.#context.on("agent/inbox/claimed", ({ agent, message, turn }) => {
       const inflight = this.#ownedRecord(agent)?.inflight;
@@ -1019,6 +1298,7 @@ export class DurableSessionAgent implements AcpAgent {
         context: this.#context,
         sessionId: String(sessionId),
         events: inspection.events,
+        childHeaders: await this.#childHeaders(sessionId, inspection.events),
         diagnose: (operation, error) => this.#diagnose(operation, sessionId, error),
       });
       if (resident !== undefined) {
@@ -1108,6 +1388,7 @@ export class DurableSessionAgent implements AcpAgent {
       return {};
     }
     this.#sessions.delete(sessionId);
+    this.#releaseOrphanedChildren();
     try {
       await this.#disposeRecord(record);
       return {};
@@ -1401,6 +1682,7 @@ export class DurableSessionAgent implements AcpAgent {
           context: this.#context,
           sessionId: request.sessionId,
           events: page.events,
+          childHeaders: await this.#childHeaders(sessionId, page.events),
           diagnose: (operation, error) => this.#diagnose(operation, sessionId, error),
         }),
         hasMore: page.hasMore,
@@ -1635,6 +1917,135 @@ export class DurableSessionAgent implements AcpAgent {
     return record?.handle.agent === agent ? record : undefined;
   }
 
+  #lineageRecord(id: SessionId): SessionRecord | ChildRecord | undefined {
+    return this.#sessions.get(id) ?? this.#children.get(id);
+  }
+
+  /** The owned root above a registered child, following `parentSession` links through nested children. */
+  #rootOf(childId: SessionId): SessionRecord | undefined {
+    const visited = new Set<SessionId>();
+    let cursor = this.#children.get(childId);
+    while (cursor !== undefined && !visited.has(cursor.agent.id)) {
+      visited.add(cursor.agent.id);
+      const root = this.#sessions.get(cursor.parentId);
+      if (root !== undefined) return root;
+      cursor = this.#children.get(cursor.parentId);
+    }
+    return undefined;
+  }
+
+  #releaseOrphanedChildren(): void {
+    for (const childId of this.#children.keys()) {
+      if (this.#rootOf(childId) === undefined) this.#children.delete(childId);
+    }
+  }
+
+  async #childHeaders(sessionId: SessionId, events: readonly SessionEvent[]): Promise<SessionHeader[]> {
+    if (!hasSubagentCall(events)) return [];
+    try {
+      const headers = await this.#context.sessionPersistence.list();
+      return headers.filter((header) => header.parentSession === sessionId);
+    } catch (error) {
+      this.#diagnose("session children", sessionId, error);
+      return [];
+    }
+  }
+
+  #childStarted(info: SubagentRunInfo): void {
+    if (!info.local) return;
+    const child = this.#context.agents.get(info.id);
+    if (child === undefined) return;
+    const scope = this.#callScope.getStore();
+    const parentId = scope?.agentId ?? child.session.header.parentSession;
+    if (parentId === undefined) return;
+    const parent = this.#lineageRecord(parentId);
+    if (parent === undefined) return;
+    const existing = this.#children.get(info.id);
+    const record: ChildRecord =
+      existing?.agent === child
+        ? existing
+        : {
+            agent: child,
+            parentId,
+            toolCalls: new Map(),
+            messageCreatedAt: new Map(),
+            outputTail: Promise.resolve(),
+          };
+    this.#children.set(info.id, record);
+    const correlated = scope !== undefined && scope.agentId === parentId ? scope : undefined;
+    const view = correlated?.view ?? descriptorView(child.session.events);
+    this.#notifySubagent(parent, {
+      ...(correlated === undefined
+        ? { kind: "startedUncorrelated" }
+        : { kind: "started", toolCallId: correlated.callId }),
+      sessionId: String(parentId),
+      childSessionId: String(info.id),
+      label: view.label,
+      mode: view.mode,
+    });
+    // The child's first updates must follow its `started` notification.
+    record.outputTail = parent.outputTail;
+  }
+
+  #childEnded(info: SubagentRunEndInfo): void {
+    const record = this.#children.get(info.id);
+    if (record === undefined) return;
+    this.#children.delete(info.id);
+    const parent = this.#lineageRecord(record.parentId);
+    if (parent === undefined) return;
+    const summary = subagentSummary(info.lastAssistantMessage);
+    // Every queued child update precedes its `ended` notification.
+    parent.outputTail = parent.outputTail.catch(() => undefined).then(() => record.outputTail.catch(() => undefined));
+    this.#notifySubagent(parent, {
+      kind: "ended",
+      sessionId: String(record.parentId),
+      childSessionId: String(info.id),
+      stopReason: subagentStopReason(String(info.stopReason)),
+      ...(summary === undefined ? {} : { summary }),
+    });
+  }
+
+  #notifySubagent(parent: SessionRecord | ChildRecord, params: Record<string, unknown>): void {
+    const parentId = "handle" in parent ? parent.handle.agent.id : parent.agent.id;
+    if (!validateProtocolValue({ definition: "subagentNotification", value: params }).valid) {
+      this.#diagnose(SUBAGENT_NOTIFICATION_METHOD, parentId, new Error("sub-agent notification exceeds protocol bounds"));
+      return;
+    }
+    this.#queueTail(parent, () => this.#connection.extNotification(SUBAGENT_NOTIFICATION_METHOD, params));
+  }
+
+  #queueTail(record: SessionRecord | ChildRecord, task: () => Promise<void>): void {
+    if ("handle" in record) {
+      this.#queue(record, task);
+      return;
+    }
+    record.outputTail = record.outputTail.catch(() => undefined).then(task);
+    void record.outputTail.catch((error: unknown) => {
+      this.#diagnose("child session output", record.agent.id, error);
+    });
+  }
+
+  #projectChildEvent(record: ChildRecord, event: SessionEvent): void {
+    const sessionId = String(record.agent.id);
+    this.#queueTail(record, () =>
+      projectSessionEvent(
+        {
+          context: this.#context,
+          sessionId,
+          agent: record.agent,
+          mode: "live",
+          toolCalls: record.toolCalls,
+          messageCreatedAt: record.messageCreatedAt,
+          emitUpdate: (update, messageTime) =>
+            this.#connection.sessionUpdate({ sessionId, update, ...updateMetadata(messageTime, undefined) }),
+          emitStatus: (status) => this.#connection.extNotification("deepseek/session/status", status),
+          diagnose: (operation, error) => this.#diagnose(operation, record.agent.id, error),
+        },
+        event,
+      ),
+    );
+  }
+
   #queue(record: SessionRecord, task: () => Promise<void>): void {
     const inflight = record.inflight;
     record.outputTail = record.outputTail.catch(() => undefined).then(task);
@@ -1655,13 +2066,8 @@ export class DurableSessionAgent implements AcpAgent {
           mode: "live",
           toolCalls: record.toolCalls,
           messageCreatedAt: record.messageCreatedAt,
-          emitUpdate: (update, messageTime) => this.#connection.sessionUpdate({
-            sessionId,
-            update,
-            ...(messageTime === undefined
-              ? {}
-              : { _meta: { "sesori.ai/deepseek": { messageCreatedAt: messageTime } } }),
-          }),
+          emitUpdate: (update, messageTime) =>
+            this.#connection.sessionUpdate({ sessionId, update, ...updateMetadata(messageTime, undefined) }),
           emitStatus: (status) => this.#connection.extNotification("deepseek/session/status", status),
           diagnose: (operation, error) => this.#diagnose(operation, record.handle.agent.id, error),
           onUsage: (turn, step, usage) => {
@@ -1846,6 +2252,7 @@ export class DurableSessionAgent implements AcpAgent {
     ]);
     const records = [...this.#sessions.values()];
     this.#sessions.clear();
+    this.#children.clear();
     const outcomes = await Promise.allSettled(records.map((record) => this.#disposeRecord(record)));
     const failures = [...transitionOutcomes, ...outcomes].flatMap((outcome) =>
       outcome.status === "rejected" ? [outcome.reason] : [],

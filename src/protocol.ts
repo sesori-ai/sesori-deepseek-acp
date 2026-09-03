@@ -5,7 +5,7 @@ export const ADAPTER_TITLE = "Sesori DeepSeek";
 export const ADAPTER_VERSION = "0.1.2";
 export const DEEPSEEK_HARNESS_VERSION = "0.1.1-rc.2";
 export const ACP_SDK_VERSION = "0.25.1";
-export const EXTENSION_PROTOCOL_VERSION = 1;
+export const EXTENSION_PROTOCOL_VERSION = 2;
 export const INITIALIZE_METADATA_KEY = "sesori.ai/deepseek";
 
 export interface DeepSeekInitializeMetadata {

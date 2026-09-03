@@ -2,7 +2,7 @@
   {
     "definition": "initializeMetadata",
     "value": {
-      "extensionProtocolVersion": 1,
+      "extensionProtocolVersion": 2,
       "adapterVersion": "0.1.0",
       "harnessVersion": "0.1.1-rc.2",
       "persistenceOwner": "sesori"
@@ -11,7 +11,7 @@
   {
     "definition": "initializeMetadata",
     "value": {
-      "extensionProtocolVersion": 1,
+      "extensionProtocolVersion": 2,
       "adapterVersion": "0.1.0",
       "harnessVersion": "0.1.1-rc.2",
       "persistenceOwner": "sesori",
@@ -50,12 +50,12 @@
       },
       "providers": [
         {
-          "id": "provider/alpha-α",
+          "id": "provider/alpha-\u03b1",
           "name": "Synthetic Provider",
           "models": [
             {
               "id": "v1c3ludGhldGlj",
-              "upstreamModelId": "model/alpha-α",
+              "upstreamModelId": "model/alpha-\u03b1",
               "name": "Synthetic Model",
               "reasoningEfforts": [
                 "low",
@@ -234,6 +234,86 @@
       "sessionId": "session-1",
       "kind": "warning",
       "message": "Synthetic warning"
+    }
+  },
+  {
+    "definition": "subagentNotification",
+    "value": {
+      "kind": "started",
+      "sessionId": "session-1",
+      "childSessionId": "child-1",
+      "toolCallId": "call-1",
+      "label": "Probe child",
+      "mode": "foreground"
+    }
+  },
+  {
+    "definition": "subagentNotification",
+    "value": {
+      "kind": "started",
+      "sessionId": "session-1",
+      "childSessionId": "child-2",
+      "toolCallId": "call-2",
+      "label": "Probe child",
+      "mode": "background"
+    }
+  },
+  {
+    "definition": "subagentNotification",
+    "value": {
+      "kind": "startedUncorrelated",
+      "sessionId": "session-1",
+      "childSessionId": "child-2",
+      "label": "Probe child",
+      "mode": "background"
+    }
+  },
+  {
+    "definition": "subagentNotification",
+    "value": {
+      "kind": "ended",
+      "sessionId": "session-1",
+      "childSessionId": "child-1",
+      "stopReason": "completed",
+      "summary": "Done."
+    }
+  },
+  {
+    "definition": "subagentNotification",
+    "value": {
+      "kind": "ended",
+      "sessionId": "session-1",
+      "childSessionId": "child-2",
+      "stopReason": "aborted"
+    }
+  },
+  {
+    "definition": "historyResponse",
+    "value": {
+      "updates": [
+        {
+          "sessionId": "session-1",
+          "update": {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "call-1"
+          },
+          "_meta": {
+            "sesori.ai/deepseek": {
+              "messageCreatedAt": 1,
+              "subagent": {
+                "label": "Probe child",
+                "mode": "background",
+                "childSessionId": "child-1",
+                "ended": {
+                  "stopReason": "completed",
+                  "summary": "Done."
+                }
+              }
+            }
+          }
+        }
+      ],
+      "hasMore": false
     }
   }
 ]

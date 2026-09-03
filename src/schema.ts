@@ -12,7 +12,8 @@ export type ProtocolDefinition =
   | "renameResponse"
   | "askUserQuestionRequest"
   | "askUserQuestionResponse"
-  | "sessionStatusNotification";
+  | "sessionStatusNotification"
+  | "subagentNotification";
 
 export interface FixtureEntry {
   definition: ProtocolDefinition;
@@ -41,6 +42,7 @@ const definitions: readonly ProtocolDefinition[] = [
   "askUserQuestionRequest",
   "askUserQuestionResponse",
   "sessionStatusNotification",
+  "subagentNotification",
 ];
 const definitionSet = new Set<string>(definitions);
 const ajv = new Ajv2020({ allErrors: true, strict: true });

@@ -20,6 +20,7 @@ interface SessionServices {
   extensionRequest: ReturnType<typeof vi.fn>;
   sessionUpdate: ReturnType<typeof vi.fn>;
   invoke(name: string, ...args: unknown[]): unknown;
+  invokeFirst(name: string, ...args: unknown[]): unknown;
   askQuestion(request: unknown): Promise<unknown>;
   contextServices: Map<string, unknown>;
   agent: DurableSessionAgent;
@@ -209,6 +210,7 @@ function services(): SessionServices {
     extensionRequest,
     sessionUpdate,
     invoke: (name, ...args) => listeners.get(name)?.at(-1)?.(...(args as never[])),
+    invokeFirst: (name, ...args) => listeners.get(name)?.at(0)?.(...(args as never[])),
     askQuestion: (request) => {
       if (questionProvider === undefined) throw new Error("question provider is unavailable");
       return questionProvider.ask(request);
@@ -2616,6 +2618,227 @@ describe("durable ACP sessions", () => {
           status: "completed",
         },
       },
+    ]);
+  });
+});
+
+describe("sub-agent lifecycle", () => {
+  async function rootWithChild(state: SessionServices, childId: string): Promise<{ root: AgentHandle; child: AgentHandle }> {
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const root = state.live.get(created.sessionId)!;
+    const child = await state.context.agents.create({ sessionId: SessionId(childId), meta: { cwd: "/project" } });
+    (child.agent.session.header as { parentSession?: SessionId }).parentSession = root.agent.id;
+    return { root, child };
+  }
+
+  function subagentCall(state: SessionServices, root: AgentHandle, args: { callId: string; name: string; arguments: Record<string, unknown> }): void {
+    state.invoke("session/event", root.agent.session, {
+      type: "tool/call",
+      time: 5,
+      data: { turn: 1, step: 1, callId: args.callId, name: args.name, arguments: JSON.stringify(args.arguments) },
+    });
+  }
+
+  async function executeDelegation(state: SessionServices, root: AgentHandle, args: { callId: string; name: string; arguments: Record<string, unknown> }, start: () => void): Promise<void> {
+    await state.invoke(
+      "tools/execute",
+      { callId: args.callId, name: args.name, arguments: args.arguments, agent: root.agent, signal: new AbortController().signal },
+      async () => {
+        await Promise.resolve();
+        start();
+        return { isError: false, content: [] };
+      },
+    );
+  }
+
+  it("correlates a foreground child to its executing call, streams its transcript, and ends it in order", async () => {
+    const state = services();
+    const { root, child } = await rootWithChild(state, "child-1");
+    const call = { callId: "call-1", name: "subagent", arguments: { description: "Probe child", prompt: "secret", run_in_background: false } };
+    subagentCall(state, root, call);
+    await executeDelegation(state, root, call, () => {
+      state.invoke("subagent/start", { runId: "run-1", provider: "spawn", id: child.agent.id, local: true });
+      state.invoke("session/event", child.agent.session, {
+        type: "assistant/chunk",
+        data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "child text" } },
+      });
+      state.invoke("subagent/end", {
+        runId: "run-1",
+        provider: "spawn",
+        id: child.agent.id,
+        local: true,
+        stopReason: "completed",
+        lastAssistantMessage: [{ type: "text", text: "  child answer  " }],
+      });
+    });
+    await expect.poll(() => state.extNotifications.length).toBe(2);
+
+    expect(state.extNotifications).toEqual([
+      {
+        method: "deepseek/subagent",
+        params: { kind: "started", sessionId: String(root.agent.id), childSessionId: "child-1", toolCallId: "call-1", label: "Probe child", mode: "foreground" },
+      },
+      {
+        method: "deepseek/subagent",
+        params: { kind: "ended", sessionId: String(root.agent.id), childSessionId: "child-1", stopReason: "completed", summary: "child answer" },
+      },
+    ]);
+    expect(state.updates.map((notification) => [notification.sessionId, notification.update.sessionUpdate])).toEqual([
+      [String(root.agent.id), "tool_call"],
+      ["child-1", "agent_message_chunk"],
+    ]);
+    expect(JSON.stringify(state.extNotifications)).not.toContain("secret");
+  });
+
+  it("derives the mode from run_in_background with the tool defaults", async () => {
+    const state = services();
+    const { root, child } = await rootWithChild(state, "child-bg");
+    const other = await state.context.agents.create({ sessionId: SessionId("child-fork"), meta: { cwd: "/project" } });
+    (other.agent.session.header as { parentSession?: SessionId }).parentSession = root.agent.id;
+    const background = { callId: "call-bg", name: "subagent", arguments: { description: "Background child", prompt: "p" } };
+    const fork = { callId: "call-fork", name: "subagent_fork", arguments: { description: "Forked child", prompt: "p" } };
+    subagentCall(state, root, background);
+    subagentCall(state, root, fork);
+    await executeDelegation(state, root, background, () => {
+      state.invoke("subagent/start", { runId: "run-bg", provider: "spawn", id: child.agent.id, local: true });
+    });
+    await executeDelegation(state, root, fork, () => {
+      state.invoke("subagent/start", { runId: "run-fork", provider: "fork", id: other.agent.id, local: true });
+    });
+    await expect.poll(() => state.extNotifications.length).toBe(2);
+
+    expect(state.extNotifications.map((item) => item.params)).toEqual([
+      expect.objectContaining({ kind: "started", childSessionId: "child-bg", toolCallId: "call-bg", mode: "background" }),
+      expect.objectContaining({ kind: "started", childSessionId: "child-fork", toolCallId: "call-fork", mode: "foreground" }),
+    ]);
+  });
+
+  it("announces an uncorrelated start from the child's descriptor when no delegation call is executing", async () => {
+    const state = services();
+    const { root, child } = await rootWithChild(state, "child-resumed");
+    child.agent.session.append("subagent/descriptor", { version: 2, mode: "continuable", provider: "spawn", label: "Resumed child" });
+    state.invoke("subagent/start", { runId: "run-2", provider: "spawn", id: child.agent.id, local: true });
+    await expect.poll(() => state.extNotifications.length).toBe(1);
+
+    expect(state.extNotifications[0]!.params).toEqual({
+      kind: "startedUncorrelated",
+      sessionId: String(root.agent.id),
+      childSessionId: "child-resumed",
+      label: "Resumed child",
+      mode: "background",
+    });
+  });
+
+  it("ignores children of agents this connection does not own", async () => {
+    const state = services();
+    const foreign = await state.context.agents.create({ sessionId: SessionId("foreign-child"), meta: { cwd: "/project" } });
+    (foreign.agent.session.header as { parentSession?: SessionId }).parentSession = SessionId("foreign-root");
+    state.invoke("subagent/start", { runId: "run-3", provider: "spawn", id: foreign.agent.id, local: true });
+    state.invoke("session/event", foreign.agent.session, {
+      type: "assistant/chunk",
+      data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "dropped" } },
+    });
+    state.invoke("subagent/end", { runId: "run-3", provider: "spawn", id: foreign.agent.id, local: true, stopReason: "completed" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(state.extNotifications).toEqual([]);
+    expect(state.updates).toEqual([]);
+  });
+
+  it("gives registered children the owning root's model selection", async () => {
+    const state = services();
+    const { root, child } = await rootWithChild(state, "child-model");
+    state.invoke("subagent/start", { runId: "run-4", provider: "spawn", id: child.agent.id, local: true });
+    const inherited = { provider: "inherited", model: "inherited", reasoningEffort: "high" };
+
+    await expect(
+      state.invokeFirst("agent/request", { agent: child.agent, turn: 1, step: 1 }, async () => inherited),
+    ).resolves.toEqual({ provider: "synthetic", model: "synthetic" });
+    await expect(
+      state.invokeFirst("agent/request", { agent: root.agent, turn: 1, step: 1 }, async () => inherited),
+    ).resolves.toEqual(inherited);
+  });
+
+  it("folds delegation identity and settlement into the parent's replayed tool calls", async () => {
+    const state = services();
+    const meta = header({ id: "parent", cwd: "/project", createdAt: 1 });
+    state.headers.push(meta, {
+      ...header({ id: "fork-child", cwd: "/project", createdAt: 150 }),
+      parentSession: SessionId("parent"),
+      origin: "subagent",
+    } as SessionHeader);
+    const toolResult = (args: { seq: number; time: number; callId: string; text: string }) => ({
+      type: "tool/result",
+      seq: args.seq,
+      time: args.time,
+      surfaceOp: "append",
+      sourceEventSeqs: [args.seq - 1],
+      data: {
+        turn: 1,
+        step: 1,
+        message: {
+          id: `result-${args.callId}`,
+          role: "user",
+          source: { kind: "tool", callId: args.callId },
+          content: [{ type: "tool-result", toolCallId: args.callId, content: [{ type: "text", text: args.text }] }],
+        },
+      },
+    });
+    state.inspections.set("parent", {
+      meta,
+      events: [
+        {
+          type: "user/message",
+          seq: 0,
+          time: 1,
+          surfaceOp: "append",
+          data: { id: "user-1", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "delegate" }] },
+        },
+        {
+          type: "tool/call",
+          seq: 1,
+          time: 10,
+          data: { turn: 1, step: 1, callId: "call-bg", name: "subagent", arguments: JSON.stringify({ description: "Background child", prompt: "secret" }) },
+        },
+        toolResult({ seq: 2, time: 12, callId: "call-bg", text: "started subagent bg-child" }),
+        {
+          type: "tool/call",
+          seq: 3,
+          time: 100,
+          data: { turn: 1, step: 1, callId: "call-fork", name: "subagent_fork", arguments: "{not json" },
+        },
+        toolResult({ seq: 4, time: 200, callId: "call-fork", text: "OK" }),
+        {
+          type: "user/message",
+          seq: 5,
+          time: 300,
+          surfaceOp: "append",
+          data: {
+            id: "notice-1",
+            role: "user",
+            source: {
+              kind: "subagent-settled",
+              form: "notice",
+              summary: "Background subagent bg-child was stopped before it finished.",
+              senderSessionId: "bg-child",
+            },
+            content: [{ type: "text", text: "secret closing message" }],
+          },
+        },
+      ] as unknown as SessionEvent[],
+    });
+
+    const response = await state.agent.extMethod("deepseek/session/history", { sessionId: "parent" });
+    const subagentMeta = (notification: SessionNotification) =>
+      (notification._meta as { "sesori.ai/deepseek": { subagent?: unknown } })["sesori.ai/deepseek"].subagent;
+    expect(JSON.stringify(response)).not.toContain("secret");
+    expect((response.updates as SessionNotification[]).map((notification) => [notification.update.sessionUpdate, subagentMeta(notification)])).toEqual([
+      ["user_message_chunk", undefined],
+      ["tool_call", { label: "Background child", mode: "background" }],
+      ["tool_call_update", { label: "Background child", mode: "background", childSessionId: "bg-child" }],
+      ["tool_call", { label: "subagent_fork", mode: "foreground" }],
+      ["tool_call_update", { label: "subagent_fork", mode: "foreground", childSessionId: "fork-child", ended: { stopReason: "completed" } }],
+      ["tool_call_update", { label: "Background child", mode: "background", childSessionId: "bg-child", ended: { stopReason: "aborted" } }],
     ]);
   });
 });

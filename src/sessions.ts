@@ -276,6 +276,7 @@ interface ChildRecord {
   readonly toolCalls: Map<string, ToolCallRecord>;
   readonly messageCreatedAt: Map<string, number>;
   outputTail: Promise<void>;
+  lifecycle: { readonly kind: "unannounced" } | { readonly kind: "announced"; readonly mode: SubagentMode };
   /** Settled, but retained because a registered descendant still resolves its lineage through it. */
   ended: boolean;
 }
@@ -1406,7 +1407,7 @@ export class DurableSessionAgent implements AcpAgent {
     this.#sessions.delete(sessionId);
     try {
       await this.#disposeRecord(record);
-      this.#releaseOrphanedChildren();
+      await this.#releaseOrphanedChildren();
       return {};
     } catch (error) {
       if (!this.#closed && !this.#sessions.has(sessionId)) {
@@ -1978,10 +1979,14 @@ export class DurableSessionAgent implements AcpAgent {
     }
   }
 
-  #releaseOrphanedChildren(): void {
-    for (const childId of this.#children.keys()) {
-      if (this.#rootOf(childId) === undefined) this.#children.delete(childId);
+  async #releaseOrphanedChildren(): Promise<void> {
+    const orphaned: ChildRecord[] = [];
+    for (const [childId, child] of this.#children) {
+      if (this.#rootOf(childId) !== undefined) continue;
+      this.#children.delete(childId);
+      orphaned.push(child);
     }
+    await Promise.allSettled(orphaned.map((child) => child.outputTail));
   }
 
   async #bindingsFor(sessionId: SessionId, events: readonly SessionEvent[]): Promise<ReadonlyMap<string, string>> {
@@ -2021,6 +2026,7 @@ export class DurableSessionAgent implements AcpAgent {
         toolCalls: new Map(),
         messageCreatedAt: new Map(),
         outputTail: parent.outputTail,
+        lifecycle: { kind: "unannounced" },
         ended: false,
       };
       this.#children.set(descendant.id, record);
@@ -2048,9 +2054,11 @@ export class DurableSessionAgent implements AcpAgent {
             toolCalls: new Map(),
             messageCreatedAt: new Map(),
             outputTail: Promise.resolve(),
+            lifecycle: { kind: "unannounced" },
             ended: false,
           };
     record.ended = false;
+    record.lifecycle = { kind: "unannounced" };
     this.#children.set(info.id, record);
     // The child's first updates must follow its `started` notification.
     record.outputTail = parent.outputTail;
@@ -2060,7 +2068,7 @@ export class DurableSessionAgent implements AcpAgent {
       this.#diagnose(SUBAGENT_NOTIFICATION_METHOD, parentId, new Error("sub-agent start without an executing delegation call"));
       return;
     }
-    this.#notifySubagent(parent, {
+    const announced = this.#notifySubagent(parent, {
       kind: "started",
       sessionId: String(parentId),
       childSessionId: String(info.id),
@@ -2068,6 +2076,9 @@ export class DurableSessionAgent implements AcpAgent {
       label: scope.view.label,
       mode: scope.view.mode,
     });
+    if (!announced) return;
+    record.lifecycle = { kind: "announced", mode: scope.view.mode };
+    record.outputTail = parent.outputTail;
     void this.#bindings
       .record({ parentId: String(parentId), toolCallId: scope.callId, childSessionId: String(info.id) })
       .catch((error: unknown) => {
@@ -2079,12 +2090,14 @@ export class DurableSessionAgent implements AcpAgent {
     const record = this.#children.get(info.id);
     if (record === undefined || record.ended) return;
     record.ended = true;
+    const lifecycle = record.lifecycle;
     const parent = this.#lineageRecord(record.parentId);
     this.#releaseSettled(info.id);
     if (parent === undefined) return;
-    const summary = subagentSummary(info.lastAssistantMessage);
     // Every queued child update precedes its `ended` notification.
     parent.outputTail = parent.outputTail.catch(() => undefined).then(() => record.outputTail.catch(() => undefined));
+    if (lifecycle.kind === "unannounced") return;
+    const summary = subagentSummary(info.lastAssistantMessage);
     this.#notifySubagent(parent, {
       kind: "ended",
       sessionId: String(record.parentId),
@@ -2094,13 +2107,14 @@ export class DurableSessionAgent implements AcpAgent {
     });
   }
 
-  #notifySubagent(parent: SessionRecord | ChildRecord, params: Record<string, unknown>): void {
+  #notifySubagent(parent: SessionRecord | ChildRecord, params: Record<string, unknown>): boolean {
     const parentId = "handle" in parent ? parent.handle.agent.id : parent.agent.id;
     if (!validateProtocolValue({ definition: "subagentNotification", value: params }).valid) {
       this.#diagnose(SUBAGENT_NOTIFICATION_METHOD, parentId, new Error("sub-agent notification exceeds protocol bounds"));
-      return;
+      return false;
     }
     this.#queueTail(parent, () => this.#connection.extNotification(SUBAGENT_NOTIFICATION_METHOD, params));
+    return true;
   }
 
   #queueTail(record: SessionRecord | ChildRecord, task: () => Promise<void>): void {

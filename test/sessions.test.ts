@@ -19,6 +19,7 @@ interface SessionServices {
   extNotifications: { method: string; params: Record<string, unknown> }[];
   requestPermission: ReturnType<typeof vi.fn>;
   extensionRequest: ReturnType<typeof vi.fn>;
+  extNotification: ReturnType<typeof vi.fn>;
   sessionUpdate: ReturnType<typeof vi.fn>;
   invoke(name: string, ...args: unknown[]): unknown;
   invokeFirst(name: string, ...args: unknown[]): unknown;
@@ -184,13 +185,14 @@ function services(): SessionServices {
   const sessionUpdate = vi.fn(async (notification: SessionNotification) => {
     updates.push(notification);
   });
+  const extNotification = vi.fn(async (method: string, params: Record<string, unknown>) => {
+    extNotifications.push({ method, params });
+  });
   const connection = {
     sessionUpdate,
     requestPermission,
     extMethod: extensionRequest,
-    extNotification: vi.fn(async (method: string, params: Record<string, unknown>) => {
-      extNotifications.push({ method, params });
-    }),
+    extNotification,
   } as unknown as AgentSideConnection;
   const diagnostics: string[] = [];
   const bindings = createMemorySubagentBindingStore();
@@ -212,6 +214,7 @@ function services(): SessionServices {
     extNotifications,
     requestPermission,
     extensionRequest,
+    extNotification,
     sessionUpdate,
     invoke: (name, ...args) => listeners.get(name)?.at(-1)?.(...(args as never[])),
     invokeFirst: (name, ...args) => listeners.get(name)?.at(0)?.(...(args as never[])),
@@ -2696,6 +2699,73 @@ describe("sub-agent lifecycle", () => {
     await expect(state.bindings.load({ parentId: String(root.agent.id) })).resolves.toEqual(new Map([["call-1", "child-1"]]));
   });
 
+  it("delivers a child's started notification before its first transcript update", async () => {
+    const state = services();
+    const { root, child } = await rootWithChild(state, "child-ordered");
+    const call = {
+      callId: "call-ordered",
+      name: "subagent",
+      arguments: { description: "Ordered child", prompt: "p", run_in_background: false },
+    };
+    subagentCall(state, root, call);
+    await expect.poll(() => state.sessionUpdate.mock.calls.length).toBe(1);
+    const startDelivery = Promise.withResolvers<void>();
+    state.extNotification.mockImplementationOnce(async (method: string, params: Record<string, unknown>) => {
+      state.extNotifications.push({ method, params });
+      await startDelivery.promise;
+    });
+
+    await executeDelegation(state, root, call, () => {
+      state.invoke("subagent/start", { runId: "run-ordered", provider: "spawn", id: child.agent.id, local: true });
+      state.invoke("session/event", child.agent.session, {
+        type: "assistant/chunk",
+        data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "child text" } },
+      });
+    });
+    await expect.poll(() => state.extNotification.mock.calls.length).toBe(1);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(state.updates).toHaveLength(1);
+
+    startDelivery.resolve();
+    await expect.poll(() => state.updates.length).toBe(2);
+    expect(state.updates[1]!.sessionId).toBe("child-ordered");
+  });
+
+  it("makes root close drain pending child transcript output", async () => {
+    const state = services();
+    const { root, child } = await rootWithChild(state, "child-closing");
+    const call = {
+      callId: "call-closing",
+      name: "subagent",
+      arguments: { description: "Closing child", prompt: "p", run_in_background: false },
+    };
+    subagentCall(state, root, call);
+    await executeDelegation(state, root, call, () => {
+      state.invoke("subagent/start", { runId: "run-closing", provider: "spawn", id: child.agent.id, local: true });
+    });
+    await expect.poll(() => state.extNotifications.length).toBe(1);
+    const childOutput = Promise.withResolvers<void>();
+    state.sessionUpdate.mockImplementationOnce(async (notification: SessionNotification) => {
+      state.updates.push(notification);
+      await childOutput.promise;
+    });
+    state.invoke("session/event", child.agent.session, {
+      type: "assistant/chunk",
+      data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "pending" } },
+    });
+    await expect.poll(() => state.sessionUpdate.mock.calls.length).toBe(2);
+    let closeCompleted = false;
+    const closing = state.agent.closeSession({ sessionId: String(root.agent.id) }).then(() => {
+      closeCompleted = true;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(closeCompleted).toBe(false);
+
+    childOutput.resolve();
+    await closing;
+    expect(closeCompleted).toBe(true);
+  });
+
   it("derives the mode from run_in_background with the tool defaults", async () => {
     const state = services();
     const { root, child } = await rootWithChild(state, "child-bg");
@@ -2727,7 +2797,15 @@ describe("sub-agent lifecycle", () => {
       type: "assistant/chunk",
       data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "resumed text" } },
     });
+    state.invoke("subagent/end", {
+      runId: "run-2",
+      provider: "spawn",
+      id: child.agent.id,
+      local: true,
+      stopReason: "completed",
+    });
     await expect.poll(() => state.updates.length).toBe(1);
+    await new Promise<void>((resolve) => setImmediate(resolve));
 
     expect(state.extNotifications).toEqual([]);
     expect(state.updates[0]!.sessionId).toBe("child-resumed");
@@ -2869,18 +2947,46 @@ describe("sub-agent lifecycle follow-ups", () => {
     (child.agent.session.header as { parentSession?: SessionId }).parentSession = root.agent.id;
     const grandchild = await state.context.agents.create({ sessionId: SessionId("leaf"), meta: { cwd: "/project" } });
     (grandchild.agent.session.header as { parentSession?: SessionId }).parentSession = child.agent.id;
-    state.invoke("subagent/start", { runId: "r1", provider: "spawn", id: child.agent.id, local: true });
-    state.invoke("subagent/start", { runId: "r2", provider: "spawn", id: grandchild.agent.id, local: true });
+    await state.invoke(
+      "tools/execute",
+      {
+        callId: "call-mid",
+        name: "subagent",
+        arguments: { description: "Middle", prompt: "p" },
+        agent: root.agent,
+        signal: new AbortController().signal,
+      },
+      async () => {
+        state.invoke("subagent/start", { runId: "r1", provider: "spawn", id: child.agent.id, local: true });
+      },
+    );
+    await state.invoke(
+      "tools/execute",
+      {
+        callId: "call-leaf",
+        name: "subagent",
+        arguments: { description: "Leaf", prompt: "p" },
+        agent: child.agent,
+        signal: new AbortController().signal,
+      },
+      async () => {
+        state.invoke("subagent/start", { runId: "r2", provider: "spawn", id: grandchild.agent.id, local: true });
+      },
+    );
     state.invoke("subagent/end", { runId: "r1", provider: "spawn", id: child.agent.id, local: true, stopReason: "completed" });
 
     await expect(
       state.invokeFirst("agent/request", { agent: grandchild.agent, turn: 1, step: 1 }, async () => ({ provider: "x", model: "y" })),
     ).resolves.toEqual({ provider: "synthetic", model: "synthetic" });
     state.invoke("subagent/end", { runId: "r2", provider: "spawn", id: grandchild.agent.id, local: true, stopReason: "aborted" });
-    await expect.poll(() => state.extNotifications.length).toBe(2);
-    expect(state.extNotifications.map((item) => [item.params.kind, item.params.sessionId, item.params.childSessionId])).toEqual([
-      ["ended", String(root.agent.id), "mid"],
-      ["ended", "mid", "leaf"],
+    await expect.poll(() => state.extNotifications.length).toBe(4);
+    expect(
+      state.extNotifications
+        .filter((item) => item.params.kind === "ended")
+        .map((item) => [item.params.sessionId, item.params.childSessionId]),
+    ).toEqual([
+      [String(root.agent.id), "mid"],
+      ["mid", "leaf"],
     ]);
   });
 

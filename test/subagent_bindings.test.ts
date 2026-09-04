@@ -12,8 +12,9 @@ afterEach(async () => {
 
 describe("file sub-agent binding store", () => {
   it("persists bindings per parent under hashed names and reads them back", async () => {
-    const root = join(await mkdtemp(join(tmpdir(), "sesori-bindings-")), "bindings");
-    roots.push(root);
+    const temporaryRoot = await mkdtemp(join(tmpdir(), "sesori-bindings-"));
+    roots.push(temporaryRoot);
+    const root = join(temporaryRoot, "bindings");
     const store = createFileSubagentBindingStore({ root });
     await Promise.all([
       store.record({ parentId: "parent/one", toolCallId: "call-1", childSessionId: "child-1" }),
@@ -25,5 +26,17 @@ describe("file sub-agent binding store", () => {
     expect((await readdir(root)).every((name) => /^[0-9a-f]{64}\.json$/u.test(name))).toBe(true);
     await expect(store.load({ parentId: "parent/one" })).resolves.toEqual(new Map([["call-1", "child-1"], ["call-2", "child-2"]]));
     await expect(store.load({ parentId: "unknown" })).resolves.toEqual(new Map());
+  });
+
+  it("serializes a load behind a pending binding write", async () => {
+    const temporaryRoot = await mkdtemp(join(tmpdir(), "sesori-bindings-"));
+    roots.push(temporaryRoot);
+    const store = createFileSubagentBindingStore({ root: join(temporaryRoot, "bindings") });
+
+    const recording = store.record({ parentId: "parent", toolCallId: "call", childSessionId: "child" });
+    const loaded = store.load({ parentId: "parent" });
+
+    await expect(loaded).resolves.toEqual(new Map([["call", "child"]]));
+    await recording;
   });
 });

@@ -47,7 +47,7 @@ import {
 import { isAppendSurfaceEvent } from "@deepseek-ai/dsh-session/surface";
 import type { SessionInspection } from "@deepseek-ai/dsh-session-persistence";
 import { SessionTitleInvalidError } from "@deepseek-ai/dsh-session-title";
-import type { SubagentRunEndInfo, SubagentRunInfo } from "@deepseek-ai/dsh-subagent";
+import { SubagentError, type SubagentRunEndInfo, type SubagentRunInfo } from "@deepseek-ai/dsh-subagent";
 import type {} from "@deepseek-ai/dsh-tools";
 import { createInitializeResponse, INITIALIZE_METADATA_KEY } from "./protocol.js";
 import type { SubagentBindingStore } from "./subagent_bindings.js";
@@ -276,7 +276,7 @@ interface ChildRecord {
   readonly toolCalls: Map<string, ToolCallRecord>;
   readonly messageCreatedAt: Map<string, number>;
   outputTail: Promise<void>;
-  lifecycle: { readonly kind: "unannounced" } | { readonly kind: "announced" };
+  lifecycle: { readonly kind: "unannounced" } | { readonly kind: "announced"; readonly mode: SubagentMode };
   /** Settled, but retained because a registered descendant still resolves its lineage through it. */
   ended: boolean;
 }
@@ -1687,6 +1687,7 @@ export class DurableSessionAgent implements AcpAgent {
       return (await this.#catalog()) as unknown as Record<string, unknown>;
     }
     if (method === "deepseek/session/rename") return this.#rename(params);
+    if (method === "deepseek/subagent/interrupt") return this.#interruptSubagent(params);
     if (method !== "deepseek/session/history") throw RequestError.methodNotFound(method);
     const request = historyRequest(params);
     const sessionId = parseSessionId(request.sessionId);
@@ -1819,6 +1820,40 @@ export class DurableSessionAgent implements AcpAgent {
       if (cleanupFailure === undefined) transition.resolve();
       else transition.reject(cleanupFailure);
     }
+  }
+
+  /**
+   * Interrupt one continuable child on behalf of the user. One-shot children
+   * (foreground runs and fork jobs) are cancelled only through their parent
+   * tool call, so they report `not_cancellable`.
+   */
+  #interruptSubagent(params: Record<string, unknown>): Record<string, unknown> {
+    if (!validateProtocolValue({ definition: "subagentInterruptRequest", value: params }).valid) {
+      throw invalidParams("invalid DeepSeek sub-agent interrupt request");
+    }
+    const sessionId = parseSessionId(params.sessionId as string);
+    const childId = parseSessionId(params.childSessionId as string);
+    const child = this.#children.get(childId);
+    const respond = (args: {
+      result: "interrupted" | "not_cancellable" | "unknown_child";
+    }): Record<string, unknown> => ({ result: args.result });
+    if (this.#lineageRecord(sessionId) === undefined || child === undefined || child.ended || child.parentId !== sessionId) {
+      return respond({ result: "unknown_child" });
+    }
+    if (child.lifecycle.kind === "unannounced") return respond({ result: "unknown_child" });
+    if (child.lifecycle.mode !== "background") return respond({ result: "not_cancellable" });
+    const subagents = this.#context.get("subagents") as
+      | { interrupt(target: SessionId, authority: { kind: "user"; parentSessionId: SessionId }): void }
+      | undefined;
+    if (subagents === undefined) throw internalError("sub-agent runtime is unavailable");
+    try {
+      subagents.interrupt(childId, { kind: "user", parentSessionId: sessionId });
+    } catch (error) {
+      this.#diagnose("deepseek/subagent/interrupt", sessionId, error);
+      if (error instanceof SubagentError) throw invalidParams("sub-agent interrupt was not authorized");
+      throw internalError("unable to interrupt DeepSeek sub-agent");
+    }
+    return respond({ result: "interrupted" });
   }
 
   #renameResponse(title: string): Record<string, unknown> {
@@ -2115,7 +2150,7 @@ export class DurableSessionAgent implements AcpAgent {
       mode: scope.view.mode,
     });
     if (!announced) return;
-    record.lifecycle = { kind: "announced" };
+    record.lifecycle = { kind: "announced", mode: scope.view.mode };
     record.outputTail = parent.outputTail;
     void this.#bindings
       .record({ parentId: String(parentId), toolCallId: scope.callId, childSessionId: String(info.id) })

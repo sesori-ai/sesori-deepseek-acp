@@ -3427,3 +3427,52 @@ describe("sub-agent lifecycle second review", () => {
     expect(folds.at(-1)).toEqual({ label: "Foreground", mode: "foreground", childSessionId: "fg-child", ended: { stopReason: "aborted" } });
   });
 });
+
+describe("sub-agent interrupt", () => {
+  async function registered(args: { state: SessionServices; childId: string; background: boolean }) {
+    const created = await args.state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const root = args.state.live.get(created.sessionId)!;
+    const child = await args.state.context.agents.create({
+      sessionId: SessionId(args.childId),
+      meta: { cwd: "/project" },
+    });
+    (child.agent.session.header as { parentSession?: SessionId }).parentSession = root.agent.id;
+    await args.state.invoke(
+      "tools/execute",
+      {
+        callId: `call-${args.childId}`,
+        name: "subagent",
+        arguments: { description: "Child", prompt: "p", run_in_background: args.background },
+        agent: root.agent,
+        signal: new AbortController().signal,
+      },
+      async () => {
+        args.state.invoke("subagent/start", { runId: `run-${args.childId}`, provider: "spawn", id: child.agent.id, local: true });
+      },
+    );
+    return { root, child };
+  }
+
+  it("interrupts a continuable child with user authority scoped to its parent", async () => {
+    const state = services();
+    const interrupt = vi.fn();
+    state.contextServices.set("subagents", { interrupt });
+    const { root } = await registered({ state, childId: "child-cont", background: true });
+
+    await expect(state.agent.extMethod("deepseek/subagent/interrupt", { sessionId: String(root.agent.id), childSessionId: "child-cont" })).resolves.toEqual({ result: "interrupted" });
+    expect(interrupt).toHaveBeenCalledWith("child-cont", { kind: "user", parentSessionId: root.agent.id });
+  });
+
+  it("reports one-shot children as not cancellable and foreign children as unknown", async () => {
+    const state = services();
+    const interrupt = vi.fn();
+    state.contextServices.set("subagents", { interrupt });
+    const { root } = await registered({ state, childId: "child-once", background: false });
+
+    await expect(state.agent.extMethod("deepseek/subagent/interrupt", { sessionId: String(root.agent.id), childSessionId: "child-once" })).resolves.toEqual({ result: "not_cancellable" });
+    await expect(state.agent.extMethod("deepseek/subagent/interrupt", { sessionId: String(root.agent.id), childSessionId: "nobody" })).resolves.toEqual({ result: "unknown_child" });
+    await expect(state.agent.extMethod("deepseek/subagent/interrupt", { sessionId: "other-root", childSessionId: "child-once" })).resolves.toEqual({ result: "unknown_child" });
+    await expect(state.agent.extMethod("deepseek/subagent/interrupt", { sessionId: String(root.agent.id) })).rejects.toThrow("invalid DeepSeek sub-agent interrupt request");
+    expect(interrupt).not.toHaveBeenCalled();
+  });
+});

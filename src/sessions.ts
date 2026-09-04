@@ -954,7 +954,9 @@ function replaySubagentResult(args: {
   const bound = args.children?.bindings.get(args.callId);
   if (view.mode === "background") {
     const childSessionId = (args.call.name === "subagent" ? continuableChildId(args.content) : undefined) ?? bound;
-    if (childSessionId === undefined) return view;
+    if (childSessionId === undefined) {
+      return args.failed ? { ...view, ended: { stopReason: "error" } } : view;
+    }
     args.children?.continuable.set(childSessionId, { callId: args.callId, label: view.label });
     return { ...view, childSessionId };
   }
@@ -2076,6 +2078,7 @@ export class DurableSessionAgent implements AcpAgent {
     const parent = this.#lineageRecord(parentId);
     if (parent === undefined) return;
     const existing = this.#children.get(info.id);
+    const pendingOutput = existing?.agent === child ? existing.outputTail : undefined;
     const record: ChildRecord =
       existing?.agent === child
         ? existing
@@ -2091,7 +2094,11 @@ export class DurableSessionAgent implements AcpAgent {
     record.ended = false;
     record.lifecycle = { kind: "unannounced" };
     this.#children.set(info.id, record);
-    // The child's first updates must follow its `started` notification.
+    // A lazily adopted child can already have output in flight before its start hook arrives.
+    if (pendingOutput !== undefined) {
+      parent.outputTail = parent.outputTail.catch(() => undefined).then(() => pendingOutput.catch(() => undefined));
+    }
+    // Future child updates follow both any adopted output and the `started` notification.
     record.outputTail = parent.outputTail;
     if (scope === undefined || scope.agentId !== parentId) {
       // Every dsh start observed so far ran inside its delegation call; a start without one is a

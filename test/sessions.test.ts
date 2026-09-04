@@ -2734,6 +2734,52 @@ describe("sub-agent lifecycle", () => {
     expect(state.updates[1]!.sessionId).toBe("child-ordered");
   });
 
+  it("preserves pending adopted output when the child's start arrives later", async () => {
+    const state = services();
+    const { root, child } = await rootWithChild(state, "child-adopted-first");
+    const adoptedOutput = Promise.withResolvers<void>();
+    state.sessionUpdate.mockImplementationOnce(async (notification: SessionNotification) => {
+      state.updates.push(notification);
+      await adoptedOutput.promise;
+    });
+    state.invoke("session/event", child.agent.session, {
+      type: "assistant/chunk",
+      data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "early text" } },
+    });
+    await expect.poll(() => state.sessionUpdate.mock.calls.length).toBe(1);
+    const call = {
+      callId: "call-adopted-first",
+      name: "subagent",
+      arguments: { description: "Adopted child", prompt: "p", run_in_background: false },
+    };
+    await executeDelegation(state, root, call, () => {
+      state.invoke("subagent/start", { runId: "run-adopted-first", provider: "spawn", id: child.agent.id, local: true });
+    });
+    expect(state.extNotification).not.toHaveBeenCalled();
+    let closeCompleted = false;
+    const closing = state.agent.closeSession({ sessionId: String(root.agent.id) }).then(() => {
+      closeCompleted = true;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(closeCompleted).toBe(false);
+
+    adoptedOutput.resolve();
+    await closing;
+    expect(state.extNotifications).toEqual([
+      {
+        method: "deepseek/subagent",
+        params: {
+          kind: "started",
+          sessionId: String(root.agent.id),
+          childSessionId: "child-adopted-first",
+          toolCallId: "call-adopted-first",
+          label: "Adopted child",
+          mode: "foreground",
+        },
+      },
+    ]);
+  });
+
   it("reads an active child's history from its resident session", async () => {
     const state = services();
     const { root, child } = await rootWithChild(state, "child-history");
@@ -3194,6 +3240,75 @@ describe("sub-agent lifecycle follow-ups", () => {
       [String(root.agent.id), "mid"],
       ["mid", "leaf"],
     ]);
+  });
+
+  it("marks a failed background launch without a child id as ended", async () => {
+    const state = services();
+    const meta = header({ id: "failed-background", cwd: "/project", createdAt: 1 });
+    state.headers.push(meta);
+    state.inspections.set("failed-background", {
+      meta,
+      events: [
+        {
+          type: "user/message",
+          seq: 0,
+          time: 1,
+          surfaceOp: "append",
+          data: { id: "user", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "go" }] },
+        },
+        {
+          type: "tool/call",
+          seq: 1,
+          time: 2,
+          data: {
+            turn: 1,
+            step: 1,
+            callId: "call-failed",
+            name: "subagent",
+            arguments: JSON.stringify({ description: "Failed child", prompt: "p" }),
+          },
+        },
+        {
+          type: "tool/result",
+          seq: 2,
+          time: 3,
+          surfaceOp: "append",
+          sourceEventSeqs: [1],
+          data: {
+            turn: 1,
+            step: 1,
+            message: {
+              id: "failed-result",
+              role: "user",
+              source: { kind: "tool", callId: "call-failed" },
+              content: [
+                {
+                  type: "tool-result",
+                  toolCallId: "call-failed",
+                  isError: true,
+                  content: [{ type: "text", text: "unable to start subagent" }],
+                },
+              ],
+            },
+          },
+        },
+      ] as unknown as SessionEvent[],
+    });
+
+    const response = await state.agent.extMethod("deepseek/session/history", { sessionId: "failed-background" });
+    const folds = (response.updates as SessionNotification[])
+      .map((notification) =>
+        (notification._meta as { "sesori.ai/deepseek"?: { subagent?: unknown } } | undefined)?.[
+          "sesori.ai/deepseek"
+        ]?.subagent,
+      )
+      .filter((fold) => fold !== undefined);
+
+    expect(folds.at(-1)).toEqual({
+      label: "Failed child",
+      mode: "background",
+      ended: { stopReason: "error" },
+    });
   });
 
   it("folds a settlement whose delegation call sits on an earlier history page", async () => {

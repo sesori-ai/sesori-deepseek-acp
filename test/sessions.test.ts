@@ -2805,6 +2805,40 @@ describe("sub-agent lifecycle", () => {
     expect(closeCompleted).toBe(true);
   });
 
+  it("makes root close collect and drain active nested descendants", async () => {
+    const state = services();
+    const { root, child } = await rootWithChild(state, "child-nested-close");
+    state.invoke("subagent/start", { runId: "run-parent-close", provider: "spawn", id: child.agent.id, local: true });
+    const grandchild = await state.context.agents.create({
+      sessionId: SessionId("grandchild-nested-close"),
+      meta: { cwd: "/project" },
+    });
+    (grandchild.agent.session.header as { parentSession?: SessionId }).parentSession = child.agent.id;
+    state.invoke("subagent/start", { runId: "run-grandchild-close", provider: "spawn", id: grandchild.agent.id, local: true });
+    const nestedOutput = Promise.withResolvers<void>();
+    state.sessionUpdate.mockImplementationOnce(async (notification: SessionNotification) => {
+      state.updates.push(notification);
+      await nestedOutput.promise;
+    });
+    state.invoke("session/event", grandchild.agent.session, {
+      type: "assistant/chunk",
+      data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "pending" } },
+    });
+    await expect.poll(() => state.sessionUpdate.mock.calls.length).toBe(1);
+    let closeCompleted = false;
+    const closing = state.agent.closeSession({ sessionId: String(root.agent.id) }).then(() => {
+      closeCompleted = true;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(closeCompleted).toBe(false);
+
+    nestedOutput.resolve();
+    await closing;
+    await expect(
+      state.agent.extMethod("deepseek/session/history", { sessionId: "grandchild-nested-close" }),
+    ).rejects.toThrow("unknown session");
+  });
+
   it("preserves another root's children when its concurrent close fails", async () => {
     const state = services();
     const { root: successfulRoot, child: successfulChild } = await rootWithChild(state, "child-successful-close");

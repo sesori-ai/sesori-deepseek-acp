@@ -1990,12 +1990,10 @@ export class DurableSessionAgent implements AcpAgent {
   }
 
   async #releaseOrphanedChildren(args: { rootId: SessionId }): Promise<void> {
-    const orphaned: ChildRecord[] = [];
-    for (const [childId, child] of this.#children) {
-      if (!this.#descendsFromRoot({ childId, rootId: args.rootId })) continue;
-      this.#children.delete(childId);
-      orphaned.push(child);
-    }
+    const orphaned = [...this.#children.entries()].flatMap(([childId, child]) =>
+      this.#descendsFromRoot({ childId, rootId: args.rootId }) ? [child] : [],
+    );
+    for (const child of orphaned) this.#children.delete(child.agent.id);
     await Promise.allSettled(orphaned.map((child) => child.outputTail));
   }
 

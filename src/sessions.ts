@@ -112,11 +112,10 @@ function subagentPresentationPrompt(value: unknown): string | undefined {
   if (trimmed.length === 0) return undefined;
   const characters: string[] = [];
   for (const character of trimmed) {
-    if (characters.length === MAX_SUBAGENT_PROMPT_CHARACTERS) break;
     const codePoint = character.codePointAt(0);
     // String iteration preserves valid pairs but exposes an unpaired surrogate as its own non-scalar value.
     if (codePoint === undefined || (codePoint >= 0xd800 && codePoint <= 0xdfff)) return undefined;
-    characters.push(character);
+    if (characters.length < MAX_SUBAGENT_PROMPT_CHARACTERS) characters.push(character);
   }
   const prompt = characters.join("").trimEnd();
   return prompt.length === 0 ? undefined : prompt;

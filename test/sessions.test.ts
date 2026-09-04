@@ -2706,7 +2706,13 @@ describe("sub-agent lifecycle", () => {
 
   it("fails closed without leaking malformed, blank, or non-scalar delegation prompts", async () => {
     const sentinel = "SENTINEL_PRIVATE_SUBAGENT_PROMPT";
-    for (const [index, prompt] of [undefined, "   ", { private: sentinel }, "\ud800"].entries()) {
+    for (const [index, prompt] of [
+      undefined,
+      "   ",
+      { private: sentinel },
+      "\ud800",
+      `${"p".repeat(32_768)}\ud800`,
+    ].entries()) {
       const state = services();
       const { root, child } = await rootWithChild(state, `child-invalid-${index}`);
       await executeDelegation(

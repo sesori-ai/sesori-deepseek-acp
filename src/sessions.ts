@@ -1834,12 +1834,14 @@ export class DurableSessionAgent implements AcpAgent {
     const sessionId = parseSessionId(params.sessionId as string);
     const childId = parseSessionId(params.childSessionId as string);
     const child = this.#children.get(childId);
-    const respond = (result: "interrupted" | "not_cancellable" | "unknown_child"): Record<string, unknown> => ({ result });
+    const respond = (args: {
+      result: "interrupted" | "not_cancellable" | "unknown_child";
+    }): Record<string, unknown> => ({ result: args.result });
     if (this.#lineageRecord(sessionId) === undefined || child === undefined || child.ended || child.parentId !== sessionId) {
-      return respond("unknown_child");
+      return respond({ result: "unknown_child" });
     }
-    if (child.lifecycle.kind === "unannounced") return respond("unknown_child");
-    if (child.lifecycle.mode !== "background") return respond("not_cancellable");
+    if (child.lifecycle.kind === "unannounced") return respond({ result: "unknown_child" });
+    if (child.lifecycle.mode !== "background") return respond({ result: "not_cancellable" });
     const subagents = this.#context.get("subagents") as
       | { interrupt(target: SessionId, authority: { kind: "user"; parentSessionId: SessionId }): void }
       | undefined;
@@ -1851,7 +1853,7 @@ export class DurableSessionAgent implements AcpAgent {
       if (error instanceof SubagentError) throw invalidParams("sub-agent interrupt was not authorized");
       throw internalError("unable to interrupt DeepSeek sub-agent");
     }
-    return respond("interrupted");
+    return respond({ result: "interrupted" });
   }
 
   #renameResponse(title: string): Record<string, unknown> {

@@ -64,6 +64,9 @@ const MODEL_CONFIG_ID = "deepseek.model";
 const REASONING_CONFIG_ID = "deepseek.reasoning_effort";
 const SUBAGENT_NOTIFICATION_METHOD = "deepseek/subagent";
 const MAX_SUBAGENT_LABEL_LENGTH = 256;
+// This is the tile's presentation copy, not the prompt executed by dsh. A generous
+// 32,768-Unicode-character cap counts complete scalar values and bounds duplicated live/history payloads.
+const MAX_SUBAGENT_PROMPT_CHARACTERS = 32_768;
 const MAX_SUBAGENT_SUMMARY_LENGTH = 512;
 
 type SubagentMode = "foreground" | "background";
@@ -84,11 +87,13 @@ const SUBAGENT_STOP_REASONS: ReadonlySet<string> = new Set<SubagentStopReason>([
 
 interface SubagentCallView {
   label: string;
+  prompt: string;
   mode: SubagentMode;
 }
 
 interface SubagentReplayMeta {
   label: string;
+  prompt: string;
   mode: SubagentMode;
   childSessionId?: string;
   ended?: { stopReason: SubagentStopReason; summary?: string };
@@ -100,13 +105,32 @@ function boundedText(value: unknown, maxLength: number): string | undefined {
   return /\S/u.test(text) ? text : undefined;
 }
 
+/** Trim and bound the duplicated tile prompt by complete Unicode scalar values without changing dsh input. */
+function subagentPresentationPrompt(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return undefined;
+  const characters: string[] = [];
+  for (const character of trimmed) {
+    const codePoint = character.codePointAt(0);
+    // String iteration preserves valid pairs but exposes an unpaired surrogate as its own non-scalar value.
+    if (codePoint === undefined || (codePoint >= 0xd800 && codePoint <= 0xdfff)) return undefined;
+    if (characters.length < MAX_SUBAGENT_PROMPT_CHARACTERS) characters.push(character);
+  }
+  const prompt = characters.join("").trimEnd();
+  return prompt.length === 0 ? undefined : prompt;
+}
+
 function subagentCallView(name: string, args: unknown): SubagentCallView | undefined {
   const defaultMode = SUBAGENT_TOOL_DEFAULT_MODES.get(name);
   if (defaultMode === undefined) return undefined;
   const record = typeof args === "object" && args !== null ? (args as Record<string, unknown>) : {};
+  const prompt = subagentPresentationPrompt(record.prompt);
+  if (prompt === undefined) return undefined;
   const background = record.run_in_background;
   return {
     label: boundedText(record.description, MAX_SUBAGENT_LABEL_LENGTH) ?? name,
+    prompt,
     mode: typeof background === "boolean" ? (background ? "background" : "foreground") : defaultMode,
   };
 }
@@ -152,7 +176,7 @@ interface ReplayChildren {
   /** Durable `toolCallId -> childSessionId` bindings recorded at each live `subagent/start`. */
   bindings: ReadonlyMap<string, string>;
   /** Continuable child id to the parent call that started it, for the later settlement notice. */
-  continuable: Map<string, { callId: string; label: string }>;
+  continuable: Map<string, { callId: string; label: string; prompt: string }>;
 }
 
 interface CatalogModel {
@@ -693,6 +717,7 @@ async function projectSessionEvent(args: EventProjection, event: SessionEvent): 
         eventTime(event),
         {
           label: started.label,
+          prompt: started.prompt,
           mode: "background",
           childSessionId,
           ended: { stopReason: settledStopReason(typeof source.summary === "string" ? source.summary : "") },
@@ -957,7 +982,11 @@ function replaySubagentResult(args: {
     if (childSessionId === undefined) {
       return args.failed ? { ...view, ended: { stopReason: "error" } } : view;
     }
-    args.children?.continuable.set(childSessionId, { callId: args.callId, label: view.label });
+    args.children?.continuable.set(childSessionId, {
+      callId: args.callId,
+      label: view.label,
+      prompt: view.prompt,
+    });
     return { ...view, childSessionId };
   }
   const ended = { stopReason: args.failed ? foregroundStopReason(args.content) : ("completed" as const) };
@@ -1001,7 +1030,7 @@ function priorContinuable(events: readonly SessionEvent[]): ReplayChildren["cont
       const view = call === undefined ? undefined : replaySubagentCall(call.name, call.arguments);
       const childSessionId = view?.mode === "background" ? continuableChildId(result.content) : undefined;
       if (view !== undefined && childSessionId !== undefined) {
-        continuable.set(childSessionId, { callId, label: view.label });
+        continuable.set(childSessionId, { callId, label: view.label, prompt: view.prompt });
       }
     } else if (event.type === "user/message" && isAppendSurfaceEvent(event)) {
       const source = event.data.source as { kind: string; senderSessionId?: unknown };
@@ -2147,6 +2176,7 @@ export class DurableSessionAgent implements AcpAgent {
       childSessionId: String(info.id),
       toolCallId: scope.callId,
       label: scope.view.label,
+      prompt: scope.view.prompt,
       mode: scope.view.mode,
     });
     if (!announced) return;

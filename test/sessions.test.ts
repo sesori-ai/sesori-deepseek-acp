@@ -2665,7 +2665,8 @@ describe("sub-agent lifecycle", () => {
   it("correlates a foreground child to its executing call, streams its transcript, and ends it in order", async () => {
     const state = services();
     const { root, child } = await rootWithChild(state, "child-1");
-    const call = { callId: "call-1", name: "subagent", arguments: { description: "Probe child", prompt: "secret", run_in_background: false } };
+    const prompt = "SENTINEL_CHILD_PROMPT";
+    const call = { callId: "call-1", name: "subagent", arguments: { description: "Probe child", prompt, run_in_background: false } };
     subagentCall(state, root, call);
     await executeDelegation(state, root, call, () => {
       state.invoke("subagent/start", { runId: "run-1", provider: "spawn", id: child.agent.id, local: true });
@@ -2687,7 +2688,7 @@ describe("sub-agent lifecycle", () => {
     expect(state.extNotifications).toEqual([
       {
         method: "deepseek/subagent",
-        params: { kind: "started", sessionId: String(root.agent.id), childSessionId: "child-1", toolCallId: "call-1", label: "Probe child", mode: "foreground" },
+        params: { kind: "started", sessionId: String(root.agent.id), childSessionId: "child-1", toolCallId: "call-1", label: "Probe child", prompt, mode: "foreground" },
       },
       {
         method: "deepseek/subagent",
@@ -2698,8 +2699,169 @@ describe("sub-agent lifecycle", () => {
       [String(root.agent.id), "tool_call"],
       ["child-1", "agent_message_chunk"],
     ]);
-    expect(JSON.stringify(state.extNotifications)).not.toContain("secret");
+    expect(JSON.stringify(state.extNotifications)).toContain(prompt);
+    expect(state.diagnostics.join("\n")).not.toContain(prompt);
     await expect(state.bindings.load({ parentId: String(root.agent.id) })).resolves.toEqual(new Map([["call-1", "child-1"]]));
+  });
+
+  it("fails closed without leaking malformed, blank, or non-scalar delegation prompts", async () => {
+    const sentinel = "SENTINEL_PRIVATE_SUBAGENT_PROMPT";
+    for (const [index, prompt] of [
+      undefined,
+      "   ",
+      { private: sentinel },
+      "\ud800",
+      `${"p".repeat(32_768)}\ud800`,
+    ].entries()) {
+      const state = services();
+      const { root, child } = await rootWithChild(state, `child-invalid-${index}`);
+      await executeDelegation(
+        state,
+        root,
+        {
+          callId: `call-invalid-${index}`,
+          name: "subagent",
+          arguments: { description: "Invalid child", ...(prompt === undefined ? {} : { prompt }) },
+        },
+        () => {
+          state.invoke("subagent/start", {
+            runId: `run-invalid-${index}`,
+            provider: "spawn",
+            id: child.agent.id,
+            local: true,
+          });
+        },
+      );
+
+      expect(state.extNotifications).toEqual([]);
+      expect(state.diagnostics.join("\n")).toContain("sub-agent start without an executing delegation call");
+      expect(state.diagnostics.join("\n")).not.toContain(sentinel);
+    }
+  });
+
+  it("truncates the live tile prompt on complete Unicode scalar boundaries", async () => {
+    const state = services();
+    const { root, child } = await rootWithChild(state, "child-long-prompt");
+    const prompt = `  ${"p".repeat(32_767)}😀suffix  `;
+    await executeDelegation(
+      state,
+      root,
+      { callId: "call-long-prompt", name: "subagent", arguments: { description: "Long prompt", prompt } },
+      () => {
+        state.invoke("subagent/start", {
+          runId: "run-long-prompt",
+          provider: "spawn",
+          id: child.agent.id,
+          local: true,
+        });
+      },
+    );
+
+    const projectedPrompt = state.extNotifications[0]?.params.prompt;
+    if (typeof projectedPrompt !== "string") throw new Error("expected a projected sub-agent prompt");
+    expect(projectedPrompt).toBe(`${"p".repeat(32_767)}😀`);
+    expect([...projectedPrompt]).toHaveLength(32_768);
+    expect(/[\uD800-\uDFFF]/u.test(projectedPrompt)).toBe(false);
+    expect(projectedPrompt).not.toMatch(/\s$/u);
+  });
+
+  it("removes trailing whitespace exposed by the prompt truncation boundary", async () => {
+    const state = services();
+    const { root, child } = await rootWithChild(state, "child-boundary-whitespace");
+    const visible = `${"p".repeat(32_766)}😀`;
+    await executeDelegation(
+      state,
+      root,
+      {
+        callId: "call-boundary-whitespace",
+        name: "subagent",
+        arguments: { description: "Boundary whitespace", prompt: `${visible} \t suffix` },
+      },
+      () => {
+        state.invoke("subagent/start", {
+          runId: "run-boundary-whitespace",
+          provider: "spawn",
+          id: child.agent.id,
+          local: true,
+        });
+      },
+    );
+
+    const projectedPrompt = state.extNotifications[0]?.params.prompt;
+    expect(projectedPrompt).toBe(visible);
+    expect(typeof projectedPrompt === "string" && !/\s$/u.test(projectedPrompt)).toBe(true);
+  });
+
+  it("normalizes outer prompt whitespace identically for live and replay", async () => {
+    const rawPrompt = " \n  delegated 😀 prompt \t ";
+    const expectedPrompt = "delegated 😀 prompt";
+    const live = services();
+    const { root, child } = await rootWithChild(live, "child-normalized-prompt");
+    await executeDelegation(
+      live,
+      root,
+      {
+        callId: "call-normalized-prompt",
+        name: "subagent",
+        arguments: { description: "Normalized prompt", prompt: rawPrompt },
+      },
+      () => {
+        live.invoke("subagent/start", {
+          runId: "run-normalized-prompt",
+          provider: "spawn",
+          id: child.agent.id,
+          local: true,
+        });
+      },
+    );
+
+    const replay = services();
+    const meta = header({ id: "normalized-replay", cwd: "/project", createdAt: 1 });
+    replay.headers.push(meta);
+    replay.inspections.set("normalized-replay", {
+      meta,
+      events: [
+        {
+          type: "user/message",
+          seq: 0,
+          time: 0,
+          surfaceOp: "append",
+          data: {
+            id: "normalized-user",
+            role: "user",
+            source: { kind: "user" },
+            content: [{ type: "text", text: "delegate" }],
+          },
+        },
+        {
+          type: "tool/call",
+          seq: 1,
+          time: 1,
+          data: {
+            turn: 1,
+            step: 1,
+            callId: "call-normalized-prompt",
+            name: "subagent",
+            arguments: JSON.stringify({ description: "Normalized prompt", prompt: rawPrompt }),
+          },
+        },
+      ] as unknown as SessionEvent[],
+    });
+    const response = await replay.agent.extMethod("deepseek/session/history", { sessionId: "normalized-replay" });
+    const replayPrompt = (response.updates as SessionNotification[])
+      .map(
+        (notification) =>
+          (notification._meta as
+            | { "sesori.ai/deepseek"?: { subagent?: { prompt?: unknown } } }
+            | undefined)?.["sesori.ai/deepseek"]?.subagent?.prompt,
+      )
+      .find((prompt) => prompt !== undefined);
+    const livePrompt = live.extNotifications[0]?.params.prompt;
+
+    expect([livePrompt, replayPrompt]).toEqual([expectedPrompt, expectedPrompt]);
+    for (const prompt of [livePrompt, replayPrompt]) {
+      expect(typeof prompt === "string" && !/[\uD800-\uDFFF]/u.test(prompt) && !/\s$/u.test(prompt)).toBe(true);
+    }
   });
 
   it("delivers a child's started notification before its first transcript update", async () => {
@@ -2774,6 +2936,7 @@ describe("sub-agent lifecycle", () => {
           childSessionId: "child-adopted-first",
           toolCallId: "call-adopted-first",
           label: "Adopted child",
+          prompt: "p",
           mode: "foreground",
         },
       },
@@ -2980,8 +3143,8 @@ describe("sub-agent lifecycle", () => {
     await expect.poll(() => state.extNotifications.length).toBe(2);
 
     expect(state.extNotifications.map((item) => item.params)).toEqual([
-      expect.objectContaining({ kind: "started", childSessionId: "child-bg", toolCallId: "call-bg", mode: "background" }),
-      expect.objectContaining({ kind: "started", childSessionId: "child-fork", toolCallId: "call-fork", mode: "foreground" }),
+      expect.objectContaining({ kind: "started", childSessionId: "child-bg", toolCallId: "call-bg", prompt: "p", mode: "background" }),
+      expect.objectContaining({ kind: "started", childSessionId: "child-fork", toolCallId: "call-fork", prompt: "p", mode: "foreground" }),
     ]);
   });
 
@@ -3130,14 +3293,14 @@ describe("sub-agent lifecycle", () => {
           type: "tool/call",
           seq: 1,
           time: 10,
-          data: { turn: 1, step: 1, callId: "call-bg", name: "subagent", arguments: JSON.stringify({ description: "Background child", prompt: "secret" }) },
+          data: { turn: 1, step: 1, callId: "call-bg", name: "subagent", arguments: JSON.stringify({ description: "Background child", prompt: "background prompt" }) },
         },
         toolResult({ seq: 2, time: 12, callId: "call-bg", text: "started subagent bg-child" }),
         {
           type: "tool/call",
           seq: 3,
           time: 100,
-          data: { turn: 1, step: 1, callId: "call-fork", name: "subagent_fork", arguments: "{not json" },
+          data: { turn: 1, step: 1, callId: "call-fork", name: "subagent_fork", arguments: JSON.stringify({ description: "Fork child", prompt: "fork prompt" }) },
         },
         toolResult({ seq: 4, time: 200, callId: "call-fork", text: "OK" }),
         {
@@ -3154,7 +3317,7 @@ describe("sub-agent lifecycle", () => {
               summary: "Background subagent bg-child was stopped before it finished.",
               senderSessionId: "bg-child",
             },
-            content: [{ type: "text", text: "secret closing message" }],
+            content: [{ type: "text", text: "SENTINEL_SETTLEMENT_CONTENT" }],
           },
         },
       ] as unknown as SessionEvent[],
@@ -3163,14 +3326,14 @@ describe("sub-agent lifecycle", () => {
     const response = await state.agent.extMethod("deepseek/session/history", { sessionId: "parent" });
     const subagentMeta = (notification: SessionNotification) =>
       (notification._meta as { "sesori.ai/deepseek": { subagent?: unknown } })["sesori.ai/deepseek"].subagent;
-    expect(JSON.stringify(response)).not.toContain("secret");
+    expect(JSON.stringify(response)).not.toContain("SENTINEL_SETTLEMENT_CONTENT");
     expect((response.updates as SessionNotification[]).map((notification) => [notification.update.sessionUpdate, subagentMeta(notification)])).toEqual([
       ["user_message_chunk", undefined],
-      ["tool_call", { label: "Background child", mode: "background" }],
-      ["tool_call_update", { label: "Background child", mode: "background", childSessionId: "bg-child" }],
-      ["tool_call", { label: "subagent_fork", mode: "foreground" }],
-      ["tool_call_update", { label: "subagent_fork", mode: "foreground", childSessionId: "fork-child", ended: { stopReason: "completed" } }],
-      ["tool_call_update", { label: "Background child", mode: "background", childSessionId: "bg-child", ended: { stopReason: "aborted" } }],
+      ["tool_call", { label: "Background child", prompt: "background prompt", mode: "background" }],
+      ["tool_call_update", { label: "Background child", prompt: "background prompt", mode: "background", childSessionId: "bg-child" }],
+      ["tool_call", { label: "Fork child", prompt: "fork prompt", mode: "foreground" }],
+      ["tool_call_update", { label: "Fork child", prompt: "fork prompt", mode: "foreground", childSessionId: "fork-child", ended: { stopReason: "completed" } }],
+      ["tool_call_update", { label: "Background child", prompt: "background prompt", mode: "background", childSessionId: "bg-child", ended: { stopReason: "aborted" } }],
     ]);
   });
 });
@@ -3306,9 +3469,73 @@ describe("sub-agent lifecycle follow-ups", () => {
 
     expect(folds.at(-1)).toEqual({
       label: "Failed child",
+      prompt: "p",
       mode: "background",
       ended: { stopReason: "error" },
     });
+  });
+
+  it("leaves malformed replay prompts as generic tools without leaking their values", async () => {
+    const state = services();
+    const meta = header({ id: "invalid-prompts", cwd: "/project", createdAt: 1 });
+    const sentinel = "SENTINEL_PRIVATE_REPLAY_PROMPT";
+    state.headers.push(meta);
+    const call = (seq: number, callId: string, prompt: unknown, includePrompt = true) => ({
+      type: "tool/call",
+      seq,
+      time: seq,
+      data: {
+        turn: 1,
+        step: 1,
+        callId,
+        name: "subagent",
+        arguments: JSON.stringify({ description: "Invalid prompt", ...(includePrompt ? { prompt } : {}) }),
+      },
+    });
+    const result = (seq: number, callId: string) => ({
+      type: "tool/result",
+      seq,
+      time: seq,
+      surfaceOp: "append",
+      sourceEventSeqs: [seq - 1],
+      data: {
+        turn: 1,
+        step: 1,
+        message: {
+          id: `result-${callId}`,
+          role: "user",
+          source: { kind: "tool", callId },
+          content: [{ type: "tool-result", toolCallId: callId, content: [{ type: "text", text: "failed" }] }],
+        },
+      },
+    });
+    state.inspections.set("invalid-prompts", {
+      meta,
+      events: [
+        call(1, "missing", undefined, false),
+        result(2, "missing"),
+        call(3, "blank", "   "),
+        result(4, "blank"),
+        call(5, "malformed", { private: sentinel }),
+        result(6, "malformed"),
+        call(7, "non-scalar", "\ud800"),
+        result(8, "non-scalar"),
+      ] as unknown as SessionEvent[],
+    });
+
+    const response = await state.agent.extMethod("deepseek/session/history", { sessionId: "invalid-prompts" });
+    const folds = (response.updates as SessionNotification[])
+      .map(
+        (notification) =>
+          (notification._meta as { "sesori.ai/deepseek"?: { subagent?: unknown } } | undefined)?.[
+            "sesori.ai/deepseek"
+          ]?.subagent,
+      )
+      .filter((fold) => fold !== undefined);
+
+    expect(folds).toEqual([]);
+    expect(JSON.stringify(response)).not.toContain(sentinel);
+    expect(state.diagnostics.join("\n")).not.toContain(sentinel);
   });
 
   it("folds a settlement whose delegation call sits on an earlier history page", async () => {
@@ -3350,7 +3577,7 @@ describe("sub-agent lifecycle follow-ups", () => {
     expect(response.hasMore).toBe(true);
     expect((response.updates as SessionNotification[]).map((notification) => [notification.update.sessionUpdate, (notification._meta as { "sesori.ai/deepseek"?: { subagent?: unknown } } | undefined)?.["sesori.ai/deepseek"]?.subagent])).toEqual([
       ["user_message_chunk", undefined],
-      ["tool_call_update", { label: "Paged child", mode: "background", childSessionId: "paged-child", ended: { stopReason: "completed" } }],
+      ["tool_call_update", { label: "Paged child", prompt: "p", mode: "background", childSessionId: "paged-child", ended: { stopReason: "completed" } }],
     ]);
   });
 });
@@ -3424,7 +3651,7 @@ describe("sub-agent lifecycle second review", () => {
     const response = await state.agent.extMethod("deepseek/session/history", { sessionId: "mixed" });
     const folds = (response.updates as SessionNotification[]).map((notification) => (notification._meta as { "sesori.ai/deepseek"?: { subagent?: unknown } } | undefined)?.["sesori.ai/deepseek"]?.subagent).filter((fold) => fold !== undefined);
     expect(JSON.stringify(response)).not.toContain("secret");
-    expect(folds.at(-1)).toEqual({ label: "Foreground", mode: "foreground", childSessionId: "fg-child", ended: { stopReason: "aborted" } });
+    expect(folds.at(-1)).toEqual({ label: "Foreground", prompt: "p", mode: "foreground", childSessionId: "fg-child", ended: { stopReason: "aborted" } });
   });
 });
 

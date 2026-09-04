@@ -244,6 +244,7 @@
       "childSessionId": "child-1",
       "toolCallId": "call-1",
       "label": "Probe child",
+      "prompt": "Synthetic prompt for child-1",
       "mode": "foreground"
     }
   },
@@ -255,6 +256,7 @@
       "childSessionId": "child-2",
       "toolCallId": "call-2",
       "label": "Probe child",
+      "prompt": "Synthetic prompt for child-2",
       "mode": "background"
     }
   },
@@ -292,6 +294,7 @@
               "messageCreatedAt": 1,
               "subagent": {
                 "label": "Probe child",
+                "prompt": "Synthetic child prompt",
                 "mode": "background",
                 "childSessionId": "child-1",
                 "ended": {

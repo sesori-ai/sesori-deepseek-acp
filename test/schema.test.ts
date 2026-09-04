@@ -35,6 +35,52 @@ describe("DeepSeek extension schema", () => {
     ).toBe(true);
   });
 
+  it("bounds live and replayed prompts to 32,768 Unicode scalar values", () => {
+    const maxPrompt = "😀".repeat(32_768);
+    const started = {
+      kind: "started",
+      sessionId: "session-1",
+      childSessionId: "child-1",
+      toolCallId: "call-1",
+      label: "Probe child",
+      prompt: maxPrompt,
+      mode: "foreground",
+    };
+    const replay = {
+      label: "Probe child",
+      prompt: maxPrompt,
+      mode: "background",
+    };
+
+    const history = (subagent: Record<string, unknown>) => ({
+      updates: [
+        {
+          sessionId: "session-1",
+          update: { sessionUpdate: "tool_call", toolCallId: "call-1" },
+          _meta: { "sesori.ai/deepseek": { subagent } },
+        },
+      ],
+      hasMore: false,
+    });
+
+    expect(validateProtocolValue({ definition: "subagentNotification", value: started }).valid).toBe(true);
+    expect(validateProtocolValue({ definition: "historyResponse", value: history(replay) }).valid).toBe(true);
+    for (const prompt of [undefined, "   ", "😀".repeat(32_769), "\ud800"]) {
+      expect(
+        validateProtocolValue({
+          definition: "subagentNotification",
+          value: { ...started, prompt },
+        }).valid,
+      ).toBe(false);
+      expect(
+        validateProtocolValue({
+          definition: "historyResponse",
+          value: history({ ...replay, prompt }),
+        }).valid,
+      ).toBe(false);
+    }
+  });
+
   it("rejects unknown status variants", () => {
     expect(
       validateProtocolValue({

@@ -670,6 +670,18 @@
         "refusal"
       ]
     },
+    "subagentPrompt": {
+      "description": "Trimmed tile presentation prompt, bounded to 32768 Unicode scalar values.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 32768,
+      "pattern": "\\S",
+      "allOf": [
+        {
+          "pattern": "^[^\\uD800-\\uDFFF]*$"
+        }
+      ]
+    },
     "subagentSummary": {
       "type": "string",
       "minLength": 1,
@@ -684,6 +696,7 @@
         "childSessionId",
         "toolCallId",
         "label",
+        "prompt",
         "mode"
       ],
       "properties": {
@@ -701,6 +714,9 @@
         },
         "label": {
           "$ref": "#/$defs/nonblank"
+        },
+        "prompt": {
+          "$ref": "#/$defs/subagentPrompt"
         },
         "mode": {
           "$ref": "#/$defs/subagentMode"
@@ -749,11 +765,15 @@
       "type": "object",
       "required": [
         "label",
+        "prompt",
         "mode"
       ],
       "properties": {
         "label": {
           "$ref": "#/$defs/nonblank"
+        },
+        "prompt": {
+          "$ref": "#/$defs/subagentPrompt"
         },
         "mode": {
           "$ref": "#/$defs/subagentMode"

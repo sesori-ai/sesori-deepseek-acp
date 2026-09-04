@@ -2731,6 +2731,45 @@ describe("sub-agent lifecycle", () => {
     expect(state.updates[1]!.sessionId).toBe("child-ordered");
   });
 
+  it("reads an active child's history from its resident session", async () => {
+    const state = services();
+    const { root, child } = await rootWithChild(state, "child-history");
+    const call = {
+      callId: "call-history",
+      name: "subagent",
+      arguments: { description: "History child", prompt: "p", run_in_background: false },
+    };
+    subagentCall(state, root, call);
+    await executeDelegation(state, root, call, () => {
+      state.invoke("subagent/start", { runId: "run-history", provider: "spawn", id: child.agent.id, local: true });
+    });
+    const residentEvent = {
+      type: "assistant/message",
+      seq: 0,
+      time: 10,
+      surfaceOp: "append",
+      data: {
+        turn: 1,
+        step: 1,
+        message: {
+          id: "child-answer",
+          role: "assistant",
+          source: { kind: "model", provider: "synthetic", model: "synthetic" },
+          content: [{ type: "text", text: "resident child text" }],
+        },
+      },
+    } as unknown as SessionEvent;
+    (child.agent.session.events as SessionEvent[]).push(residentEvent);
+    state.invoke("session/event", child.agent.session, residentEvent);
+
+    const response = await state.agent.extMethod("deepseek/session/history", { sessionId: "child-history" });
+
+    expect((response.updates as SessionNotification[]).map((notification) => notification.update.sessionUpdate)).toEqual([
+      "agent_message_chunk",
+    ]);
+    expect(JSON.stringify(response)).toContain("resident child text");
+  });
+
   it("makes root close drain pending child transcript output", async () => {
     const state = services();
     const { root, child } = await rootWithChild(state, "child-closing");
@@ -2939,7 +2978,7 @@ describe("sub-agent lifecycle", () => {
 });
 
 describe("sub-agent lifecycle follow-ups", () => {
-  it("retains a settled child while its background grandchild still resolves lineage through it", async () => {
+  it("retains a settled child and drains its nested lifecycle tail", async () => {
     const state = services();
     const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
     const root = state.live.get(created.sessionId)!;
@@ -2978,8 +3017,23 @@ describe("sub-agent lifecycle follow-ups", () => {
     await expect(
       state.invokeFirst("agent/request", { agent: grandchild.agent, turn: 1, step: 1 }, async () => ({ provider: "x", model: "y" })),
     ).resolves.toEqual({ provider: "synthetic", model: "synthetic" });
+    await expect.poll(() => state.extNotifications.length).toBe(3);
+    const nestedEndDelivery = Promise.withResolvers<void>();
+    state.extNotification.mockImplementationOnce(async (method: string, params: Record<string, unknown>) => {
+      state.extNotifications.push({ method, params });
+      await nestedEndDelivery.promise;
+    });
     state.invoke("subagent/end", { runId: "r2", provider: "spawn", id: grandchild.agent.id, local: true, stopReason: "aborted" });
-    await expect.poll(() => state.extNotifications.length).toBe(4);
+    await expect.poll(() => state.extNotification.mock.calls.length).toBe(4);
+    let closeCompleted = false;
+    const closing = state.agent.closeSession({ sessionId: String(root.agent.id) }).then(() => {
+      closeCompleted = true;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(closeCompleted).toBe(false);
+
+    nestedEndDelivery.resolve();
+    await closing;
     expect(
       state.extNotifications
         .filter((item) => item.params.kind === "ended")

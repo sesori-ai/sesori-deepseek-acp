@@ -1153,8 +1153,9 @@ export class DurableSessionAgent implements AcpAgent {
     this.#hooks.push(this.#context.on("approval/request", (request: ApprovalRequest, next: () => Promise<ApprovalOutcome>) => {
       const record = this.#interactiveRecord(request.agent);
       if (record === undefined || request.callId === undefined) return next();
-      return withAbort(
-        record.outputTail.then(() => {
+      const permission = this.#queueInteraction({
+        record,
+        task: () => {
           request.signal?.throwIfAborted();
           return this.#connection.requestPermission({
             sessionId: String(request.agent.id),
@@ -1164,9 +1165,9 @@ export class DurableSessionAgent implements AcpAgent {
               { optionId: "reject-once", name: "Reject", kind: "reject_once" },
             ],
           });
-        }),
-        request.signal,
-      )
+        },
+      });
+      return withAbort(permission, request.signal)
         .then(({ outcome }) =>
           outcome.outcome === "cancelled"
             ? "cancelled"
@@ -1973,11 +1974,19 @@ export class DurableSessionAgent implements AcpAgent {
     if (current === undefined || !current.ended) return;
     const descendant = [...this.#children.values()].some((child) => child.parentId === current.agent.id);
     if (descendant) return;
-    const tail = current.outputTail;
+    let persisted = false;
+    const persistenceTail = current.outputTail.catch(() => undefined).then(async () => {
+      try {
+        persisted = await this.#flush(current.agent.session);
+      } catch (error) {
+        this.#diagnose("child session flush", current.agent.id, error);
+      }
+    });
+    current.outputTail = persistenceTail;
     const release = (): void => {
       const retained = this.#children.get(id);
-      if (retained !== current || !retained.ended) return;
-      if (retained.outputTail !== tail) {
+      if (retained !== current || !retained.ended || !persisted) return;
+      if (retained.outputTail !== persistenceTail) {
         this.#releaseSettled(id);
         return;
       }
@@ -1986,7 +1995,7 @@ export class DurableSessionAgent implements AcpAgent {
       this.#children.delete(id);
       this.#releaseSettled(retained.parentId);
     };
-    void tail.then(release, release);
+    void persistenceTail.then(release, release);
   }
 
   async #releaseOrphanedChildren(args: { rootId: SessionId }): Promise<void> {
@@ -2154,6 +2163,15 @@ export class DurableSessionAgent implements AcpAgent {
     });
   }
 
+  #queueInteraction<T>(args: { record: SessionRecord | ChildRecord; task: () => Promise<T> }): Promise<T> {
+    const result = args.record.outputTail.catch(() => undefined).then(args.task);
+    args.record.outputTail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
   #projectChildEvent(record: ChildRecord, event: SessionEvent): void {
     const sessionId = String(record.agent.id);
     this.#queueTail(record, () =>
@@ -2301,10 +2319,16 @@ export class DurableSessionAgent implements AcpAgent {
       throw new Error("invalid DeepSeek question request");
     }
     request.signal?.throwIfAborted();
-    const response = await withAbort(record.outputTail.then(() => {
-      request.signal?.throwIfAborted();
-      return this.#connection.extMethod("deepseek/ask_user_question", params);
-    }), request.signal);
+    const response = await withAbort(
+      this.#queueInteraction({
+        record,
+        task: () => {
+          request.signal?.throwIfAborted();
+          return this.#connection.extMethod("deepseek/ask_user_question", params);
+        },
+      }),
+      request.signal,
+    );
     if (!validateProtocolValue({ definition: "askUserQuestionResponse", value: response }).valid) {
       throw new Error("invalid DeepSeek question response");
     }

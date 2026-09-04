@@ -14,6 +14,7 @@ interface SessionServices {
   live: Map<string, AgentHandle>;
   create: ReturnType<typeof vi.fn>;
   resume: ReturnType<typeof vi.fn>;
+  flush: ReturnType<typeof vi.fn>;
   updates: SessionNotification[];
   diagnostics: string[];
   extNotifications: { method: string; params: Record<string, unknown> }[];
@@ -129,6 +130,7 @@ function services(): SessionServices {
     if (inspection === undefined) throw new Error("not found");
     return makeHandle(inspection.meta, inspection.events, options.setup);
   });
+  const flush = vi.fn(async () => true);
   context = {
     on: (name: string, listener: (...args: never[]) => unknown) => {
       listeners.set(name, [...(listeners.get(name) ?? []), listener]);
@@ -139,7 +141,7 @@ function services(): SessionServices {
       resume,
       get: (id: string) => live.get(id)?.agent,
     },
-    sessions: { flush: vi.fn(async () => true) },
+    sessions: { flush },
     llm: {
       listProviders: () => [],
       listModels: async () => [],
@@ -209,6 +211,7 @@ function services(): SessionServices {
     live,
     create,
     resume,
+    flush,
     updates,
     diagnostics,
     extNotifications,
@@ -2770,6 +2773,46 @@ describe("sub-agent lifecycle", () => {
     expect(JSON.stringify(response)).toContain("resident child text");
   });
 
+  it("retains settled child history until its session flush completes", async () => {
+    const state = services();
+    const { child } = await rootWithChild(state, "child-flushing");
+    state.invoke("subagent/start", { runId: "run-flushing", provider: "spawn", id: child.agent.id, local: true });
+    const residentEvent = {
+      type: "assistant/message",
+      seq: 0,
+      time: 10,
+      surfaceOp: "append",
+      data: {
+        turn: 1,
+        step: 1,
+        message: {
+          id: "flushing-answer",
+          role: "assistant",
+          source: { kind: "model", provider: "synthetic", model: "synthetic" },
+          content: [{ type: "text", text: "not persisted yet" }],
+        },
+      },
+    } as unknown as SessionEvent;
+    (child.agent.session.events as SessionEvent[]).push(residentEvent);
+    state.invoke("session/event", child.agent.session, residentEvent);
+    const flushed = Promise.withResolvers<boolean>();
+    state.flush.mockReturnValueOnce(flushed.promise);
+
+    state.invoke("subagent/end", {
+      runId: "run-flushing",
+      provider: "spawn",
+      id: child.agent.id,
+      local: true,
+      stopReason: "completed",
+    });
+    await expect.poll(() => state.flush.mock.calls.length).toBe(1);
+    const response = await state.agent.extMethod("deepseek/session/history", { sessionId: "child-flushing" });
+
+    expect(JSON.stringify(response)).toContain("not persisted yet");
+    flushed.resolve(true);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  });
+
   it("makes root close drain pending child transcript output", async () => {
     const state = services();
     const { root, child } = await rootWithChild(state, "child-closing");
@@ -3198,16 +3241,43 @@ describe("sub-agent lifecycle follow-ups", () => {
 });
 
 describe("sub-agent lifecycle second review", () => {
-  it("routes a registered child's approval to the client under the child session", async () => {
+  it("serializes a registered child's interactions and drains them on close", async () => {
     const state = services();
     const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
     const root = state.live.get(created.sessionId)!;
     const child = await state.context.agents.create({ sessionId: SessionId("child-ask"), meta: { cwd: "/project" } });
     (child.agent.session.header as { parentSession?: SessionId }).parentSession = root.agent.id;
     state.invoke("subagent/start", { runId: "r", provider: "spawn", id: child.agent.id, local: true });
-    state.requestPermission.mockResolvedValueOnce({ outcome: { outcome: "selected", optionId: "allow-once" } });
+    const permissionResponse = Promise.withResolvers<{ outcome: { outcome: "selected"; optionId: string } }>();
+    state.requestPermission.mockReturnValueOnce(permissionResponse.promise);
+    state.extensionRequest.mockResolvedValueOnce({
+      answers: [{ questionId: "q1", selectedLabels: [], customAnswer: "Answer" }],
+    });
 
-    await expect(state.invoke("approval/request", { agent: child.agent, callId: "call-x" }, async () => "unavailable")).resolves.toBe("allowed-once");
+    const permission = state.invoke(
+      "approval/request",
+      { agent: child.agent, callId: "call-x" },
+      async () => "unavailable",
+    ) as Promise<unknown>;
+    const question = state.askQuestion({
+      agent: child.agent,
+      questions: [{ id: "q1", question: "Proceed?" }],
+    });
+    await expect.poll(() => state.requestPermission.mock.calls.length).toBe(1);
+    expect(state.extensionRequest).not.toHaveBeenCalled();
+    let closeCompleted = false;
+    const closing = state.agent.closeSession({ sessionId: created.sessionId }).then(() => {
+      closeCompleted = true;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(closeCompleted).toBe(false);
+
+    permissionResponse.resolve({ outcome: { outcome: "selected", optionId: "allow-once" } });
+    await expect(permission).resolves.toBe("allowed-once");
+    await expect(question).resolves.toEqual({
+      answers: [{ id: "q1", selected: [], custom: "Answer" }],
+    });
+    await closing;
     expect(state.requestPermission).toHaveBeenCalledWith(expect.objectContaining({ sessionId: "child-ask" }));
   });
 

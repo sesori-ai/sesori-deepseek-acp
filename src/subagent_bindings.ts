@@ -53,7 +53,10 @@ export function createFileSubagentBindingStore(args: { root: string }): Subagent
     }
   };
   return {
-    load: ({ parentId }) => read(parentId),
+    load: async ({ parentId }) => {
+      await tails.get(parentId)?.catch(() => undefined);
+      return read(parentId);
+    },
     record: ({ parentId, toolCallId, childSessionId }) => {
       const previous = tails.get(parentId) ?? Promise.resolve();
       const next = previous.catch(() => undefined).then(async () => {
@@ -73,12 +76,10 @@ export function createFileSubagentBindingStore(args: { root: string }): Subagent
         await rename(staging, path);
       });
       tails.set(parentId, next);
-      void next.then(
-        () => {
-          if (tails.get(parentId) === next) tails.delete(parentId);
-        },
-        () => undefined,
-      );
+      const releaseTail = (): void => {
+        if (tails.get(parentId) === next) tails.delete(parentId);
+      };
+      void next.then(releaseTail, releaseTail);
       return next;
     },
   };

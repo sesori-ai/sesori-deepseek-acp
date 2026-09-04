@@ -1407,7 +1407,7 @@ export class DurableSessionAgent implements AcpAgent {
     this.#sessions.delete(sessionId);
     try {
       await this.#disposeRecord(record);
-      await this.#releaseOrphanedChildren();
+      await this.#releaseOrphanedChildren({ rootId: sessionId });
       return {};
     } catch (error) {
       if (!this.#closed && !this.#sessions.has(sessionId)) {
@@ -1989,14 +1989,25 @@ export class DurableSessionAgent implements AcpAgent {
     void tail.then(release, release);
   }
 
-  async #releaseOrphanedChildren(): Promise<void> {
+  async #releaseOrphanedChildren(args: { rootId: SessionId }): Promise<void> {
     const orphaned: ChildRecord[] = [];
     for (const [childId, child] of this.#children) {
-      if (this.#rootOf(childId) !== undefined) continue;
+      if (!this.#descendsFromRoot({ childId, rootId: args.rootId })) continue;
       this.#children.delete(childId);
       orphaned.push(child);
     }
     await Promise.allSettled(orphaned.map((child) => child.outputTail));
+  }
+
+  #descendsFromRoot(args: { childId: SessionId; rootId: SessionId }): boolean {
+    const visited = new Set<SessionId>();
+    let cursor = this.#children.get(args.childId);
+    while (cursor !== undefined && !visited.has(cursor.agent.id)) {
+      if (cursor.parentId === args.rootId) return true;
+      visited.add(cursor.agent.id);
+      cursor = this.#children.get(cursor.parentId);
+    }
+    return false;
   }
 
   async #bindingsFor(sessionId: SessionId, events: readonly SessionEvent[]): Promise<ReadonlyMap<string, string>> {
@@ -2018,9 +2029,12 @@ export class DurableSessionAgent implements AcpAgent {
     const agent = this.#context.agents.get(session.id);
     if (agent === undefined || agent.session !== session) return undefined;
     const chain: Agent[] = [];
+    const visited = new Set<SessionId>();
     let cursor: Agent | undefined = agent;
     let parent: SessionRecord | ChildRecord | undefined;
-    while (cursor !== undefined && chain.length < 16) {
+    while (cursor !== undefined) {
+      if (visited.has(cursor.id)) return undefined;
+      visited.add(cursor.id);
       const parentId = cursor.session.header.parentSession;
       if (parentId === undefined) return undefined;
       chain.push(cursor);

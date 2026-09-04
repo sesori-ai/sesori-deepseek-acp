@@ -2805,6 +2805,40 @@ describe("sub-agent lifecycle", () => {
     expect(closeCompleted).toBe(true);
   });
 
+  it("preserves another root's children when its concurrent close fails", async () => {
+    const state = services();
+    const { root: successfulRoot, child: successfulChild } = await rootWithChild(state, "child-successful-close");
+    const failingCreated = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const failingRoot = state.live.get(failingCreated.sessionId)!;
+    const failingChild = await state.context.agents.create({
+      sessionId: SessionId("child-failing-close"),
+      meta: { cwd: "/project" },
+    });
+    (failingChild.agent.session.header as { parentSession?: SessionId }).parentSession = failingRoot.agent.id;
+    state.invoke("subagent/start", { runId: "run-successful-close", provider: "spawn", id: successfulChild.agent.id, local: true });
+    state.invoke("subagent/start", { runId: "run-failing-close", provider: "spawn", id: failingChild.agent.id, local: true });
+    const disposeStarted = Promise.withResolvers<void>();
+    const releaseDispose = Promise.withResolvers<void>();
+    vi.mocked(failingRoot.dispose).mockImplementationOnce(async () => {
+      disposeStarted.resolve();
+      await releaseDispose.promise;
+      throw new Error("synthetic disposal failure");
+    });
+    const failingClose = expect(
+      state.agent.closeSession({ sessionId: failingCreated.sessionId }),
+    ).rejects.toThrow("unable to close DeepSeek session");
+    await disposeStarted.promise;
+
+    await state.agent.closeSession({ sessionId: String(successfulRoot.agent.id) });
+    releaseDispose.resolve();
+    await failingClose;
+
+    const inherited = { provider: "inherited", model: "inherited" };
+    await expect(
+      state.invokeFirst("agent/request", { agent: failingChild.agent, turn: 1, step: 1 }, async () => inherited),
+    ).resolves.toEqual({ provider: "synthetic", model: "synthetic" });
+  });
+
   it("derives the mode from run_in_background with the tool defaults", async () => {
     const state = services();
     const { root, child } = await rootWithChild(state, "child-bg");
@@ -2864,6 +2898,47 @@ describe("sub-agent lifecycle", () => {
 
     expect(state.updates[0]!.sessionId).toBe("grandchild-quiet");
     expect(String(root.agent.id)).not.toBe("grandchild-quiet");
+  });
+
+  it("adopts descendants deeper than sixteen parent sessions", async () => {
+    const state = services();
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    let parentId = SessionId(created.sessionId);
+    let deepest: Agent | undefined;
+    for (let depth = 1; depth <= 20; depth += 1) {
+      const descendant = await state.context.agents.create({
+        sessionId: SessionId(`deep-child-${depth}`),
+        meta: { cwd: "/project" },
+      });
+      (descendant.agent.session.header as { parentSession?: SessionId }).parentSession = parentId;
+      parentId = descendant.agent.id;
+      deepest = descendant.agent;
+    }
+    if (deepest === undefined) throw new Error("test hierarchy was not created");
+
+    state.invoke("session/event", deepest.session, {
+      type: "assistant/chunk",
+      data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "deep text" } },
+    });
+    await expect.poll(() => state.updates.length).toBe(1);
+
+    expect(state.updates[0]!.sessionId).toBe("deep-child-20");
+  });
+
+  it("rejects cyclic parent chains while adopting descendants", async () => {
+    const state = services();
+    await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const first = await state.context.agents.create({ sessionId: SessionId("cycle-first"), meta: { cwd: "/project" } });
+    const second = await state.context.agents.create({ sessionId: SessionId("cycle-second"), meta: { cwd: "/project" } });
+    (first.agent.session.header as { parentSession?: SessionId }).parentSession = second.agent.id;
+    (second.agent.session.header as { parentSession?: SessionId }).parentSession = first.agent.id;
+
+    state.invoke("session/event", first.agent.session, {
+      type: "assistant/chunk",
+      data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "dropped" } },
+    });
+
+    expect(state.updates).toEqual([]);
   });
 
   it("ignores children of agents this connection does not own", async () => {

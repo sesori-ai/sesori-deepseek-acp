@@ -5,6 +5,7 @@ import { CommandId } from "@deepseek-ai/dsh-commands";
 import { SessionId, type SessionEvent, type SessionHeader } from "@deepseek-ai/dsh-session";
 import { describe, expect, it, vi } from "vitest";
 import { DurableSessionAgent } from "../src/sessions.ts";
+import { createMemorySubagentBindingStore, type SubagentBindingStore } from "../src/subagent_bindings.ts";
 
 interface SessionServices {
   context: Context;
@@ -13,15 +14,19 @@ interface SessionServices {
   live: Map<string, AgentHandle>;
   create: ReturnType<typeof vi.fn>;
   resume: ReturnType<typeof vi.fn>;
+  flush: ReturnType<typeof vi.fn>;
   updates: SessionNotification[];
   diagnostics: string[];
   extNotifications: { method: string; params: Record<string, unknown> }[];
   requestPermission: ReturnType<typeof vi.fn>;
   extensionRequest: ReturnType<typeof vi.fn>;
+  extNotification: ReturnType<typeof vi.fn>;
   sessionUpdate: ReturnType<typeof vi.fn>;
   invoke(name: string, ...args: unknown[]): unknown;
+  invokeFirst(name: string, ...args: unknown[]): unknown;
   askQuestion(request: unknown): Promise<unknown>;
   contextServices: Map<string, unknown>;
+  bindings: SubagentBindingStore;
   agent: DurableSessionAgent;
 }
 
@@ -125,6 +130,7 @@ function services(): SessionServices {
     if (inspection === undefined) throw new Error("not found");
     return makeHandle(inspection.meta, inspection.events, options.setup);
   });
+  const flush = vi.fn(async () => true);
   context = {
     on: (name: string, listener: (...args: never[]) => unknown) => {
       listeners.set(name, [...(listeners.get(name) ?? []), listener]);
@@ -135,7 +141,7 @@ function services(): SessionServices {
       resume,
       get: (id: string) => live.get(id)?.agent,
     },
-    sessions: { flush: vi.fn(async () => true) },
+    sessions: { flush },
     llm: {
       listProviders: () => [],
       listModels: async () => [],
@@ -181,19 +187,22 @@ function services(): SessionServices {
   const sessionUpdate = vi.fn(async (notification: SessionNotification) => {
     updates.push(notification);
   });
+  const extNotification = vi.fn(async (method: string, params: Record<string, unknown>) => {
+    extNotifications.push({ method, params });
+  });
   const connection = {
     sessionUpdate,
     requestPermission,
     extMethod: extensionRequest,
-    extNotification: vi.fn(async (method: string, params: Record<string, unknown>) => {
-      extNotifications.push({ method, params });
-    }),
+    extNotification,
   } as unknown as AgentSideConnection;
   const diagnostics: string[] = [];
+  const bindings = createMemorySubagentBindingStore();
   const agent = new DurableSessionAgent({
     context,
     connection,
     diagnostics: { write: (message) => diagnostics.push(message) },
+    bindings,
   });
   return {
     context,
@@ -202,18 +211,22 @@ function services(): SessionServices {
     live,
     create,
     resume,
+    flush,
     updates,
     diagnostics,
     extNotifications,
     requestPermission,
     extensionRequest,
+    extNotification,
     sessionUpdate,
     invoke: (name, ...args) => listeners.get(name)?.at(-1)?.(...(args as never[])),
+    invokeFirst: (name, ...args) => listeners.get(name)?.at(0)?.(...(args as never[])),
     askQuestion: (request) => {
       if (questionProvider === undefined) throw new Error("question provider is unavailable");
       return questionProvider.ask(request);
     },
     contextServices,
+    bindings,
     agent,
   };
 }
@@ -2617,5 +2630,800 @@ describe("durable ACP sessions", () => {
         },
       },
     ]);
+  });
+});
+
+describe("sub-agent lifecycle", () => {
+  async function rootWithChild(state: SessionServices, childId: string): Promise<{ root: AgentHandle; child: AgentHandle }> {
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const root = state.live.get(created.sessionId)!;
+    const child = await state.context.agents.create({ sessionId: SessionId(childId), meta: { cwd: "/project" } });
+    (child.agent.session.header as { parentSession?: SessionId }).parentSession = root.agent.id;
+    return { root, child };
+  }
+
+  function subagentCall(state: SessionServices, root: AgentHandle, args: { callId: string; name: string; arguments: Record<string, unknown> }): void {
+    state.invoke("session/event", root.agent.session, {
+      type: "tool/call",
+      time: 5,
+      data: { turn: 1, step: 1, callId: args.callId, name: args.name, arguments: JSON.stringify(args.arguments) },
+    });
+  }
+
+  async function executeDelegation(state: SessionServices, root: AgentHandle, args: { callId: string; name: string; arguments: Record<string, unknown> }, start: () => void): Promise<void> {
+    await state.invoke(
+      "tools/execute",
+      { callId: args.callId, name: args.name, arguments: args.arguments, agent: root.agent, signal: new AbortController().signal },
+      async () => {
+        await Promise.resolve();
+        start();
+        return { isError: false, content: [] };
+      },
+    );
+  }
+
+  it("correlates a foreground child to its executing call, streams its transcript, and ends it in order", async () => {
+    const state = services();
+    const { root, child } = await rootWithChild(state, "child-1");
+    const call = { callId: "call-1", name: "subagent", arguments: { description: "Probe child", prompt: "secret", run_in_background: false } };
+    subagentCall(state, root, call);
+    await executeDelegation(state, root, call, () => {
+      state.invoke("subagent/start", { runId: "run-1", provider: "spawn", id: child.agent.id, local: true });
+      state.invoke("session/event", child.agent.session, {
+        type: "assistant/chunk",
+        data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "child text" } },
+      });
+      state.invoke("subagent/end", {
+        runId: "run-1",
+        provider: "spawn",
+        id: child.agent.id,
+        local: true,
+        stopReason: "completed",
+        lastAssistantMessage: [{ type: "text", text: "  child answer  " }],
+      });
+    });
+    await expect.poll(() => state.extNotifications.length).toBe(2);
+
+    expect(state.extNotifications).toEqual([
+      {
+        method: "deepseek/subagent",
+        params: { kind: "started", sessionId: String(root.agent.id), childSessionId: "child-1", toolCallId: "call-1", label: "Probe child", mode: "foreground" },
+      },
+      {
+        method: "deepseek/subagent",
+        params: { kind: "ended", sessionId: String(root.agent.id), childSessionId: "child-1", stopReason: "completed", summary: "child answer" },
+      },
+    ]);
+    expect(state.updates.map((notification) => [notification.sessionId, notification.update.sessionUpdate])).toEqual([
+      [String(root.agent.id), "tool_call"],
+      ["child-1", "agent_message_chunk"],
+    ]);
+    expect(JSON.stringify(state.extNotifications)).not.toContain("secret");
+    await expect(state.bindings.load({ parentId: String(root.agent.id) })).resolves.toEqual(new Map([["call-1", "child-1"]]));
+  });
+
+  it("delivers a child's started notification before its first transcript update", async () => {
+    const state = services();
+    const { root, child } = await rootWithChild(state, "child-ordered");
+    const call = {
+      callId: "call-ordered",
+      name: "subagent",
+      arguments: { description: "Ordered child", prompt: "p", run_in_background: false },
+    };
+    subagentCall(state, root, call);
+    await expect.poll(() => state.sessionUpdate.mock.calls.length).toBe(1);
+    const startDelivery = Promise.withResolvers<void>();
+    state.extNotification.mockImplementationOnce(async (method: string, params: Record<string, unknown>) => {
+      state.extNotifications.push({ method, params });
+      await startDelivery.promise;
+    });
+
+    await executeDelegation(state, root, call, () => {
+      state.invoke("subagent/start", { runId: "run-ordered", provider: "spawn", id: child.agent.id, local: true });
+      state.invoke("session/event", child.agent.session, {
+        type: "assistant/chunk",
+        data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "child text" } },
+      });
+    });
+    await expect.poll(() => state.extNotification.mock.calls.length).toBe(1);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(state.updates).toHaveLength(1);
+
+    startDelivery.resolve();
+    await expect.poll(() => state.updates.length).toBe(2);
+    expect(state.updates[1]!.sessionId).toBe("child-ordered");
+  });
+
+  it("preserves pending adopted output when the child's start arrives later", async () => {
+    const state = services();
+    const { root, child } = await rootWithChild(state, "child-adopted-first");
+    const adoptedOutput = Promise.withResolvers<void>();
+    state.sessionUpdate.mockImplementationOnce(async (notification: SessionNotification) => {
+      state.updates.push(notification);
+      await adoptedOutput.promise;
+    });
+    state.invoke("session/event", child.agent.session, {
+      type: "assistant/chunk",
+      data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "early text" } },
+    });
+    await expect.poll(() => state.sessionUpdate.mock.calls.length).toBe(1);
+    const call = {
+      callId: "call-adopted-first",
+      name: "subagent",
+      arguments: { description: "Adopted child", prompt: "p", run_in_background: false },
+    };
+    await executeDelegation(state, root, call, () => {
+      state.invoke("subagent/start", { runId: "run-adopted-first", provider: "spawn", id: child.agent.id, local: true });
+    });
+    expect(state.extNotification).not.toHaveBeenCalled();
+    let closeCompleted = false;
+    const closing = state.agent.closeSession({ sessionId: String(root.agent.id) }).then(() => {
+      closeCompleted = true;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(closeCompleted).toBe(false);
+
+    adoptedOutput.resolve();
+    await closing;
+    expect(state.extNotifications).toEqual([
+      {
+        method: "deepseek/subagent",
+        params: {
+          kind: "started",
+          sessionId: String(root.agent.id),
+          childSessionId: "child-adopted-first",
+          toolCallId: "call-adopted-first",
+          label: "Adopted child",
+          mode: "foreground",
+        },
+      },
+    ]);
+  });
+
+  it("reads an active child's history from its resident session", async () => {
+    const state = services();
+    const { root, child } = await rootWithChild(state, "child-history");
+    const call = {
+      callId: "call-history",
+      name: "subagent",
+      arguments: { description: "History child", prompt: "p", run_in_background: false },
+    };
+    subagentCall(state, root, call);
+    await executeDelegation(state, root, call, () => {
+      state.invoke("subagent/start", { runId: "run-history", provider: "spawn", id: child.agent.id, local: true });
+    });
+    const residentEvent = {
+      type: "assistant/message",
+      seq: 0,
+      time: 10,
+      surfaceOp: "append",
+      data: {
+        turn: 1,
+        step: 1,
+        message: {
+          id: "child-answer",
+          role: "assistant",
+          source: { kind: "model", provider: "synthetic", model: "synthetic" },
+          content: [{ type: "text", text: "resident child text" }],
+        },
+      },
+    } as unknown as SessionEvent;
+    (child.agent.session.events as SessionEvent[]).push(residentEvent);
+    state.invoke("session/event", child.agent.session, residentEvent);
+
+    const response = await state.agent.extMethod("deepseek/session/history", { sessionId: "child-history" });
+
+    expect((response.updates as SessionNotification[]).map((notification) => notification.update.sessionUpdate)).toEqual([
+      "agent_message_chunk",
+    ]);
+    expect(JSON.stringify(response)).toContain("resident child text");
+  });
+
+  it("retains settled child history until its session flush completes", async () => {
+    const state = services();
+    const { child } = await rootWithChild(state, "child-flushing");
+    state.invoke("subagent/start", { runId: "run-flushing", provider: "spawn", id: child.agent.id, local: true });
+    const residentEvent = {
+      type: "assistant/message",
+      seq: 0,
+      time: 10,
+      surfaceOp: "append",
+      data: {
+        turn: 1,
+        step: 1,
+        message: {
+          id: "flushing-answer",
+          role: "assistant",
+          source: { kind: "model", provider: "synthetic", model: "synthetic" },
+          content: [{ type: "text", text: "not persisted yet" }],
+        },
+      },
+    } as unknown as SessionEvent;
+    (child.agent.session.events as SessionEvent[]).push(residentEvent);
+    state.invoke("session/event", child.agent.session, residentEvent);
+    const flushed = Promise.withResolvers<boolean>();
+    state.flush.mockReturnValueOnce(flushed.promise);
+
+    state.invoke("subagent/end", {
+      runId: "run-flushing",
+      provider: "spawn",
+      id: child.agent.id,
+      local: true,
+      stopReason: "completed",
+    });
+    await expect.poll(() => state.flush.mock.calls.length).toBe(1);
+    const response = await state.agent.extMethod("deepseek/session/history", { sessionId: "child-flushing" });
+
+    expect(JSON.stringify(response)).toContain("not persisted yet");
+    flushed.resolve(true);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  });
+
+  it("makes root close drain pending child transcript output", async () => {
+    const state = services();
+    const { root, child } = await rootWithChild(state, "child-closing");
+    const call = {
+      callId: "call-closing",
+      name: "subagent",
+      arguments: { description: "Closing child", prompt: "p", run_in_background: false },
+    };
+    subagentCall(state, root, call);
+    await executeDelegation(state, root, call, () => {
+      state.invoke("subagent/start", { runId: "run-closing", provider: "spawn", id: child.agent.id, local: true });
+    });
+    await expect.poll(() => state.extNotifications.length).toBe(1);
+    const childOutput = Promise.withResolvers<void>();
+    state.sessionUpdate.mockImplementationOnce(async (notification: SessionNotification) => {
+      state.updates.push(notification);
+      await childOutput.promise;
+    });
+    state.invoke("session/event", child.agent.session, {
+      type: "assistant/chunk",
+      data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "pending" } },
+    });
+    await expect.poll(() => state.sessionUpdate.mock.calls.length).toBe(2);
+    let closeCompleted = false;
+    const closing = state.agent.closeSession({ sessionId: String(root.agent.id) }).then(() => {
+      closeCompleted = true;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(closeCompleted).toBe(false);
+
+    childOutput.resolve();
+    await closing;
+    expect(closeCompleted).toBe(true);
+  });
+
+  it("makes root close collect and drain active nested descendants", async () => {
+    const state = services();
+    const { root, child } = await rootWithChild(state, "child-nested-close");
+    state.invoke("subagent/start", { runId: "run-parent-close", provider: "spawn", id: child.agent.id, local: true });
+    const grandchild = await state.context.agents.create({
+      sessionId: SessionId("grandchild-nested-close"),
+      meta: { cwd: "/project" },
+    });
+    (grandchild.agent.session.header as { parentSession?: SessionId }).parentSession = child.agent.id;
+    state.invoke("subagent/start", { runId: "run-grandchild-close", provider: "spawn", id: grandchild.agent.id, local: true });
+    const nestedOutput = Promise.withResolvers<void>();
+    state.sessionUpdate.mockImplementationOnce(async (notification: SessionNotification) => {
+      state.updates.push(notification);
+      await nestedOutput.promise;
+    });
+    state.invoke("session/event", grandchild.agent.session, {
+      type: "assistant/chunk",
+      data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "pending" } },
+    });
+    await expect.poll(() => state.sessionUpdate.mock.calls.length).toBe(1);
+    let closeCompleted = false;
+    const closing = state.agent.closeSession({ sessionId: String(root.agent.id) }).then(() => {
+      closeCompleted = true;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(closeCompleted).toBe(false);
+
+    nestedOutput.resolve();
+    await closing;
+    await expect(
+      state.agent.extMethod("deepseek/session/history", { sessionId: "grandchild-nested-close" }),
+    ).rejects.toThrow("unknown session");
+  });
+
+  it("preserves another root's children when its concurrent close fails", async () => {
+    const state = services();
+    const { root: successfulRoot, child: successfulChild } = await rootWithChild(state, "child-successful-close");
+    const failingCreated = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const failingRoot = state.live.get(failingCreated.sessionId)!;
+    const failingChild = await state.context.agents.create({
+      sessionId: SessionId("child-failing-close"),
+      meta: { cwd: "/project" },
+    });
+    (failingChild.agent.session.header as { parentSession?: SessionId }).parentSession = failingRoot.agent.id;
+    state.invoke("subagent/start", { runId: "run-successful-close", provider: "spawn", id: successfulChild.agent.id, local: true });
+    state.invoke("subagent/start", { runId: "run-failing-close", provider: "spawn", id: failingChild.agent.id, local: true });
+    const disposeStarted = Promise.withResolvers<void>();
+    const releaseDispose = Promise.withResolvers<void>();
+    vi.mocked(failingRoot.dispose).mockImplementationOnce(async () => {
+      disposeStarted.resolve();
+      await releaseDispose.promise;
+      throw new Error("synthetic disposal failure");
+    });
+    const failingClose = expect(
+      state.agent.closeSession({ sessionId: failingCreated.sessionId }),
+    ).rejects.toThrow("unable to close DeepSeek session");
+    await disposeStarted.promise;
+
+    await state.agent.closeSession({ sessionId: String(successfulRoot.agent.id) });
+    releaseDispose.resolve();
+    await failingClose;
+
+    const inherited = { provider: "inherited", model: "inherited" };
+    await expect(
+      state.invokeFirst("agent/request", { agent: failingChild.agent, turn: 1, step: 1 }, async () => inherited),
+    ).resolves.toEqual({ provider: "synthetic", model: "synthetic" });
+  });
+
+  it("derives the mode from run_in_background with the tool defaults", async () => {
+    const state = services();
+    const { root, child } = await rootWithChild(state, "child-bg");
+    const other = await state.context.agents.create({ sessionId: SessionId("child-fork"), meta: { cwd: "/project" } });
+    (other.agent.session.header as { parentSession?: SessionId }).parentSession = root.agent.id;
+    const background = { callId: "call-bg", name: "subagent", arguments: { description: "Background child", prompt: "p" } };
+    const fork = { callId: "call-fork", name: "subagent_fork", arguments: { description: "Forked child", prompt: "p" } };
+    subagentCall(state, root, background);
+    subagentCall(state, root, fork);
+    await executeDelegation(state, root, background, () => {
+      state.invoke("subagent/start", { runId: "run-bg", provider: "spawn", id: child.agent.id, local: true });
+    });
+    await executeDelegation(state, root, fork, () => {
+      state.invoke("subagent/start", { runId: "run-fork", provider: "fork", id: other.agent.id, local: true });
+    });
+    await expect.poll(() => state.extNotifications.length).toBe(2);
+
+    expect(state.extNotifications.map((item) => item.params)).toEqual([
+      expect.objectContaining({ kind: "started", childSessionId: "child-bg", toolCallId: "call-bg", mode: "background" }),
+      expect.objectContaining({ kind: "started", childSessionId: "child-fork", toolCallId: "call-fork", mode: "foreground" }),
+    ]);
+  });
+
+  it("logs a start without an executing delegation call and still streams the child", async () => {
+    const state = services();
+    const { child } = await rootWithChild(state, "child-resumed");
+    state.invoke("subagent/start", { runId: "run-2", provider: "spawn", id: child.agent.id, local: true });
+    state.invoke("session/event", child.agent.session, {
+      type: "assistant/chunk",
+      data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "resumed text" } },
+    });
+    state.invoke("subagent/end", {
+      runId: "run-2",
+      provider: "spawn",
+      id: child.agent.id,
+      local: true,
+      stopReason: "completed",
+    });
+    await expect.poll(() => state.updates.length).toBe(1);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(state.extNotifications).toEqual([]);
+    expect(state.updates[0]!.sessionId).toBe("child-resumed");
+    expect(state.diagnostics.join("")).toContain("sub-agent start without an executing delegation call");
+  });
+
+  it("projects events of a descendant it never saw start by walking parentSession", async () => {
+    const state = services();
+    const { root, child } = await rootWithChild(state, "child-quiet");
+    const grandchild = await state.context.agents.create({ sessionId: SessionId("grandchild-quiet"), meta: { cwd: "/project" } });
+    (grandchild.agent.session.header as { parentSession?: SessionId }).parentSession = child.agent.id;
+    state.invoke("session/event", grandchild.agent.session, {
+      type: "assistant/chunk",
+      data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "deep text" } },
+    });
+    await expect.poll(() => state.updates.length).toBe(1);
+
+    expect(state.updates[0]!.sessionId).toBe("grandchild-quiet");
+    expect(String(root.agent.id)).not.toBe("grandchild-quiet");
+  });
+
+  it("adopts descendants deeper than sixteen parent sessions", async () => {
+    const state = services();
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    let parentId = SessionId(created.sessionId);
+    let deepest: Agent | undefined;
+    for (let depth = 1; depth <= 20; depth += 1) {
+      const descendant = await state.context.agents.create({
+        sessionId: SessionId(`deep-child-${depth}`),
+        meta: { cwd: "/project" },
+      });
+      (descendant.agent.session.header as { parentSession?: SessionId }).parentSession = parentId;
+      parentId = descendant.agent.id;
+      deepest = descendant.agent;
+    }
+    if (deepest === undefined) throw new Error("test hierarchy was not created");
+
+    state.invoke("session/event", deepest.session, {
+      type: "assistant/chunk",
+      data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "deep text" } },
+    });
+    await expect.poll(() => state.updates.length).toBe(1);
+
+    expect(state.updates[0]!.sessionId).toBe("deep-child-20");
+  });
+
+  it("rejects cyclic parent chains while adopting descendants", async () => {
+    const state = services();
+    await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const first = await state.context.agents.create({ sessionId: SessionId("cycle-first"), meta: { cwd: "/project" } });
+    const second = await state.context.agents.create({ sessionId: SessionId("cycle-second"), meta: { cwd: "/project" } });
+    (first.agent.session.header as { parentSession?: SessionId }).parentSession = second.agent.id;
+    (second.agent.session.header as { parentSession?: SessionId }).parentSession = first.agent.id;
+
+    state.invoke("session/event", first.agent.session, {
+      type: "assistant/chunk",
+      data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "dropped" } },
+    });
+
+    expect(state.updates).toEqual([]);
+  });
+
+  it("ignores children of agents this connection does not own", async () => {
+    const state = services();
+    const foreign = await state.context.agents.create({ sessionId: SessionId("foreign-child"), meta: { cwd: "/project" } });
+    (foreign.agent.session.header as { parentSession?: SessionId }).parentSession = SessionId("foreign-root");
+    state.invoke("subagent/start", { runId: "run-3", provider: "spawn", id: foreign.agent.id, local: true });
+    state.invoke("session/event", foreign.agent.session, {
+      type: "assistant/chunk",
+      data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "dropped" } },
+    });
+    state.invoke("subagent/end", { runId: "run-3", provider: "spawn", id: foreign.agent.id, local: true, stopReason: "completed" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(state.extNotifications).toEqual([]);
+    expect(state.updates).toEqual([]);
+  });
+
+  it("gives registered children the owning root's model selection", async () => {
+    const state = services();
+    const { root, child } = await rootWithChild(state, "child-model");
+    state.invoke("subagent/start", { runId: "run-4", provider: "spawn", id: child.agent.id, local: true });
+    const inherited = { provider: "inherited", model: "inherited", reasoningEffort: "high" };
+
+    await expect(
+      state.invokeFirst("agent/request", { agent: child.agent, turn: 1, step: 1 }, async () => inherited),
+    ).resolves.toEqual({ provider: "synthetic", model: "synthetic" });
+    await expect(
+      state.invokeFirst("agent/request", { agent: root.agent, turn: 1, step: 1 }, async () => inherited),
+    ).resolves.toEqual(inherited);
+  });
+
+  it("folds delegation identity and settlement into the parent's replayed tool calls", async () => {
+    const state = services();
+    const meta = header({ id: "parent", cwd: "/project", createdAt: 1 });
+    state.headers.push(meta);
+    await state.bindings.record({ parentId: "parent", toolCallId: "call-fork", childSessionId: "fork-child" });
+    const toolResult = (args: { seq: number; time: number; callId: string; text: string }) => ({
+      type: "tool/result",
+      seq: args.seq,
+      time: args.time,
+      surfaceOp: "append",
+      sourceEventSeqs: [args.seq - 1],
+      data: {
+        turn: 1,
+        step: 1,
+        message: {
+          id: `result-${args.callId}`,
+          role: "user",
+          source: { kind: "tool", callId: args.callId },
+          content: [{ type: "tool-result", toolCallId: args.callId, content: [{ type: "text", text: args.text }] }],
+        },
+      },
+    });
+    state.inspections.set("parent", {
+      meta,
+      events: [
+        {
+          type: "user/message",
+          seq: 0,
+          time: 1,
+          surfaceOp: "append",
+          data: { id: "user-1", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "delegate" }] },
+        },
+        {
+          type: "tool/call",
+          seq: 1,
+          time: 10,
+          data: { turn: 1, step: 1, callId: "call-bg", name: "subagent", arguments: JSON.stringify({ description: "Background child", prompt: "secret" }) },
+        },
+        toolResult({ seq: 2, time: 12, callId: "call-bg", text: "started subagent bg-child" }),
+        {
+          type: "tool/call",
+          seq: 3,
+          time: 100,
+          data: { turn: 1, step: 1, callId: "call-fork", name: "subagent_fork", arguments: "{not json" },
+        },
+        toolResult({ seq: 4, time: 200, callId: "call-fork", text: "OK" }),
+        {
+          type: "user/message",
+          seq: 5,
+          time: 300,
+          surfaceOp: "append",
+          data: {
+            id: "notice-1",
+            role: "user",
+            source: {
+              kind: "subagent-settled",
+              form: "notice",
+              summary: "Background subagent bg-child was stopped before it finished.",
+              senderSessionId: "bg-child",
+            },
+            content: [{ type: "text", text: "secret closing message" }],
+          },
+        },
+      ] as unknown as SessionEvent[],
+    });
+
+    const response = await state.agent.extMethod("deepseek/session/history", { sessionId: "parent" });
+    const subagentMeta = (notification: SessionNotification) =>
+      (notification._meta as { "sesori.ai/deepseek": { subagent?: unknown } })["sesori.ai/deepseek"].subagent;
+    expect(JSON.stringify(response)).not.toContain("secret");
+    expect((response.updates as SessionNotification[]).map((notification) => [notification.update.sessionUpdate, subagentMeta(notification)])).toEqual([
+      ["user_message_chunk", undefined],
+      ["tool_call", { label: "Background child", mode: "background" }],
+      ["tool_call_update", { label: "Background child", mode: "background", childSessionId: "bg-child" }],
+      ["tool_call", { label: "subagent_fork", mode: "foreground" }],
+      ["tool_call_update", { label: "subagent_fork", mode: "foreground", childSessionId: "fork-child", ended: { stopReason: "completed" } }],
+      ["tool_call_update", { label: "Background child", mode: "background", childSessionId: "bg-child", ended: { stopReason: "aborted" } }],
+    ]);
+  });
+});
+
+describe("sub-agent lifecycle follow-ups", () => {
+  it("retains a settled child and drains its nested lifecycle tail", async () => {
+    const state = services();
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const root = state.live.get(created.sessionId)!;
+    const child = await state.context.agents.create({ sessionId: SessionId("mid"), meta: { cwd: "/project" } });
+    (child.agent.session.header as { parentSession?: SessionId }).parentSession = root.agent.id;
+    const grandchild = await state.context.agents.create({ sessionId: SessionId("leaf"), meta: { cwd: "/project" } });
+    (grandchild.agent.session.header as { parentSession?: SessionId }).parentSession = child.agent.id;
+    await state.invoke(
+      "tools/execute",
+      {
+        callId: "call-mid",
+        name: "subagent",
+        arguments: { description: "Middle", prompt: "p" },
+        agent: root.agent,
+        signal: new AbortController().signal,
+      },
+      async () => {
+        state.invoke("subagent/start", { runId: "r1", provider: "spawn", id: child.agent.id, local: true });
+      },
+    );
+    await state.invoke(
+      "tools/execute",
+      {
+        callId: "call-leaf",
+        name: "subagent",
+        arguments: { description: "Leaf", prompt: "p" },
+        agent: child.agent,
+        signal: new AbortController().signal,
+      },
+      async () => {
+        state.invoke("subagent/start", { runId: "r2", provider: "spawn", id: grandchild.agent.id, local: true });
+      },
+    );
+    state.invoke("subagent/end", { runId: "r1", provider: "spawn", id: child.agent.id, local: true, stopReason: "completed" });
+
+    await expect(
+      state.invokeFirst("agent/request", { agent: grandchild.agent, turn: 1, step: 1 }, async () => ({ provider: "x", model: "y" })),
+    ).resolves.toEqual({ provider: "synthetic", model: "synthetic" });
+    await expect.poll(() => state.extNotifications.length).toBe(3);
+    const nestedEndDelivery = Promise.withResolvers<void>();
+    state.extNotification.mockImplementationOnce(async (method: string, params: Record<string, unknown>) => {
+      state.extNotifications.push({ method, params });
+      await nestedEndDelivery.promise;
+    });
+    state.invoke("subagent/end", { runId: "r2", provider: "spawn", id: grandchild.agent.id, local: true, stopReason: "aborted" });
+    await expect.poll(() => state.extNotification.mock.calls.length).toBe(4);
+    let closeCompleted = false;
+    const closing = state.agent.closeSession({ sessionId: String(root.agent.id) }).then(() => {
+      closeCompleted = true;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(closeCompleted).toBe(false);
+
+    nestedEndDelivery.resolve();
+    await closing;
+    expect(
+      state.extNotifications
+        .filter((item) => item.params.kind === "ended")
+        .map((item) => [item.params.sessionId, item.params.childSessionId]),
+    ).toEqual([
+      [String(root.agent.id), "mid"],
+      ["mid", "leaf"],
+    ]);
+  });
+
+  it("marks a failed background launch without a child id as ended", async () => {
+    const state = services();
+    const meta = header({ id: "failed-background", cwd: "/project", createdAt: 1 });
+    state.headers.push(meta);
+    state.inspections.set("failed-background", {
+      meta,
+      events: [
+        {
+          type: "user/message",
+          seq: 0,
+          time: 1,
+          surfaceOp: "append",
+          data: { id: "user", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "go" }] },
+        },
+        {
+          type: "tool/call",
+          seq: 1,
+          time: 2,
+          data: {
+            turn: 1,
+            step: 1,
+            callId: "call-failed",
+            name: "subagent",
+            arguments: JSON.stringify({ description: "Failed child", prompt: "p" }),
+          },
+        },
+        {
+          type: "tool/result",
+          seq: 2,
+          time: 3,
+          surfaceOp: "append",
+          sourceEventSeqs: [1],
+          data: {
+            turn: 1,
+            step: 1,
+            message: {
+              id: "failed-result",
+              role: "user",
+              source: { kind: "tool", callId: "call-failed" },
+              content: [
+                {
+                  type: "tool-result",
+                  toolCallId: "call-failed",
+                  isError: true,
+                  content: [{ type: "text", text: "unable to start subagent" }],
+                },
+              ],
+            },
+          },
+        },
+      ] as unknown as SessionEvent[],
+    });
+
+    const response = await state.agent.extMethod("deepseek/session/history", { sessionId: "failed-background" });
+    const folds = (response.updates as SessionNotification[])
+      .map((notification) =>
+        (notification._meta as { "sesori.ai/deepseek"?: { subagent?: unknown } } | undefined)?.[
+          "sesori.ai/deepseek"
+        ]?.subagent,
+      )
+      .filter((fold) => fold !== undefined);
+
+    expect(folds.at(-1)).toEqual({
+      label: "Failed child",
+      mode: "background",
+      ended: { stopReason: "error" },
+    });
+  });
+
+  it("folds a settlement whose delegation call sits on an earlier history page", async () => {
+    const state = services();
+    const meta = header({ id: "paged", cwd: "/project", createdAt: 1 });
+    state.headers.push(meta);
+    const userMessage = (seq: number, id: string) => ({
+      type: "user/message",
+      seq,
+      time: seq,
+      surfaceOp: "append",
+      data: { id, role: "user", source: { kind: "user" }, content: [{ type: "text", text: "go" }] },
+    });
+    state.inspections.set("paged", {
+      meta,
+      events: [
+        userMessage(0, "u1"),
+        { type: "tool/call", seq: 1, time: 1, data: { turn: 1, step: 1, callId: "call-bg", name: "subagent", arguments: JSON.stringify({ description: "Paged child", prompt: "p" }) } },
+        {
+          type: "tool/result",
+          seq: 2,
+          time: 2,
+          surfaceOp: "append",
+          sourceEventSeqs: [1],
+          data: { turn: 1, step: 1, message: { id: "r1", role: "user", source: { kind: "tool", callId: "call-bg" }, content: [{ type: "tool-result", toolCallId: "call-bg", content: [{ type: "text", text: "started subagent paged-child" }] }] } },
+        },
+        userMessage(3, "u2"),
+        {
+          type: "user/message",
+          seq: 4,
+          time: 4,
+          surfaceOp: "append",
+          data: { id: "n1", role: "user", source: { kind: "subagent-settled", form: "notice", summary: "Background subagent paged-child finished and will do no further work unless you send it more.", senderSessionId: "paged-child" }, content: [{ type: "text", text: "closing" }] },
+        },
+      ] as unknown as SessionEvent[],
+    });
+
+    const response = await state.agent.extMethod("deepseek/session/history", { sessionId: "paged", maxMessages: 1 });
+    expect(response.hasMore).toBe(true);
+    expect((response.updates as SessionNotification[]).map((notification) => [notification.update.sessionUpdate, (notification._meta as { "sesori.ai/deepseek"?: { subagent?: unknown } } | undefined)?.["sesori.ai/deepseek"]?.subagent])).toEqual([
+      ["user_message_chunk", undefined],
+      ["tool_call_update", { label: "Paged child", mode: "background", childSessionId: "paged-child", ended: { stopReason: "completed" } }],
+    ]);
+  });
+});
+
+describe("sub-agent lifecycle second review", () => {
+  it("serializes a registered child's interactions and drains them on close", async () => {
+    const state = services();
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const root = state.live.get(created.sessionId)!;
+    const child = await state.context.agents.create({ sessionId: SessionId("child-ask"), meta: { cwd: "/project" } });
+    (child.agent.session.header as { parentSession?: SessionId }).parentSession = root.agent.id;
+    state.invoke("subagent/start", { runId: "r", provider: "spawn", id: child.agent.id, local: true });
+    const permissionResponse = Promise.withResolvers<{ outcome: { outcome: "selected"; optionId: string } }>();
+    state.requestPermission.mockReturnValueOnce(permissionResponse.promise);
+    state.extensionRequest.mockResolvedValueOnce({
+      answers: [{ questionId: "q1", selectedLabels: [], customAnswer: "Answer" }],
+    });
+
+    const permission = state.invoke(
+      "approval/request",
+      { agent: child.agent, callId: "call-x" },
+      async () => "unavailable",
+    ) as Promise<unknown>;
+    const question = state.askQuestion({
+      agent: child.agent,
+      questions: [{ id: "q1", question: "Proceed?" }],
+    });
+    await expect.poll(() => state.requestPermission.mock.calls.length).toBe(1);
+    expect(state.extensionRequest).not.toHaveBeenCalled();
+    let closeCompleted = false;
+    const closing = state.agent.closeSession({ sessionId: created.sessionId }).then(() => {
+      closeCompleted = true;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(closeCompleted).toBe(false);
+
+    permissionResponse.resolve({ outcome: { outcome: "selected", optionId: "allow-once" } });
+    await expect(permission).resolves.toBe("allowed-once");
+    await expect(question).resolves.toEqual({
+      answers: [{ id: "q1", selected: [], custom: "Answer" }],
+    });
+    await closing;
+    expect(state.requestPermission).toHaveBeenCalledWith(expect.objectContaining({ sessionId: "child-ask" }));
+  });
+
+  it("binds replayed foreground children through recorded bindings and keeps their stop reasons", async () => {
+    const state = services();
+    const meta = header({ id: "mixed", cwd: "/project", createdAt: 1 });
+    state.headers.push(meta);
+    await state.bindings.record({ parentId: "mixed", toolCallId: "bg", childSessionId: "bg-child" });
+    await state.bindings.record({ parentId: "mixed", toolCallId: "fg", childSessionId: "fg-child" });
+    const result = (seq: number, callId: string, text: string, isError = false) => ({
+      type: "tool/result",
+      seq,
+      time: seq * 10,
+      surfaceOp: "append",
+      sourceEventSeqs: [seq - 2],
+      data: { turn: 1, step: 1, message: { id: `r-${callId}`, role: "user", source: { kind: "tool", callId }, content: [{ type: "tool-result", toolCallId: callId, isError, content: [{ type: "text", text }] }] } },
+    });
+    state.inspections.set("mixed", {
+      meta,
+      events: [
+        { type: "user/message", seq: 0, time: 1, surfaceOp: "append", data: { id: "u", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "go" }] } },
+        { type: "tool/call", seq: 1, time: 10, data: { turn: 1, step: 1, callId: "bg", name: "subagent", arguments: JSON.stringify({ description: "Background", prompt: "p" }) } },
+        { type: "tool/call", seq: 2, time: 11, data: { turn: 1, step: 1, callId: "fg", name: "subagent", arguments: JSON.stringify({ description: "Foreground", prompt: "p", run_in_background: false }) } },
+        result(3, "bg", "started subagent bg-child"),
+        result(4, "fg", "subagent run was cancelled\nPartial output before the run ended:\nsecret", true),
+      ] as unknown as SessionEvent[],
+    });
+
+    const response = await state.agent.extMethod("deepseek/session/history", { sessionId: "mixed" });
+    const folds = (response.updates as SessionNotification[]).map((notification) => (notification._meta as { "sesori.ai/deepseek"?: { subagent?: unknown } } | undefined)?.["sesori.ai/deepseek"]?.subagent).filter((fold) => fold !== undefined);
+    expect(JSON.stringify(response)).not.toContain("secret");
+    expect(folds.at(-1)).toEqual({ label: "Foreground", mode: "foreground", childSessionId: "fg-child", ended: { stopReason: "aborted" } });
   });
 });

@@ -1,5 +1,5 @@
 import { Ajv2020, type ErrorObject, type ValidateFunction } from "ajv/dist/2020.js";
-import schema from "../protocol/v1/deepseek-acp.schema.json" with { type: "json" };
+import schema from "../protocol/v2/deepseek-acp.schema.json" with { type: "json" };
 
 export type ProtocolDefinition =
   | "initializeMetadata"
@@ -12,7 +12,8 @@ export type ProtocolDefinition =
   | "renameResponse"
   | "askUserQuestionRequest"
   | "askUserQuestionResponse"
-  | "sessionStatusNotification";
+  | "sessionStatusNotification"
+  | "subagentNotification";
 
 export interface FixtureEntry {
   definition: ProtocolDefinition;
@@ -41,6 +42,7 @@ const definitions: readonly ProtocolDefinition[] = [
   "askUserQuestionRequest",
   "askUserQuestionResponse",
   "sessionStatusNotification",
+  "subagentNotification",
 ];
 const definitionSet = new Set<string>(definitions);
 const ajv = new Ajv2020({ allErrors: true, strict: true });

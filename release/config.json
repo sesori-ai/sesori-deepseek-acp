@@ -10,6 +10,6 @@
   },
   "deepSeekHarnessVersion": "0.1.1-rc.2",
   "consumerRepository": "sesori-ai/sesori_apps_monorepo",
-  "consumerCommit": "69e9478d681d97d6a0f1b2d7b1f0baf03a0cd71c",
+  "consumerCommit": "2cc1485d7cc3c180cfd949cbed85d579a708f191",
   "protocolSourceCommit": "9731711f079dc0d7acf7e5eff29c81a3622bc4a0"
 }

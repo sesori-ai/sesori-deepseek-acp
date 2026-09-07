@@ -174,3 +174,12 @@ describe("DeepSeek extension schema", () => {
     }
   });
 });
+
+for (const kind of ["valid", "invalid"] as const) {
+  it(`validates separate scoped-stop v1 ${kind} corpus`, async () => {
+    const path = new URL(`../protocol/scoped-stop/v1/fixtures/${kind}.json`, import.meta.url);
+    const results = validateFixtureCorpus({ corpus: await fixture({ path }) });
+    expect(results.length).toBeGreaterThan(0);
+    expect(results.every((result) => result.valid === (kind === "valid"))).toBe(true);
+  });
+}

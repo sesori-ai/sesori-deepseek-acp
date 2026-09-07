@@ -1186,8 +1186,8 @@ export class DurableSessionAgent implements AcpAgent {
       if (record === undefined || request.callId === undefined) return next();
       const permission = this.#queueInteraction({
         record,
+        signal: request.signal,
         task: () => {
-          request.signal?.throwIfAborted();
           return this.#connection.requestPermission({
             sessionId: String(request.agent.id),
             toolCall: { toolCallId: String(request.callId) },
@@ -1198,7 +1198,7 @@ export class DurableSessionAgent implements AcpAgent {
           });
         },
       });
-      return withAbort(permission, request.signal)
+      return permission
         .then(({ outcome }) =>
           outcome.outcome === "cancelled"
             ? "cancelled"
@@ -1716,6 +1716,7 @@ export class DurableSessionAgent implements AcpAgent {
       return (await this.#catalog()) as unknown as Record<string, unknown>;
     }
     if (method === "deepseek/session/rename") return this.#rename(params);
+    if (method === "deepseek/session/stop") return this.#stopSession(params);
     if (method === "deepseek/subagent/interrupt") return this.#interruptSubagent(params);
     if (method !== "deepseek/session/history") throw RequestError.methodNotFound(method);
     const request = historyRequest(params);
@@ -1885,6 +1886,86 @@ export class DurableSessionAgent implements AcpAgent {
     return respond({ result: "interrupted" });
   }
 
+  /** Capture and signal the native scope without yielding to admission or ACP output. */
+  #stopSession(params: Record<string, unknown>): Record<string, unknown> {
+    if (!validateProtocolValue({ definition: "sessionStopRequest", value: params }).valid) {
+      throw invalidParams("invalid DeepSeek session stop request");
+    }
+    const sessionId = parseSessionId(params.sessionId as string);
+    const root = params.kind === "session" ? this.#sessions.get(sessionId) : undefined;
+    const named = params.kind === "child"
+      ? this.#children.get(parseSessionId(params.childSessionId as string))
+      : undefined;
+    if (params.kind === "session" ? root === undefined :
+      named === undefined || named.parentId !== sessionId || this.#lineageRecord(sessionId) === undefined) {
+      throw invalidParams("DeepSeek stop target is not owned by the named session");
+    }
+    const target = root?.handle.agent ?? named!.agent;
+    const launchers = new Map<SessionId, Agent>([[target.id, target]]);
+    const children: ChildRecord[] = named === undefined ? [] : [named];
+    // Map traversal is only a live ownership walk, never a durable catalog scan.
+    for (const id of launchers.keys()) {
+      for (const child of this.#children.values()) {
+        if (child.parentId !== id || launchers.has(child.agent.id)) continue;
+        children.push(child);
+        launchers.set(child.agent.id, child.agent);
+      }
+    }
+    const projections = this.#context.get("sessionProjections");
+    const continuable = new Set(children.filter((child) => {
+      const session = child.agent.session;
+      const identity = projections?.snapshot(session).values.subagent;
+      return session.header.origin === "subagent" && identity?.mode === "continuable" &&
+        identity.seq >= (session.header.seedLength ?? 0);
+    }));
+    const jobs = this.#context.get("jobs");
+    const ownedJobs = [...launchers.values()].flatMap((owner) =>
+      (jobs?.list(owner) ?? []).filter((job) => job.kind === "subagent" && job.ownerSession === owner.id &&
+        (job.status === "running" || job.status === "stopping")).map((job) => ({ owner, job })),
+    );
+    const failures: unknown[] = [];
+    const attempt = (args: { operation: string; id: SessionId; signal: () => void }): boolean => {
+      try {
+        args.signal();
+        return true;
+      } catch (cause) {
+        this.#diagnose(args.operation, args.id, cause);
+        failures.push(new Error(`${args.operation} session=${args.id}`, { cause }));
+        return false;
+      }
+    };
+    const covered = new Set<SessionId>();
+    if (root !== undefined && attempt({
+      operation: "deepseek/session/stop root",
+      id: target.id,
+      signal: () => this.#cancelRecord(root),
+    })) covered.add(target.id);
+    for (const child of children) {
+      if (continuable.has(child)) {
+        // STOP discards accepted inbox work; the legacy manager interrupt intentionally
+        // keeps it. Authority and own-suffix provenance have already been checked above.
+        if (attempt({
+          operation: "deepseek/session/stop child",
+          id: child.agent.id,
+          signal: () => child.agent.cancel({ kind: "user" }, { keepInbox: false }),
+        })) covered.add(child.agent.id);
+      } else if (covered.has(child.parentId)) {
+        // Pinned one-shot producers are exhaustive: foreground uses the launching tool
+        // signal; background forks use the complete owner-job set captured above.
+        covered.add(child.agent.id);
+      }
+    }
+    for (const { owner, job } of ownedJobs) {
+      attempt({
+        operation: `deepseek/session/stop job=${job.id}`,
+        id: owner.id,
+        signal: () => { jobs!.kill(job.id, owner, "ACP scoped stop"); },
+      });
+    }
+    if (failures.length > 0) throw new AggregateError(failures, "DeepSeek scoped stop partially failed");
+    return { workKept: children.some((child) => !child.ended && !covered.has(child.agent.id)) };
+  }
+
   #renameResponse(title: string): Record<string, unknown> {
     const response = { title };
     if (!validateProtocolValue({ definition: "renameResponse", value: response }).valid) {
@@ -1984,6 +2065,10 @@ export class DurableSessionAgent implements AcpAgent {
   async cancel(params: CancelNotification): Promise<void> {
     const record = this.#sessions.get(parseSessionId(params.sessionId));
     if (record === undefined) return;
+    this.#cancelRecord(record);
+  }
+
+  #cancelRecord(record: SessionRecord): void {
     const inflight = record.inflight;
     if (inflight !== undefined) {
       inflight.cancelled = true;
@@ -2235,13 +2320,40 @@ export class DurableSessionAgent implements AcpAgent {
     });
   }
 
-  #queueInteraction<T>(args: { record: SessionRecord | ChildRecord; task: () => Promise<T> }): Promise<T> {
-    const result = args.record.outputTail.catch(() => undefined).then(args.task);
+  #queueInteraction<T>(args: {
+    record: SessionRecord | ChildRecord;
+    signal: AbortSignal | undefined;
+    task: () => Promise<T>;
+  }): Promise<T> {
+    const result = args.record.outputTail.catch(() => undefined).then(async () => {
+      args.signal?.throwIfAborted();
+      const response = args.task();
+      const sessionId = "handle" in args.record ? args.record.handle.agent.id : args.record.agent.id;
+      // extMethod queues its write synchronously. Do not await its ACK: this control
+      // must precede the next interaction, but cannot hold the aborted output tail.
+      const onAbort = (): void => {
+        try {
+          void this.#connection.extMethod("deepseek/input/cancel", { sessionId: String(sessionId) })
+            .catch((error: unknown) => this.#diagnose("deepseek/input/cancel", sessionId, error));
+        } catch (error) {
+          this.#diagnose("deepseek/input/cancel", sessionId, error);
+        }
+      };
+      args.signal?.addEventListener("abort", onAbort, { once: true });
+      if (args.signal?.aborted) onAbort();
+      try {
+        return await withAbort(response, args.signal);
+      } finally {
+        args.signal?.removeEventListener("abort", onAbort);
+      }
+    });
     args.record.outputTail = result.then(
       () => undefined,
       () => undefined,
     );
-    return result;
+    // Preserve prompt cancellation latency while an interaction is still queued
+    // behind prior output; only the inner race owns release of that output tail.
+    return withAbort(result, args.signal);
   }
 
   #projectChildEvent(record: ChildRecord, event: SessionEvent): void {
@@ -2391,16 +2503,11 @@ export class DurableSessionAgent implements AcpAgent {
       throw new Error("invalid DeepSeek question request");
     }
     request.signal?.throwIfAborted();
-    const response = await withAbort(
-      this.#queueInteraction({
-        record,
-        task: () => {
-          request.signal?.throwIfAborted();
-          return this.#connection.extMethod("deepseek/ask_user_question", params);
-        },
-      }),
-      request.signal,
-    );
+    const response = await this.#queueInteraction({
+      record,
+      signal: request.signal,
+      task: () => this.#connection.extMethod("deepseek/ask_user_question", params),
+    });
     if (!validateProtocolValue({ definition: "askUserQuestionResponse", value: response }).valid) {
       throw new Error("invalid DeepSeek question response");
     }

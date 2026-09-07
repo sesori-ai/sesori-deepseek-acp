@@ -26,6 +26,11 @@ async function harness() {
   await mkdir(project);
   const previous = process.env.DSH_HOME;
   process.env.DSH_HOME = home;
+  cleanups.push(async () => {
+    if (previous === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = previous;
+    await rm(dir, { recursive: true, force: true });
+  });
   const context = await bootRuntime({ stateDir: join(dir, "state"), workspaceRoot: project });
   const diagnostics: string[] = [];
   const notifications: Record<string, unknown>[] = [];
@@ -61,9 +66,6 @@ async function harness() {
     input.close();
     await adapter.dispose();
     await context.fiber.dispose();
-    if (previous === undefined) delete process.env.DSH_HOME;
-    else process.env.DSH_HOME = previous;
-    await rm(dir, { recursive: true, force: true });
   });
   async function root() {
     const { sessionId } = await adapter.newSession({ cwd: project, mcpServers: [] });
@@ -104,6 +106,34 @@ async function harness() {
   }
   return { context, adapter, connection, root, stop, launch, child, signals, beforeStep, output, notifications, requests, diagnostics, job };
 }
+
+it("cancels root maintenance while prompt admission is still pending", async () => {
+  const h = await harness();
+  const root = await h.root();
+  const saved = Promise.withResolvers<readonly unknown[]>();
+  const attachments = h.context.get("attachments") as {
+    saveImages(inputs: readonly { data: Uint8Array; mediaType: string }[]): Promise<readonly unknown[]>;
+  };
+  const saveImages = vi.spyOn(attachments, "saveImages").mockReturnValue(saved.promise);
+  let maintenanceSignal!: AbortSignal;
+  const maintenance = root.runMaintenance(async (signal) => {
+    maintenanceSignal = signal;
+    await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+  });
+  await expect.poll(() => maintenanceSignal).toBeDefined();
+  const prompt = h.adapter.prompt({
+    sessionId: String(root.id),
+    prompt: [{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" }],
+  });
+  await expect.poll(() => saveImages).toHaveBeenCalledOnce();
+
+  const stopping = h.stop(root);
+  expect(maintenanceSignal.aborted).toBe(true);
+  await expect(stopping).resolves.toEqual({ workKept: false });
+  saved.resolve([]);
+  await expect(prompt).resolves.toEqual({ stopReason: "cancelled" });
+  await maintenance;
+});
 
 it("signals nested native children before delayed root/child announcements and preserves later work", async () => {
   const h = await harness();

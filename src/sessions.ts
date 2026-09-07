@@ -1938,7 +1938,13 @@ export class DurableSessionAgent implements AcpAgent {
     if (root !== undefined && attempt({
       operation: "deepseek/session/stop root",
       id: target.id,
-      signal: () => this.#cancelRecord(root),
+      signal: () => {
+        const admissionPending = root.inflight !== undefined && !root.inflight.queued;
+        this.#cancelRecord(root);
+        // Prompt admission owns a separate controller. STOP must also cancel
+        // concurrent native maintenance already running on the root agent.
+        if (admissionPending) root.handle.agent.cancel({ kind: "user" }, { keepInbox: false });
+      },
     })) covered.add(target.id);
     for (const child of children) {
       if (continuable.has(child)) {

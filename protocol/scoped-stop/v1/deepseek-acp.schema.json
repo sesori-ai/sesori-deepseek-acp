@@ -3,6 +3,12 @@
   "$id": "https://sesori.ai/protocol/scoped-stop/v1/deepseek-acp.schema.json",
   "title": "DeepSeek scoped stop v1 (additive to extension v2)",
   "$defs": {
+    "sessionId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^(?!.*[\\u0000-\\u001f\\u007f-\\u009f])(?=.*\\S).+$"
+    },
     "sessionStopRequest": {
       "oneOf": [
         {
@@ -17,10 +23,7 @@
               "const": "session"
             },
             "sessionId": {
-              "type": "string",
-              "minLength": 1,
-              "maxLength": 256,
-              "pattern": "^(?!.*[\\u0000-\\u001f\\u007f-\\u009f])(?=.*\\S).+$"
+              "$ref": "#/$defs/sessionId"
             }
           }
         },
@@ -37,16 +40,10 @@
               "const": "child"
             },
             "sessionId": {
-              "type": "string",
-              "minLength": 1,
-              "maxLength": 256,
-              "pattern": "^(?!.*[\\u0000-\\u001f\\u007f-\\u009f])(?=.*\\S).+$"
+              "$ref": "#/$defs/sessionId"
             },
             "childSessionId": {
-              "type": "string",
-              "minLength": 1,
-              "maxLength": 256,
-              "pattern": "^(?!.*[\\u0000-\\u001f\\u007f-\\u009f])(?=.*\\S).+$"
+              "$ref": "#/$defs/sessionId"
             }
           }
         }
@@ -72,10 +69,7 @@
       ],
       "properties": {
         "sessionId": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 256,
-          "pattern": "^(?!.*[\\u0000-\\u001f\\u007f-\\u009f])(?=.*\\S).+$"
+          "$ref": "#/$defs/sessionId"
         }
       }
     },

@@ -1,7 +1,13 @@
 import { Ajv2020, type ErrorObject, type ValidateFunction } from "ajv/dist/2020.js";
 import schema from "../protocol/v2/deepseek-acp.schema.json" with { type: "json" };
 
+import scopedStopSchema from "../protocol/scoped-stop/v1/deepseek-acp.schema.json" with { type: "json" };
+
 export type ProtocolDefinition =
+  | "sessionStopRequest"
+  | "sessionStopResponse"
+  | "inputCancelRequest"
+  | "inputCancelResponse"
   | "initializeMetadata"
   | "promptMetadata"
   | "catalogRequest"
@@ -33,6 +39,10 @@ export type ProtocolValidationResult =
   | { valid: false; errors: ProtocolDiagnostic[] };
 
 const definitions: readonly ProtocolDefinition[] = [
+  "sessionStopRequest",
+  "sessionStopResponse",
+  "inputCancelRequest",
+  "inputCancelResponse",
   "initializeMetadata",
   "promptMetadata",
   "catalogRequest",
@@ -51,8 +61,9 @@ const definitions: readonly ProtocolDefinition[] = [
 const definitionSet = new Set<string>(definitions);
 const ajv = new Ajv2020({ allErrors: true, strict: true });
 ajv.addSchema(schema);
+ajv.addSchema(scopedStopSchema);
 const validators = Object.fromEntries(
-  definitions.map((definition) => [definition, ajv.compile({ $ref: `${schema.$id}#/$defs/${definition}` })]),
+  definitions.map((definition) => [definition, ajv.compile({ $ref: `${definition in scopedStopSchema.$defs ? scopedStopSchema.$id : schema.$id}#/$defs/${definition}` })]),
 ) as Record<ProtocolDefinition, ValidateFunction>;
 
 function diagnostic(args: {

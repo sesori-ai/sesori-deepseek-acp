@@ -2,7 +2,14 @@ import type { AgentSideConnection, SessionNotification } from "@agentclientproto
 import type { Context } from "@deepseek-ai/cordis";
 import type { Agent, AgentHandle } from "@deepseek-ai/dsh-agent";
 import { CommandId } from "@deepseek-ai/dsh-commands";
-import { SessionId, type SessionEvent, type SessionHeader } from "@deepseek-ai/dsh-session";
+import { LlmAttemptId, type StreamChunk } from "@deepseek-ai/dsh-llm";
+import {
+  SESSION_FORMAT_VERSION,
+  SessionId,
+  SessionLogOffset,
+  type SessionEvent,
+  type SessionHeader,
+} from "@deepseek-ai/dsh-session";
 import { describe, expect, it, vi } from "vitest";
 import { DurableSessionAgent } from "../src/sessions.ts";
 import { createMemorySubagentBindingStore, type SubagentBindingStore } from "../src/subagent_bindings.ts";
@@ -15,6 +22,7 @@ interface SessionServices {
   create: ReturnType<typeof vi.fn>;
   resume: ReturnType<typeof vi.fn>;
   flush: ReturnType<typeof vi.fn>;
+  observe: ReturnType<typeof vi.fn>;
   updates: SessionNotification[];
   diagnostics: string[];
   extNotifications: { method: string; params: Record<string, unknown> }[];
@@ -32,10 +40,11 @@ interface SessionServices {
 
 function header(args: { id: string; cwd: string; createdAt?: number }): SessionHeader {
   return {
-    version: 0,
+    version: SESSION_FORMAT_VERSION,
     id: SessionId(args.id),
     cwd: args.cwd,
     createdAt: args.createdAt ?? 1,
+    isSeeded: false,
   };
 }
 
@@ -75,6 +84,29 @@ function events(): SessionEvent[] {
   ] as unknown as SessionEvent[];
 }
 
+function emitAssistantChunk(args: {
+  state: SessionServices;
+  agent: Agent;
+  turn: number;
+  step: number;
+  chunk: StreamChunk;
+  time?: number;
+}): void {
+  const attemptId = LlmAttemptId(`test-attempt-${crypto.randomUUID()}`);
+  args.state.invoke("agent/assistant-stream", {
+    agent: args.agent,
+    frame: { type: "start", attemptId, revision: 1, turn: args.turn, step: args.step },
+  });
+  args.state.invoke("agent/assistant-stream", {
+    agent: args.agent,
+    frame: { type: "chunk", attemptId, revision: 1, index: 0, time: args.time ?? Date.now(), chunk: args.chunk },
+  });
+  args.state.invoke("agent/assistant-stream", {
+    agent: args.agent,
+    frame: { type: "end", attemptId, revision: 1, index: 1, outcome: { kind: "abandoned" } },
+  });
+}
+
 function services(): SessionServices {
   const headers: SessionHeader[] = [];
   const inspections = new Map<string, { meta: SessionHeader; events: readonly SessionEvent[] }>();
@@ -82,11 +114,10 @@ function services(): SessionServices {
   const listeners = new Map<string, ((...args: never[]) => unknown)[]>();
   const contextServices = new Map<string, unknown>();
   let context: Context;
-  let questionProvider: { ask(request: unknown): Promise<unknown> } | undefined;
   const makeHandle = async (
     meta: SessionHeader,
     sessionEvents: readonly SessionEvent[],
-    setup?: (context: Context) => void | Promise<void>,
+    setup?: (context: Context, agent: Agent) => void | Promise<void>,
   ): Promise<AgentHandle> => {
     const storedEvents = [...sessionEvents];
     const agent = {
@@ -94,7 +125,10 @@ function services(): SessionServices {
       session: {
         id: meta.id,
         header: meta,
+        inheritedEventCount: SessionLogOffset(0),
         events: storedEvents,
+        snapshotEvents: () => [...storedEvents],
+        isOwnSeq: () => true,
         requestHeader: () => undefined,
         append: (type: string, data: unknown) => {
           const event = { type, seq: storedEvents.length, time: Date.now(), data } as unknown as SessionEvent;
@@ -112,7 +146,7 @@ function services(): SessionServices {
     };
     const agentContext = Object.assign(Object.create(context), { agent });
     Object.assign(agent, { ctx: agentContext });
-    await setup?.(agentContext as Context);
+    await setup?.(agentContext as Context, agent as unknown as Agent);
     const handle = {
       agent,
       dispose: vi.fn(async () => {
@@ -122,19 +156,44 @@ function services(): SessionServices {
     live.set(String(meta.id), handle);
     return handle;
   };
-  const create = vi.fn(async (options: { sessionId: string; meta: { cwd: string }; setup?: (context: Context) => void }) => {
+  const create = vi.fn(async (options: {
+    sessionId: string;
+    meta: { cwd: string };
+    setup?: (context: Context, agent: Agent) => void;
+  }) => {
     return makeHandle(header({ id: options.sessionId, cwd: options.meta.cwd }), [], options.setup);
   });
-  const resume = vi.fn(async (options: { resumeSessionId: string; setup?: (context: Context) => void }) => {
+  const resume = vi.fn(async (options: {
+    resumeSessionId: string;
+    setup?: (context: Context, agent: Agent) => void;
+  }) => {
     const inspection = inspections.get(options.resumeSessionId);
     if (inspection === undefined) throw new Error("not found");
     return makeHandle(inspection.meta, inspection.events, options.setup);
   });
   const flush = vi.fn(async () => true);
+  const observe = vi.fn(async (id: string) => {
+    const inspection = inspections.get(String(id));
+    const meta = inspection?.meta ?? headers.find((candidate) => candidate.id === id);
+    if (meta === undefined) {
+      throw Object.assign(new Error("session not found"), { code: "SESSION_QUERY_SESSION_NOT_FOUND" });
+    }
+    return {
+      source: "prepared" as const,
+      header: meta,
+      inheritedEventCount: SessionLogOffset(0),
+      events: inspection?.events ?? [],
+      cursor: -1 as const,
+      retain: vi.fn(),
+      [Symbol.dispose]: vi.fn(),
+    };
+  });
   context = {
     on: (name: string, listener: (...args: never[]) => unknown) => {
       listeners.set(name, [...(listeners.get(name) ?? []), listener]);
-      return () => undefined;
+      return () => {
+        listeners.set(name, (listeners.get(name) ?? []).filter((candidate) => candidate !== listener));
+      };
     },
     agents: {
       create,
@@ -158,28 +217,14 @@ function services(): SessionServices {
       },
     },
     sessionPersistence: {
-      list: vi.fn(async () => [...headers]),
-      inspect: vi.fn(async (id: string) => {
-        const inspection = inspections.get(id);
-        if (inspection !== undefined) return inspection;
-        const meta = headers.find((candidate) => candidate.id === id);
-        if (meta === undefined) throw new Error("not found");
-        return { meta, events: [] };
-      }),
+      list: vi.fn(async () => headers.map((header) => ({ header, revision: "synthetic-revision" }))),
     },
+    sessionQuery: { observeSession: observe },
     get: (name: string) => contextServices.get(name) ?? (context as unknown as Record<string, unknown>)[name],
     __emit: (name: string, ...args: unknown[]) => {
       for (const listener of listeners.get(name) ?? []) listener(...(args as never[]));
     },
   } as unknown as Context;
-  contextServices.set("userQuestions", {
-    registerProvider: (provider: { ask(request: unknown): Promise<unknown> }) => {
-      questionProvider = provider;
-      return () => {
-        if (questionProvider === provider) questionProvider = undefined;
-      };
-    },
-  });
   const updates: SessionNotification[] = [];
   const extNotifications: { method: string; params: Record<string, unknown> }[] = [];
   const requestPermission = vi.fn(async () => ({ outcome: { outcome: "cancelled" } }));
@@ -212,6 +257,7 @@ function services(): SessionServices {
     create,
     resume,
     flush,
+    observe,
     updates,
     diagnostics,
     extNotifications,
@@ -222,8 +268,9 @@ function services(): SessionServices {
     invoke: (name, ...args) => listeners.get(name)?.at(-1)?.(...(args as never[])),
     invokeFirst: (name, ...args) => listeners.get(name)?.at(0)?.(...(args as never[])),
     askQuestion: (request) => {
-      if (questionProvider === undefined) throw new Error("question provider is unavailable");
-      return questionProvider.ask(request);
+      const answerer = listeners.get("user-questions/request")?.at(-1);
+      if (answerer === undefined) throw new Error("question provider is unavailable");
+      return Promise.resolve(answerer(request as never, (() => Promise.reject(new Error("no provider"))) as never));
     },
     contextServices,
     bindings,
@@ -361,7 +408,7 @@ describe("durable ACP sessions", () => {
           seq: 0,
           time: index + 1_000,
           data: { title: `Title ${index}`, messageSeqs: [], source: { kind: "user" } },
-        }] as SessionEvent[],
+        }] as unknown as SessionEvent[],
       });
     }
 
@@ -369,7 +416,7 @@ describe("durable ACP sessions", () => {
 
     expect(listed.sessions).toHaveLength(100);
     expect(listed.sessions[0]).not.toHaveProperty("title");
-    expect(state.context.sessionPersistence.inspect).not.toHaveBeenCalled();
+    expect(state.observe).not.toHaveBeenCalled();
     expect(state.resume).not.toHaveBeenCalled();
   });
 
@@ -500,7 +547,7 @@ describe("durable ACP sessions", () => {
     const state = services();
     const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
     const handle = state.live.get(created.sessionId)!;
-    const residentEvents = handle.agent.session.events as SessionEvent[];
+    const residentEvents = (handle.agent.session as unknown as { events: SessionEvent[] }).events;
     residentEvents.push({
       type: "user/message",
       seq: 0,
@@ -996,9 +1043,12 @@ describe("durable ACP sessions", () => {
       _meta: { "sesori.ai/deepseek": { messageId: "caller-message-1" } },
     });
     const emitted = (state.context as unknown as { __emit(name: string, ...args: unknown[]): void }).__emit;
-    emitted("session/event", handle.agent.session, {
-      type: "assistant/chunk",
-      data: { turn: 1, step: 2, chunk: { type: "text-delta", index: 0, text: "live" } },
+    emitAssistantChunk({
+      state,
+      agent: handle.agent,
+      turn: 1,
+      step: 2,
+      chunk: { type: "text-delta", index: 0, text: "live" },
     });
     await expect.poll(() => state.updates.length).toBe(1);
     const liveId = (state.updates[0]!.update as { messageId?: string }).messageId;
@@ -1043,15 +1093,22 @@ describe("durable ACP sessions", () => {
     const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
     const session = state.live.get(created.sessionId)!.agent.session;
 
-    state.invoke("session/event", session, {
-      type: "assistant/chunk",
+    const liveAgent = state.live.get(created.sessionId)!.agent;
+    emitAssistantChunk({
+      state,
+      agent: liveAgent,
+      turn: 1,
+      step: 1,
       time: 100,
-      data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "first" } },
+      chunk: { type: "text-delta", index: 0, text: "first" },
     });
-    state.invoke("session/event", session, {
-      type: "assistant/chunk",
+    emitAssistantChunk({
+      state,
+      agent: liveAgent,
+      turn: 1,
+      step: 1,
       time: 200,
-      data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "later" } },
+      chunk: { type: "text-delta", index: 0, text: "later" },
     });
     await expect.poll(() => state.updates.length).toBe(2);
     const collidingCallId = (state.updates[0]?.update as { messageId?: string } | undefined)?.messageId;
@@ -1086,7 +1143,7 @@ describe("durable ACP sessions", () => {
     ]);
   });
 
-  it("pre-scans replay assistant chunks and keeps tool call creation metadata", async () => {
+  it("reads replay timestamps from durable assistant streams and keeps tool call metadata", async () => {
     const state = services();
     const meta = header({ id: "timestamp-replay", cwd: "/project" });
     state.headers.push(meta);
@@ -1094,38 +1151,8 @@ describe("durable ACP sessions", () => {
       meta,
       events: [
         {
-          type: "assistant/chunk",
-          seq: 0,
-          time: 200,
-          data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "first" } },
-        },
-        {
-          type: "assistant/chunk",
-          seq: 1,
-          time: 100,
-          data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "later" } },
-        },
-        {
-          type: "assistant/chunk",
-          seq: 2,
-          time: 250,
-          data: {
-            turn: 1,
-            step: 1,
-            chunk: {
-              type: "usage",
-              usage: {
-                inputTokens: 10,
-                outputTokens: 4,
-                cacheReadTokens: 2,
-                reasoningTokens: 1,
-              },
-            },
-          },
-        },
-        {
           type: "assistant/message",
-          seq: 3,
+          seq: 0,
           time: 300,
           surfaceOp: "append",
           data: {
@@ -1137,17 +1164,18 @@ describe("durable ACP sessions", () => {
               source: { kind: "model", provider: "synthetic", model: "synthetic" },
               content: [{ type: "text", text: "complete" }],
             },
+            stream: [{ type: "text-chunks", time0: 200, index: 0, dt: [0], texts: ["first", "later"] }],
           },
         },
         {
           type: "tool/call",
-          seq: 4,
+          seq: 1,
           time: 400,
           data: { turn: 1, step: 1, callId: "call-1", name: "edit", arguments: "{}" },
         },
         {
           type: "tool/result",
-          seq: 5,
+          seq: 2,
           time: 500,
           surfaceOp: "append",
           data: {
@@ -1162,26 +1190,8 @@ describe("durable ACP sessions", () => {
           },
         },
         {
-          type: "assistant/chunk",
-          seq: 6,
-          time: 600,
-          data: {
-            turn: 2,
-            step: 1,
-            chunk: {
-              type: "usage",
-              usage: {
-                inputTokens: 10,
-                outputTokens: 4,
-                cacheReadTokens: 2,
-                reasoningTokens: 1,
-              },
-            },
-          },
-        },
-        {
           type: "assistant/message",
-          seq: 7,
+          seq: 3,
           time: 700,
           surfaceOp: "append",
           data: {
@@ -1193,6 +1203,7 @@ describe("durable ACP sessions", () => {
               source: { kind: "model", provider: "synthetic", model: "synthetic" },
               content: [{ type: "text", text: "non-streamed" }],
             },
+            stream: [],
           },
         },
       ] as unknown as SessionEvent[],
@@ -1219,19 +1230,18 @@ describe("durable ACP sessions", () => {
     });
     await expect.poll(() => vi.mocked(handle.agent.followup).mock.calls.length).toBe(1);
 
-    state.invoke("session/event", handle.agent.session, {
-      type: "assistant/chunk",
-      data: {
-        turn: 1,
-        step: 1,
-        chunk: {
-          type: "usage",
-          usage: {
-            inputTokens: 10,
-            outputTokens: 4,
-            cacheReadTokens: 2,
-            reasoningTokens: 1,
-          },
+    emitAssistantChunk({
+      state,
+      agent: handle.agent,
+      turn: 1,
+      step: 1,
+      chunk: {
+        type: "usage",
+        usage: {
+          inputTokens: 10,
+          outputTokens: 4,
+          cacheReadTokens: 2,
+          reasoningTokens: 1,
         },
       },
     });
@@ -1622,13 +1632,13 @@ describe("durable ACP sessions", () => {
       value: "unknown",
     });
     await Promise.resolve();
-    const inspection = Promise.withResolvers<{ meta: SessionHeader; events: readonly SessionEvent[] }>();
-    vi.mocked(state.context.sessionPersistence.inspect).mockReturnValueOnce(inspection.promise);
+    const replayOutput = Promise.withResolvers<void>();
+    state.sessionUpdate.mockImplementationOnce(() => replayOutput.promise);
     const loading = state.agent.loadSession({ sessionId: created.sessionId, cwd: "/project", mcpServers: [] });
     lookup.resolve([]);
 
     await expect(changing).rejects.toThrow("session load is in progress");
-    inspection.resolve({ meta: header({ id: created.sessionId, cwd: "/project" }), events: [] });
+    replayOutput.resolve();
     await loading;
   });
 
@@ -1849,18 +1859,34 @@ describe("durable ACP sessions", () => {
     const meta = header({ id: "rename-inspecting", cwd: "/project" });
     state.headers.push(meta);
     state.inspections.set("rename-inspecting", { meta, events: [] });
-    const inspection = Promise.withResolvers<{ meta: SessionHeader; events: readonly SessionEvent[] }>();
-    vi.mocked(state.context.sessionPersistence.inspect).mockReturnValueOnce(inspection.promise);
+    const inspection = Promise.withResolvers<{
+      source: "prepared";
+      header: SessionHeader;
+      inheritedEventCount: ReturnType<typeof SessionLogOffset>;
+      events: readonly SessionEvent[];
+      cursor: -1;
+      retain: ReturnType<typeof vi.fn>;
+      [Symbol.dispose]: ReturnType<typeof vi.fn>;
+    }>();
+    state.observe.mockReturnValueOnce(inspection.promise);
     const renaming = state.agent.extMethod("deepseek/session/rename", {
       sessionId: "rename-inspecting",
       title: "Cold title",
     });
-    await expect.poll(() => vi.mocked(state.context.sessionPersistence.inspect).mock.calls.length).toBe(1);
+    await expect.poll(() => state.observe.mock.calls.length).toBe(1);
 
     await expect(
       state.agent.prompt({ sessionId: "rename-inspecting", prompt: [{ type: "text", text: "question" }] }),
     ).rejects.toThrow("session load is in progress");
-    inspection.resolve({ meta, events: [] });
+    inspection.resolve({
+      source: "prepared",
+      header: meta,
+      inheritedEventCount: SessionLogOffset(0),
+      events: [],
+      cursor: -1,
+      retain: vi.fn(),
+      [Symbol.dispose]: vi.fn(),
+    });
     await expect(renaming).resolves.toEqual({ title: "Cold title" });
   });
 
@@ -1869,7 +1895,7 @@ describe("durable ACP sessions", () => {
     const meta = header({ id: "rename-retry", cwd: "/project" });
     state.headers.push(meta);
     state.inspections.set("rename-retry", { meta, events: [] });
-    vi.mocked(state.context.sessionPersistence.inspect).mockRejectedValueOnce(new Error("synthetic inspect failure"));
+    state.observe.mockRejectedValueOnce(new Error("synthetic inspect failure"));
 
     await expect(
       state.agent.extMethod("deepseek/session/rename", { sessionId: "rename-retry", title: "First" }),
@@ -1881,9 +1907,6 @@ describe("durable ACP sessions", () => {
 
   it("validates cold rename persistence before resuming", async () => {
     const state = services();
-    const meta = header({ id: "unlisted-rename", cwd: "/project" });
-    state.inspections.set("unlisted-rename", { meta, events: [] });
-
     await expect(
       state.agent.extMethod("deepseek/session/rename", {
         sessionId: "unlisted-rename",
@@ -1919,9 +1942,12 @@ describe("durable ACP sessions", () => {
       prompt: [{ type: "text", text: "question" }],
     });
     await expect.poll(() => vi.mocked(handle.agent.followup).mock.calls.length).toBe(1);
-    state.invoke("session/event", handle.agent.session, {
-      type: "assistant/chunk",
-      data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "answer" } },
+    emitAssistantChunk({
+      state,
+      agent: handle.agent,
+      turn: 1,
+      step: 1,
+      chunk: { type: "text-delta", index: 0, text: "answer" },
     });
     state.invoke("session/event", handle.agent.session, {
       type: "session/title",
@@ -2025,13 +2051,19 @@ describe("durable ACP sessions", () => {
     await expect.poll(() => vi.mocked(handle.agent.followup).mock.calls.length).toBe(1);
     state.sessionUpdate.mockRejectedValueOnce(new Error("synthetic output failure"));
 
-    emitted("session/event", handle.agent.session, {
-      type: "assistant/chunk",
-      data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "first" } },
+    emitAssistantChunk({
+      state,
+      agent: handle.agent,
+      turn: 1,
+      step: 1,
+      chunk: { type: "text-delta", index: 0, text: "first" },
     });
-    emitted("session/event", handle.agent.session, {
-      type: "assistant/chunk",
-      data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "second" } },
+    emitAssistantChunk({
+      state,
+      agent: handle.agent,
+      turn: 1,
+      step: 1,
+      chunk: { type: "text-delta", index: 0, text: "second" },
     });
     emitted("session/event", handle.agent.session, {
       type: "turn/end",
@@ -2306,9 +2338,12 @@ describe("durable ACP sessions", () => {
       state.updates.push(notification);
       await output.promise;
     });
-    state.invoke("session/event", handle.agent.session, {
-      type: "assistant/chunk",
-      data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "Context first" } },
+    emitAssistantChunk({
+      state,
+      agent: handle.agent,
+      turn: 1,
+      step: 1,
+      chunk: { type: "text-delta", index: 0, text: "Context first" },
     });
     await expect.poll(() => state.sessionUpdate.mock.calls.length).toBe(1);
     state.extensionRequest.mockResolvedValueOnce({
@@ -2452,9 +2487,12 @@ describe("durable ACP sessions", () => {
       prompt: [{ type: "text", text: "question" }],
     });
     await expect.poll(() => vi.mocked(handle.agent.followup).mock.calls.length).toBe(1);
-    state.invoke("session/event", handle.agent.session, {
-      type: "assistant/chunk",
-      data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "pending" } },
+    emitAssistantChunk({
+      state,
+      agent: handle.agent,
+      turn: 1,
+      step: 1,
+      chunk: { type: "text-delta", index: 0, text: "pending" },
     });
     await expect.poll(() => state.sessionUpdate.mock.calls.length).toBe(1);
     let closeCompleted = false;
@@ -2670,9 +2708,12 @@ describe("sub-agent lifecycle", () => {
     subagentCall(state, root, call);
     await executeDelegation(state, root, call, () => {
       state.invoke("subagent/start", { runId: "run-1", provider: "spawn", id: child.agent.id, local: true });
-      state.invoke("session/event", child.agent.session, {
-        type: "assistant/chunk",
-        data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "child text" } },
+      emitAssistantChunk({
+        state,
+        agent: child.agent,
+        turn: 1,
+        step: 1,
+        chunk: { type: "text-delta", index: 0, text: "child text" },
       });
       state.invoke("subagent/end", {
         runId: "run-1",
@@ -2882,9 +2923,12 @@ describe("sub-agent lifecycle", () => {
 
     await executeDelegation(state, root, call, () => {
       state.invoke("subagent/start", { runId: "run-ordered", provider: "spawn", id: child.agent.id, local: true });
-      state.invoke("session/event", child.agent.session, {
-        type: "assistant/chunk",
-        data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "child text" } },
+      emitAssistantChunk({
+        state,
+        agent: child.agent,
+        turn: 1,
+        step: 1,
+        chunk: { type: "text-delta", index: 0, text: "child text" },
       });
     });
     await expect.poll(() => state.extNotification.mock.calls.length).toBe(1);
@@ -2904,9 +2948,12 @@ describe("sub-agent lifecycle", () => {
       state.updates.push(notification);
       await adoptedOutput.promise;
     });
-    state.invoke("session/event", child.agent.session, {
-      type: "assistant/chunk",
-      data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "early text" } },
+    emitAssistantChunk({
+      state,
+      agent: child.agent,
+      turn: 1,
+      step: 1,
+      chunk: { type: "text-delta", index: 0, text: "early text" },
     });
     await expect.poll(() => state.sessionUpdate.mock.calls.length).toBe(1);
     const call = {
@@ -2971,7 +3018,7 @@ describe("sub-agent lifecycle", () => {
         },
       },
     } as unknown as SessionEvent;
-    (child.agent.session.events as SessionEvent[]).push(residentEvent);
+    (child.agent.session as unknown as { events: SessionEvent[] }).events.push(residentEvent);
     state.invoke("session/event", child.agent.session, residentEvent);
 
     const response = await state.agent.extMethod("deepseek/session/history", { sessionId: "child-history" });
@@ -3002,7 +3049,7 @@ describe("sub-agent lifecycle", () => {
         },
       },
     } as unknown as SessionEvent;
-    (child.agent.session.events as SessionEvent[]).push(residentEvent);
+    (child.agent.session as unknown as { events: SessionEvent[] }).events.push(residentEvent);
     state.invoke("session/event", child.agent.session, residentEvent);
     const flushed = Promise.withResolvers<boolean>();
     state.flush.mockReturnValueOnce(flushed.promise);
@@ -3040,9 +3087,12 @@ describe("sub-agent lifecycle", () => {
       state.updates.push(notification);
       await childOutput.promise;
     });
-    state.invoke("session/event", child.agent.session, {
-      type: "assistant/chunk",
-      data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "pending" } },
+    emitAssistantChunk({
+      state,
+      agent: child.agent,
+      turn: 1,
+      step: 1,
+      chunk: { type: "text-delta", index: 0, text: "pending" },
     });
     await expect.poll(() => state.sessionUpdate.mock.calls.length).toBe(2);
     let closeCompleted = false;
@@ -3072,9 +3122,12 @@ describe("sub-agent lifecycle", () => {
       state.updates.push(notification);
       await nestedOutput.promise;
     });
-    state.invoke("session/event", grandchild.agent.session, {
-      type: "assistant/chunk",
-      data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "pending" } },
+    emitAssistantChunk({
+      state,
+      agent: grandchild.agent,
+      turn: 1,
+      step: 1,
+      chunk: { type: "text-delta", index: 0, text: "pending" },
     });
     await expect.poll(() => state.sessionUpdate.mock.calls.length).toBe(1);
     let closeCompleted = false;
@@ -3152,9 +3205,12 @@ describe("sub-agent lifecycle", () => {
     const state = services();
     const { child } = await rootWithChild(state, "child-resumed");
     state.invoke("subagent/start", { runId: "run-2", provider: "spawn", id: child.agent.id, local: true });
-    state.invoke("session/event", child.agent.session, {
-      type: "assistant/chunk",
-      data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "resumed text" } },
+    emitAssistantChunk({
+      state,
+      agent: child.agent,
+      turn: 1,
+      step: 1,
+      chunk: { type: "text-delta", index: 0, text: "resumed text" },
     });
     state.invoke("subagent/end", {
       runId: "run-2",
@@ -3176,9 +3232,12 @@ describe("sub-agent lifecycle", () => {
     const { root, child } = await rootWithChild(state, "child-quiet");
     const grandchild = await state.context.agents.create({ sessionId: SessionId("grandchild-quiet"), meta: { cwd: "/project" } });
     (grandchild.agent.session.header as { parentSession?: SessionId }).parentSession = child.agent.id;
-    state.invoke("session/event", grandchild.agent.session, {
-      type: "assistant/chunk",
-      data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "deep text" } },
+    emitAssistantChunk({
+      state,
+      agent: grandchild.agent,
+      turn: 1,
+      step: 1,
+      chunk: { type: "text-delta", index: 0, text: "deep text" },
     });
     await expect.poll(() => state.updates.length).toBe(1);
 
@@ -3202,9 +3261,12 @@ describe("sub-agent lifecycle", () => {
     }
     if (deepest === undefined) throw new Error("test hierarchy was not created");
 
-    state.invoke("session/event", deepest.session, {
-      type: "assistant/chunk",
-      data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "deep text" } },
+    emitAssistantChunk({
+      state,
+      agent: deepest,
+      turn: 1,
+      step: 1,
+      chunk: { type: "text-delta", index: 0, text: "deep text" },
     });
     await expect.poll(() => state.updates.length).toBe(1);
 
@@ -3219,9 +3281,12 @@ describe("sub-agent lifecycle", () => {
     (first.agent.session.header as { parentSession?: SessionId }).parentSession = second.agent.id;
     (second.agent.session.header as { parentSession?: SessionId }).parentSession = first.agent.id;
 
-    state.invoke("session/event", first.agent.session, {
-      type: "assistant/chunk",
-      data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "dropped" } },
+    emitAssistantChunk({
+      state,
+      agent: first.agent,
+      turn: 1,
+      step: 1,
+      chunk: { type: "text-delta", index: 0, text: "dropped" },
     });
 
     expect(state.updates).toEqual([]);
@@ -3232,9 +3297,12 @@ describe("sub-agent lifecycle", () => {
     const foreign = await state.context.agents.create({ sessionId: SessionId("foreign-child"), meta: { cwd: "/project" } });
     (foreign.agent.session.header as { parentSession?: SessionId }).parentSession = SessionId("foreign-root");
     state.invoke("subagent/start", { runId: "run-3", provider: "spawn", id: foreign.agent.id, local: true });
-    state.invoke("session/event", foreign.agent.session, {
-      type: "assistant/chunk",
-      data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 0, text: "dropped" } },
+    emitAssistantChunk({
+      state,
+      agent: foreign.agent,
+      turn: 1,
+      step: 1,
+      chunk: { type: "text-delta", index: 0, text: "dropped" },
     });
     state.invoke("subagent/end", { runId: "run-3", provider: "spawn", id: foreign.agent.id, local: true, stopReason: "completed" });
     await new Promise((resolve) => setTimeout(resolve, 0));

@@ -1,10 +1,18 @@
-import { cp, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { PassThrough } from "node:stream";
+import { zstdCompressSync } from "node:zlib";
 import { PROTOCOL_VERSION, type AgentSideConnection, type SessionNotification } from "@agentclientprotocol/sdk";
 import { defaultDshHome, resolveDshHome } from "@deepseek-ai/dsh-home-paths";
-import { SESSION_FORMAT_VERSION, SessionId, type SessionEvent } from "@deepseek-ai/dsh-session";
+import {
+  SESSION_FORMAT_VERSION,
+  Session,
+  SessionId,
+  SessionLogOffset,
+  type SessionEvent,
+  type SessionHeader,
+} from "@deepseek-ai/dsh-session";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   bootRuntime,
@@ -23,6 +31,24 @@ async function tempRoot(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "sesori-deepseek-runtime-"));
   roots.push(root);
   return root;
+}
+
+function projectStorageKey(path: string): string {
+  let readable = "";
+  let separatorRun = false;
+  for (const character of path) {
+    if (character === "/" || character === "\\" || character === ":") {
+      if (!separatorRun) readable += "-";
+      separatorRun = true;
+    } else if (character !== "~" && /^[A-Za-z0-9._-]$/u.test(character)) {
+      readable += character;
+      separatorRun = false;
+    } else {
+      readable += `~${character.charCodeAt(0).toString(16).toUpperCase().padStart(4, "0")}`;
+      separatorRun = false;
+    }
+  }
+  return `--${(readable.replace(/^-+/u, "") || "root").slice(0, 251)}--`;
 }
 
 afterEach(async () => {
@@ -48,6 +74,7 @@ describe("DeepSeek runtime composition", () => {
       sessions: join(stateDir, "sessions"),
       attachmentsHome: join(stateDir, "attachments-home"),
       queryDatabase: join(stateDir, "query", "sessions.sqlite"),
+      storages: join(stateDir, "storages"),
       spills: join(stateDir, "spills"),
     });
     expect(entries.get("session-telemetry-otel")?.disabled).toBe(true);
@@ -61,6 +88,10 @@ describe("DeepSeek runtime composition", () => {
       name: "@deepseek-ai/dsh-tool-ask-user",
     });
     expect(entries.get("tool-ask-user")?.disabled).not.toBe(true);
+    expect(entries.get("web")?.disabled).not.toBe(true);
+    expect(entries.get("web-search-deepseek")?.disabled).not.toBe(true);
+    expect(entries.get("web-fetch-http")?.disabled).not.toBe(true);
+    expect(entries.get("tool-web")?.disabled).not.toBe(true);
     expect(entries.get("settings")?.config).toBeUndefined();
     expect(entries.get("credentials")?.config).toBeUndefined();
     expect([...entries.values()].some((entry) => entry.name === "@deepseek-ai/dsh-acp")).toBe(
@@ -122,12 +153,14 @@ describe("DeepSeek runtime composition", () => {
       const approval = context.get("approval") as { config: { policy?: string } };
       const persistence = context.get("sessionPersistence") as unknown as { root: string };
       const attachments = context.get("attachments") as unknown as { root: string };
-      const query = context.get("sessionQuery") as { config: { path: string; openAt: string } };
+      const query = context.get("sessionQuery") as unknown as { config: { path: string; openAt: string } };
       const spills = context.get("spillStore") as { root: string };
 
       expect(context.get("sessions")).toBeDefined();
       const tools = context.get("tools") as { schemas(): { name: string }[] };
       expect(tools.schemas()).toContainEqual(expect.objectContaining({ name: "ask_user_question" }));
+      expect(tools.schemas()).toContainEqual(expect.objectContaining({ name: "web_search" }));
+      expect(tools.schemas()).toContainEqual(expect.objectContaining({ name: "web_fetch" }));
       expect(persistence.root).toBe(join(stateDir, "sessions"));
       const attachmentRelativePath = relative(join(stateDir, "attachments-home"), attachments.root);
       expect(isAbsolute(attachmentRelativePath)).toBe(false);
@@ -146,11 +179,19 @@ describe("DeepSeek runtime composition", () => {
         value: "synthetic-key",
       });
       expect(sandboxPolicy.defaultMode).toBe("workspace-write");
-      expect(
-        sandboxPolicy.resolve({
-          session: { id: "synthetic-session", events: [], header: { cwd: projectB } },
-        }).workspaceRoot,
-      ).toBe(await realpath(projectB));
+      const sandboxSession = Session.create(
+        SessionId("synthetic-session"),
+        [],
+        {
+          version: SESSION_FORMAT_VERSION,
+          id: SessionId("synthetic-session"),
+          createdAt: 1,
+          cwd: projectB,
+          isSeeded: false,
+        },
+        SessionLogOffset(0),
+      );
+      expect(sandboxPolicy.resolve({ session: sandboxSession }).workspaceRoot).toBe(await realpath(projectB));
       expect(approval.config.policy).toBe("ask");
     } finally {
       await context?.fiber.dispose();
@@ -159,6 +200,88 @@ describe("DeepSeek runtime composition", () => {
 
     expect(await readdir(home)).toEqual(before);
     await expect(readFile(join(home, "settings.yaml"), "utf8")).resolves.toBe(settingsBefore);
+  });
+
+  it("exposes and requests canonical DeepSeek Flash metadata without catalog network I/O", async () => {
+    const root = await tempRoot();
+    const home = join(root, "home");
+    const stateDir = join(root, "state");
+    const project = join(root, "project");
+    await cp(new URL("./fixtures/dsh-home", import.meta.url), home, { recursive: true });
+    await mkdir(project);
+    process.env.DSH_HOME = home;
+    delete process.env.DEEPSEEK_API_KEY;
+
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("network disabled"));
+    const context = await bootRuntime({ stateDir, workspaceRoot: project });
+    const requests: { provider: string; model: string; reasoningEffort?: string }[] = [];
+    const stopStream = context.on("llm/stream", (options) => {
+      requests.push({
+        provider: options.provider,
+        model: options.model,
+        ...(options.reasoningEffort === undefined ? {} : { reasoningEffort: String(options.reasoningEffort) }),
+      });
+      return (async function* () {
+        yield { type: "block-start" as const, index: 0, blockType: "text" as const };
+        yield { type: "text-delta" as const, index: 0, text: "synthetic answer" };
+        yield { type: "block-end" as const, index: 0, block: { type: "text" as const, text: "synthetic answer" } };
+        yield { type: "finish" as const, reason: { kind: "stop" as const } };
+      })();
+    });
+    const connection = {
+      sessionUpdate: vi.fn(async () => undefined),
+      extMethod: vi.fn(async () => ({})),
+      extNotification: vi.fn(async () => undefined),
+    } as unknown as AgentSideConnection;
+    const adapter = new DurableSessionAgent({
+      context,
+      connection,
+      diagnostics: { write: () => undefined },
+      bindings: createMemorySubagentBindingStore(),
+    });
+    try {
+      const fresh = await adapter.extMethod("deepseek/catalog", { cwd: project });
+      const refreshed = await adapter.extMethod("deepseek/catalog", { cwd: project });
+      expect(fetchSpy).not.toHaveBeenCalled();
+      for (const catalog of [fresh, refreshed]) {
+        expect(catalog).toMatchObject({
+          defaultSelectionId: expect.any(String),
+          providers: [
+            expect.objectContaining({
+              id: "deepseek-official",
+              models: expect.arrayContaining([
+                expect.objectContaining({
+                  upstreamModelId: "deepseek-flash",
+                  name: "DeepSeek-V41-Flash",
+                  reasoningEfforts: ["off", "low", "high", "max"],
+                  defaultReasoningEffort: "high",
+                  supportsImages: true,
+                }),
+              ]),
+            }),
+          ],
+        });
+      }
+      const created = await adapter.newSession({ cwd: project, mcpServers: [] });
+      expect(created.configOptions?.[0]).toMatchObject({
+        id: "deepseek.model",
+        currentValue: (fresh.defaultSelectionId as string),
+      });
+      await expect(adapter.prompt({
+        sessionId: created.sessionId,
+        prompt: [{ type: "text", text: "synthetic prompt" }],
+      })).resolves.toMatchObject({ stopReason: "end_turn" });
+      expect(requests.find((request) => request.model === "deepseek-flash")).toEqual({
+        provider: "deepseek-official",
+        model: "deepseek-flash",
+        reasoningEffort: "high",
+      });
+    } finally {
+      stopStream();
+      await adapter.dispose();
+      await context.fiber.dispose();
+      fetchSpy.mockRestore();
+    }
   });
 
   it("boots without credentials and does not make a model request", async () => {
@@ -172,6 +295,124 @@ describe("DeepSeek runtime composition", () => {
         resolve(ref: string): Promise<unknown>;
       };
       await expect(credentials.resolve("DEEPSEEK_API_KEY")).resolves.toBeUndefined();
+    } finally {
+      await context.fiber.dispose();
+    }
+  });
+
+  it("natively migrates released v0 seeded sessions without rewriting source bytes", async () => {
+    const root = await tempRoot();
+    const stateDir = join(root, "state");
+    const project = join(root, "project");
+    const childId = SessionId("released-v0-seeded-child");
+    const parentId = SessionId("released-v0-parent");
+    await mkdir(project);
+    process.env.DSH_HOME = join(root, "home");
+    delete process.env.DEEPSEEK_API_KEY;
+
+    const legacyDir = join(stateDir, "sessions", projectStorageKey(project), String(childId));
+    const legacyPath = join(legacyDir, "session.jsonl.zstd");
+    await mkdir(legacyDir, { recursive: true });
+    const legacyHeader = {
+      type: "session",
+      version: 0,
+      id: String(childId),
+      createdAt: 2,
+      cwd: project,
+      parentSession: String(parentId),
+      seedLength: 6,
+      delegationDepth: 0,
+    };
+    const legacyEvents = [
+      { type: "turn/start", seq: 0, time: 10, data: { turn: 1 } },
+      { type: "step/start", seq: 1, time: 11, data: { turn: 1, step: 1 } },
+      {
+        type: "request/header",
+        seq: 2,
+        time: 12,
+        data: {
+          header: {
+            config: { provider: "deepseek-official", model: "deepseek-chat" },
+            system: "Legacy system prompt",
+          },
+          reason: "initial",
+        },
+      },
+      {
+        type: "user/message",
+        seq: 3,
+        time: 13,
+        surfaceOp: "append",
+        data: {
+          id: "legacy-user",
+          role: "user",
+          source: { kind: "user" },
+          content: [{ type: "text", text: "inherited prompt" }],
+        },
+      },
+      { type: "step/end", seq: 4, time: 14, data: { turn: 1, step: 1 } },
+      { type: "turn/end", seq: 5, time: 15, data: { turn: 1, reason: { kind: "completed" } } },
+      {
+        type: "session/title",
+        seq: 6,
+        time: 20,
+        data: { title: "Legacy seeded session", messageSeqs: [], source: { kind: "user" } },
+      },
+    ];
+    const legacyBytes = Buffer.concat([
+      zstdCompressSync(`${JSON.stringify(legacyHeader)}\n`, { params: { 201: 1 } }),
+      zstdCompressSync(`${legacyEvents.map((event) => JSON.stringify(event)).join("\n")}\n`, { params: { 201: 1 } }),
+    ]);
+    await writeFile(legacyPath, legacyBytes);
+
+    const context = await bootRuntime({ stateDir, workspaceRoot: project });
+    try {
+      const parent = await context.sessionPersistence.create({
+        version: SESSION_FORMAT_VERSION,
+        id: parentId,
+        createdAt: 1,
+        cwd: project,
+        isSeeded: false,
+      });
+      await parent.flush();
+      await parent.close();
+
+      const query = context.get("sessionQuery") as unknown as {
+        listSessions(): Promise<{ header: SessionHeader }[]>;
+        observeSession(id: SessionId, options: { projectionMode: "none" }): Promise<{
+          header: SessionHeader;
+          inheritedEventCount: number;
+          events: readonly SessionEvent[];
+          [Symbol.dispose](): void;
+        }>;
+        traceSession(id: SessionId): Promise<unknown>;
+      };
+      const listed = await query.listSessions();
+      expect(listed.map((record) => record.header.id)).toEqual([childId, parentId]);
+      const childRecord = listed.find((record) => record.header.id === childId);
+      expect(childRecord?.header).toMatchObject({ parentSession: parentId, isSeeded: true });
+
+      const observation = await query.observeSession(childId, { projectionMode: "none" });
+      try {
+        expect(observation.header).toMatchObject({
+          version: SESSION_FORMAT_VERSION,
+          id: childId,
+          parentSession: parentId,
+          isSeeded: true,
+        });
+        expect(observation.inheritedEventCount).toBe(8);
+        expect(observation.events.map((event) => event.type)).toContain("session/title");
+      } finally {
+        observation[Symbol.dispose]();
+      }
+      const lineage = await query.traceSession(childId);
+      expect(lineage).toMatchObject({ complete: true, root: { header: { id: parentId } } });
+      await expect(readFile(legacyPath)).resolves.toEqual(legacyBytes);
+
+      const resumed = await context.agents.resume({ resumeSessionId: childId });
+      await resumed.dispose();
+      await expect(readFile(join(legacyDir, "session.v3.jsonl.zstd"))).resolves.not.toHaveLength(0);
+      await expect(readFile(legacyPath)).resolves.toEqual(legacyBytes);
     } finally {
       await context.fiber.dispose();
     }
@@ -203,13 +444,16 @@ describe("DeepSeek runtime composition", () => {
     ] as unknown as SessionEvent[];
 
     const first = await bootRuntime({ stateDir });
-    await first.sessionPersistence.create({
+    const storage = await first.sessionPersistence.create({
       version: SESSION_FORMAT_VERSION,
       id: sessionId,
       createdAt: 1,
       cwd: project,
+      isSeeded: false,
     });
-    await first.sessionPersistence.append(sessionId, sessionEvents);
+    await storage.append(sessionEvents);
+    await storage.flush();
+    await storage.close();
     await first.fiber.dispose();
 
     const second = await bootRuntime({ stateDir });
@@ -291,7 +535,7 @@ describe("DeepSeek runtime composition", () => {
         expect.objectContaining({ sessionId: String(sessionId) }),
       );
       await agent.closeSession({ sessionId: String(sessionId) });
-      expect((await second.sessionPersistence.list()).map((item) => item.id)).toContain(sessionId);
+      expect((await second.sessionPersistence.list()).map((item) => item.header.id)).toContain(sessionId);
       expect(diagnostics).toEqual([]);
     } finally {
       await agent.dispose();

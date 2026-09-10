@@ -33,6 +33,7 @@ export interface RuntimePaths {
   sessions: string;
   attachmentsHome: string;
   queryDatabase: string;
+  storages: string;
   spills: string;
 }
 
@@ -48,6 +49,7 @@ function statePaths(args: { stateDir: string }): RuntimePaths {
     sessions: join(args.stateDir, "sessions"),
     attachmentsHome: join(args.stateDir, "attachments-home"),
     queryDatabase: join(args.stateDir, "query", "sessions.sqlite"),
+    storages: join(args.stateDir, "storages"),
     spills: join(args.stateDir, "spills"),
   };
 }
@@ -60,6 +62,7 @@ function adapterPatches(args: { paths: RuntimePaths; workspaceRoot: string }): P
       id: "session-query-sqlite",
       config: { path: args.paths.queryDatabase, openAt: "never" },
     },
+    { id: "storage-json", config: { root: args.paths.storages } },
     { id: "spill-local", config: { root: args.paths.spills } },
     { id: "session-telemetry-otel", disabled: true },
     { id: "hmr", disabled: true },
@@ -129,6 +132,7 @@ function assertComposition(args: {
     id: "session-query-sqlite",
     config: { path: args.paths.queryDatabase, openAt: "never" },
   });
+  assertEntry({ entries: args.entries, id: "storage-json", config: { root: args.paths.storages } });
   assertEntry({ entries: args.entries, id: "spill-local", config: { root: args.paths.spills } });
   assertEntry({ entries: args.entries, id: "session-telemetry-otel", disabled: true });
   assertEntry({ entries: args.entries, id: "hmr", disabled: true });
@@ -142,12 +146,11 @@ function assertComposition(args: {
 
   const forbidden = args.entries.find((entry) => {
     const name = entry.name ?? "";
-    return (
+    return entry.disabled !== true && (
       name === "@deepseek-ai/dsh-acp" ||
       name.startsWith("@deepseek-ai/dsh-host-") ||
       name.includes("frontend-static") ||
       name.includes("webserver") ||
-      name.includes("web-fetch-http") ||
       name.includes("console-logger")
     );
   });

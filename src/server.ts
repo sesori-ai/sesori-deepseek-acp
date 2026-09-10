@@ -121,7 +121,7 @@ export async function serveStdio(args: {
           return;
         }
         transportFiber = bootContext.inject(
-          [RUNTIME_READY_KEY, "agents", "sessionPersistence"],
+          [RUNTIME_READY_KEY, "agents", "sessionPersistence", "subagents"],
           (transportContext) => {
             server = startAcpServer({
               stream,

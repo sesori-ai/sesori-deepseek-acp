@@ -3,8 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AgentSideConnection } from "@agentclientprotocol/sdk";
 import type { Agent, CreateAgentOptions } from "@deepseek-ai/dsh-agent";
-import { CallId, createUserMessage } from "@deepseek-ai/dsh-llm";
-import { SessionId } from "@deepseek-ai/dsh-session";
+import { createUserMessage, ToolCallId } from "@deepseek-ai/dsh-llm";
+import { SessionId, SessionLogOffset, SessionSeq } from "@deepseek-ai/dsh-session";
 import type { JobKind, JobOutcome } from "@deepseek-ai/dsh-jobs";
 import type {} from "@deepseek-ai/dsh-user-questions";
 import { afterEach, expect, it, vi } from "vitest";
@@ -81,7 +81,7 @@ async function harness() {
       nativeScopes.add(args.parent);
     }
     return context.tools.execute({
-    agent: args.parent, signal: args.signal, callId: CallId(crypto.randomUUID()),
+    agent: args.parent, signal: args.signal, callId: ToolCallId(crypto.randomUUID()),
     name: args.fork ? "subagent_fork" : "subagent",
     arguments: { description: "child", prompt: "wait", run_in_background: !args.foreground },
     });
@@ -141,13 +141,13 @@ it("signals nested native children before delayed root/child announcements and p
   const child = await h.child({ parent: root, signal: new AbortController().signal });
   const grandchild = await h.child({ parent: child, signal: h.signals.get(child)! });
   child.followup(createUserMessage({ source: { kind: "user" }, content: [{ type: "text", text: "old queued" }] }));
-  expect(child.inbox.hasPending).toBe(true);
+  expect(child.inbox.nextTurn.length + child.inbox.nextStep.length).toBeGreaterThan(0);
   expect(h.notifications).toEqual([]);
   const stopping = h.stop(root);
   // No microtask, output ACK, idle wait, or disposal has run since dispatch.
   expect(h.signals.get(child)!.aborted).toBe(true);
   expect(h.signals.get(grandchild)!.aborted).toBe(true);
-  expect(child.inbox.hasPending).toBe(false);
+  expect(child.inbox.nextTurn.length + child.inbox.nextStep.length).toBe(0);
   await expect(stopping).resolves.toEqual({ workKept: false });
   const later = await h.child({ parent: root, signal: new AbortController().signal });
   expect(h.signals.get(later)!.aborted).toBe(false);
@@ -270,14 +270,17 @@ for (const identity of ["missing", "inherited", "own", "wrong-origin"] as const)
       sessionId: SessionId(crypto.randomUUID()),
       meta: { cwd: root.session.header.cwd!, parentSession: root.id,
         ...(identity === "wrong-origin" ? {} : { origin: "subagent" as const }),
-        ...(inherited ? { seedLength: 1 } : {}) },
-      ...(inherited ? { seed: [{ type: "subagent/descriptor" as const, seq: 0, time: 1,
-        data: { version: 2 as const, mode: "continuable" as const, provider: "spawn", label: "ancestor" } }] } : {}),
+        ...(inherited ? { isSeeded: true } : {}) },
+      ...(inherited ? {
+        inheritedEventCount: SessionLogOffset(1),
+        seed: [{ type: "subagent/descriptor" as const, seq: SessionSeq(0), time: 1,
+          data: { version: 3 as const, mode: "continuable" as const, provider: "spawn", label: "ancestor" } }],
+      } : {}),
     });
     cleanups.push(() => handle.dispose());
     const child = handle.agent;
     if (identity === "own" || identity === "wrong-origin") child.session.append("subagent/descriptor", {
-      version: 2, mode: "continuable", provider: "spawn", label: "own",
+      version: 3, mode: "continuable", provider: "spawn", label: "own",
     });
     // Real live event adoption, deliberately no presentation-mode announcement.
     child.session.append("session/title", { title: "child", messageSeqs: [], source: { kind: "user" } });
@@ -302,7 +305,7 @@ it("settles pending permissions and logs unsupported input-cancel without blocki
   vi.spyOn(h.connection, "requestPermission").mockReturnValue(raw.promise);
   const extension = vi.spyOn(h.connection, "extMethod").mockRejectedValue(new Error("Method not found"));
   h.beforeStep.set(root, (signal) => h.context.approval.request({
-    agent: root, signal, callId: CallId("permission"), toolName: "edit", reason: "edit file",
+    agent: root, signal, callId: ToolCallId("permission"), toolName: "edit", reason: "edit file",
   }));
   root.followup(createUserMessage({ source: { kind: "user" }, content: [{ type: "text", text: "ask" }] }));
   const activity = root.whenIdle();

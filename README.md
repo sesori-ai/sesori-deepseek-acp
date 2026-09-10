@@ -17,6 +17,14 @@ node dist/src/bin.js serve --state-dir /absolute/writable/directory
 `serve` reserves stdout for ACP NDJSON. Local diagnostics use stderr and never
 include protocol frames, prompts, transcripts, credentials, or tool payloads.
 
+Runtime uses DeepSeek Harness `0.1.5-rc.2`, including canonical
+`deepseek-flash` (`DeepSeek-V41-Flash`) catalog metadata, native model selection,
+outbound `web_search` and `web_fetch` tools, and native persisted-session format
+migration. Outbound web tools do not expose a local web server, frontend, BFF,
+or additional process. Telemetry and hot reload remain disabled. Adapter-owned
+sessions, attachments, query indexes, storage documents, and spill files remain
+under supplied `--state-dir`; DeepSeek settings remain read-only.
+
 Tagged releases contain target-specific package-directory archives with a
 pinned official Node runtime, production dependencies, CycloneDX SBOM, license
 inventory, and relocatable launcher. Release CI builds and smokes each archive

@@ -29,13 +29,31 @@ import {
   type ToolCallContent,
 } from "@agentclientprotocol/sdk";
 import type { Context } from "@deepseek-ai/cordis";
-import type { Agent, AgentHandle } from "@deepseek-ai/dsh-agent";
+import {
+  installModelSelection,
+  type Agent,
+  type AgentHandle,
+  type AssistantStreamFrame,
+  type ModelSelection,
+  type ModelSelectionRef,
+} from "@deepseek-ai/dsh-agent";
 import type {} from "@deepseek-ai/dsh-agent-default-model";
 import { isImageAdmissionError, type EncodedImageAttachment } from "@deepseek-ai/dsh-attachment";
 import { parseCommand } from "@deepseek-ai/dsh-commands";
 import type {} from "@deepseek-ai/dsh-commands/types";
-import { freezeMessage, MessageId, ReasoningEffortId, type ContentBlock, type LlmCallConfig, type ReasoningEffortId as ReasoningEffort, type TokenUsage, type UserMessage } from "@deepseek-ai/dsh-llm";
+import {
+  expandAssistantStream,
+  freezeMessage,
+  isVisibleChunk,
+  MessageId,
+  ReasoningEffortId,
+  type ContentBlock,
+  type LlmCallConfig,
+  type TokenUsage,
+  type UserMessage,
+} from "@deepseek-ai/dsh-llm";
 import type { ApprovalOutcome, ApprovalRequest } from "@deepseek-ai/dsh-user-approval";
+import type { AskUserQuestionAnswer } from "@deepseek-ai/dsh-user-questions";
 import type {} from "@deepseek-ai/dsh-llm-retry/types";
 import type {} from "@deepseek-ai/dsh-compaction/types";
 import {
@@ -48,6 +66,7 @@ import { isAppendSurfaceEvent } from "@deepseek-ai/dsh-session/surface";
 import type { SessionInspection } from "@deepseek-ai/dsh-session-persistence";
 import { SessionTitleInvalidError } from "@deepseek-ai/dsh-session-title";
 import { SubagentError, type SubagentRunEndInfo, type SubagentRunInfo } from "@deepseek-ai/dsh-subagent";
+import type {} from "@deepseek-ai/dsh-tool-todo";
 import type {} from "@deepseek-ai/dsh-tools";
 import { createInitializeResponse, INITIALIZE_METADATA_KEY } from "./protocol.js";
 import type { SubagentBindingStore } from "./subagent_bindings.js";
@@ -186,42 +205,6 @@ interface CatalogModel {
   reasoningEfforts: string[];
   defaultReasoningEffort: string | null;
   supportsImages: boolean;
-}
-
-interface ModelSelection {
-  provider: string;
-  model: string;
-  reasoningEffort?: ReasoningEffort;
-}
-
-interface ModelSelectionRef {
-  current: ModelSelection | undefined;
-  assembled: ModelSelection | undefined;
-}
-
-function installSelection(agentContext: Context, selection: ModelSelectionRef): void {
-  agentContext.on("system-prompt/assemble", async (_assembly, _context, next) => {
-    const selected = selection.current;
-    const assembled = await next();
-    selection.assembled = selected;
-    if (selected === undefined) return assembled;
-    return {
-      ...assembled,
-      variables: { ...assembled.variables, provider: selected.provider, model: selected.model },
-    };
-  });
-  agentContext.on("agent/request", async (_payload, next): Promise<LlmCallConfig> => {
-    const resolved = await next();
-    const selected = selection.assembled;
-    if (selected === undefined) return resolved;
-    const { reasoningEffort: _inheritedEffort, ...rest } = resolved;
-    return {
-      ...rest,
-      provider: selected.provider,
-      model: selected.model,
-      ...(selected.reasoningEffort === undefined ? {} : { reasoningEffort: selected.reasoningEffort }),
-    };
-  });
 }
 
 interface CatalogResponse {
@@ -578,15 +561,6 @@ function messageBoundary(event: SessionEvent): boolean {
   );
 }
 
-function isAssistantContentChunk(
-  event: SessionEvent,
-): event is Extract<SessionEvent, { type: "assistant/chunk" }> {
-  return (
-    event.type === "assistant/chunk" &&
-    (event.data.chunk.type === "text-delta" || event.data.chunk.type === "reasoning-delta")
-  );
-}
-
 function assertKnownEvents(events: readonly SessionEvent[]): void {
   const unknown = events.find(
     (event) => !KNOWN_SESSION_EVENT_TYPES.has(event.type) && event.ignorable !== true,
@@ -606,19 +580,7 @@ function historyPage(args: {
   const starts = eligible.flatMap((event, index) => (messageBoundary(event) ? [index] : []));
   if (starts.length === 0) return { events: [], hasMore: false };
   const selectedStartIndex = Math.max(0, starts.length - args.maxMessages);
-  let firstEventIndex = starts[selectedStartIndex] as number;
-  const boundary = eligible[firstEventIndex];
-  if (boundary?.type === "assistant/message") {
-    while (firstEventIndex > 0) {
-      const candidate = eligible[firstEventIndex - 1];
-      if (
-        candidate?.type !== "assistant/chunk" ||
-        candidate.data.turn !== boundary.data.turn ||
-        candidate.data.step !== boundary.data.step
-      ) break;
-      firstEventIndex -= 1;
-    }
-  }
+  const firstEventIndex = starts[selectedStartIndex] as number;
   const hasMore = selectedStartIndex > 0;
   const selected = eligible.slice(firstEventIndex);
   if (!hasMore) return { events: selected, hasMore: false };
@@ -691,7 +653,17 @@ function eventTime(event: SessionEvent): number | undefined {
   return Number.isSafeInteger(event.time) && event.time >= 0 ? event.time : undefined;
 }
 
-function firstMessageTime(args: EventProjection, id: string, time: number | undefined): number | undefined {
+function assistantMessageTime(event: Extract<SessionEvent, { type: "assistant/message" }>): number | undefined {
+  const stream = event.data.stream;
+  if (stream === undefined) return eventTime(event);
+  return expandAssistantStream(stream).find((item) => isVisibleChunk(item.chunk))?.time ?? eventTime(event);
+}
+
+function firstMessageTime(
+  args: { messageCreatedAt: Map<string, number> },
+  id: string,
+  time: number | undefined,
+): number | undefined {
   const existing = args.messageCreatedAt.get(id);
   if (existing !== undefined) return existing;
   if (time !== undefined) args.messageCreatedAt.set(id, time);
@@ -744,23 +716,6 @@ async function projectSessionEvent(args: EventProjection, event: SessionEvent): 
     }
     return;
   }
-  if (event.type === "assistant/chunk" && args.mode === "live") {
-    const chunk = event.data.chunk;
-    if (chunk.type === "text-delta" || chunk.type === "reasoning-delta") {
-      const messageId = assistantMessageId(args.sessionId, event.data.turn, event.data.step);
-      await args.emitUpdate(
-        {
-          sessionUpdate: chunk.type === "reasoning-delta" ? "agent_thought_chunk" : "agent_message_chunk",
-          messageId,
-          content: { type: "text", text: chunk.text },
-        },
-        firstMessageTime(args, `assistant:${messageId}`, eventTime(event)),
-      );
-    } else if (chunk.type === "usage") {
-      args.onUsage?.(event.data.turn, event.data.step, chunk.usage);
-    }
-    return;
-  }
   if (event.type === "assistant/message" && isAppendSurfaceEvent(event)) {
     if (event.data.usage !== undefined) {
       args.onUsage?.(event.data.turn, event.data.step, event.data.usage);
@@ -771,7 +726,8 @@ async function projectSessionEvent(args: EventProjection, event: SessionEvent): 
       if (block.type === "tool-result") {
         throw new Error("session history contains unsupported assistant tool-result content");
       }
-      if (args.mode === "live" && block.type !== "image") continue;
+      if (args.mode === "live" && block.type !== "image" && block.type !== "file") continue;
+      if (block.type === "file") continue;
       await args.emitUpdate(
         {
           sessionUpdate: block.type === "reasoning" ? "agent_thought_chunk" : "agent_message_chunk",
@@ -781,7 +737,7 @@ async function projectSessionEvent(args: EventProjection, event: SessionEvent): 
               ? await imageContent({ context: args.context, attachment: block.attachment })
               : { type: "text", text: block.text },
         },
-        firstMessageTime(args, `assistant:${messageId}`, eventTime(event)),
+        firstMessageTime(args, `assistant:${messageId}`, assistantMessageTime(event)),
       );
     }
     return;
@@ -1055,12 +1011,10 @@ async function replayUpdates(args: {
   const updates: SessionNotification[] = [];
   const messageCreatedAt = new Map<string, number>();
   for (const event of args.events) {
-    if (!isAssistantContentChunk(event) && event.type !== "assistant/message") continue;
+    if (event.type !== "assistant/message") continue;
     const id = `assistant:${assistantMessageId(args.sessionId, event.data.turn, event.data.step)}`;
-    const time = eventTime(event);
-    if (time !== undefined && !messageCreatedAt.has(id)) {
-      messageCreatedAt.set(id, time);
-    }
+    const time = assistantMessageTime(event);
+    if (time !== undefined && !messageCreatedAt.has(id)) messageCreatedAt.set(id, time);
   }
   const projection: EventProjection = {
     context: args.context,
@@ -1093,6 +1047,7 @@ export class DurableSessionAgent implements AcpAgent {
   readonly #closes = new Map<SessionId, Promise<CloseSessionResponse>>();
   readonly #children = new Map<SessionId, ChildRecord>();
   readonly #callScope = new AsyncLocalStorage<SubagentCallScope | undefined>();
+  readonly #assistantAttempts = new Map<string, { turn: number; step: number }>();
   readonly #hooks: (() => void)[] = [];
   #closed = false;
   #disposal: Promise<void> | undefined;
@@ -1115,6 +1070,10 @@ export class DurableSessionAgent implements AcpAgent {
       }
       const child = this.#children.get(session.id) ?? this.#adoptDescendant(session);
       if (child?.agent.session === session) this.#projectChildEvent(child, event);
+    }));
+    this.#hooks.push(this.#context.on("agent/assistant-stream", ({ agent, frame }) => {
+      const record = this.#interactiveRecord(agent) ?? this.#adoptDescendant(agent.session);
+      if (record !== undefined) this.#projectAssistantStream(record, frame);
     }));
     this.#hooks.push(this.#context.on("tools/execute", (exec, next) => {
       const agent = exec.agent;
@@ -1208,11 +1167,10 @@ export class DurableSessionAgent implements AcpAgent {
         )
         .catch(() => "unavailable");
     }));
-    const questions = this.#context.get("userQuestions") as
-      | { registerProvider(provider: { ask(request: unknown): Promise<unknown> }): () => void }
-      | undefined;
-    const unregisterQuestions = questions?.registerProvider({ ask: (request) => this.#askQuestion(request) });
-    if (unregisterQuestions !== undefined) this.#hooks.push(unregisterQuestions);
+    this.#hooks.push(this.#context.on("user-questions/request", (request, next) => {
+      if (request.agent === undefined || this.#interactiveRecord(request.agent) === undefined) return next();
+      return this.#askQuestion(request);
+    }));
   }
 
   async initialize(_params: InitializeRequest): Promise<InitializeResponse> {
@@ -1234,7 +1192,8 @@ export class DurableSessionAgent implements AcpAgent {
     }
     const cursor = params.cursor === undefined || params.cursor === null ? undefined : decodeCursor(params.cursor);
     try {
-      const headers = await this.#context.sessionPersistence.list();
+      const snapshots = await this.#context.sessionPersistence.list();
+      const headers = snapshots.map((snapshot) => snapshot.header);
       const ids = new Set<string>();
       for (const header of headers) {
         const id = String(header.id);
@@ -1273,8 +1232,8 @@ export class DurableSessionAgent implements AcpAgent {
       handle = await this.#context.agents.create({
         sessionId,
         meta: { cwd: params.cwd },
-        setup: (agentContext) => {
-          selection = this.#installSelection(agentContext);
+        setup: (agentContext, agent) => {
+          selection = this.#installSelection(agentContext, agent);
         },
       });
       if (this.#closed) throw new Error("adapter disposed during session creation");
@@ -1362,8 +1321,8 @@ export class DurableSessionAgent implements AcpAgent {
         }
         handle = await this.#context.agents.resume({
           resumeSessionId: sessionId,
-          setup: (agentContext) => {
-            selection = this.#installSelection(agentContext);
+          setup: (agentContext, agent) => {
+            selection = this.#installSelection(agentContext, agent);
           },
         });
         resumed = true;
@@ -1450,9 +1409,7 @@ export class DurableSessionAgent implements AcpAgent {
     }
   }
 
-  #installSelection(agentContext: Context): ModelSelectionRef {
-    const agent = agentContext.agent;
-    if (agent === undefined) throw new Error("agent setup has no scoped agent");
+  #installSelection(agentContext: Context, agent: Agent): ModelSelectionRef {
     const defaults = agentContext.get("agentDefaultModel") as
       | { currentSelection(): ModelSelection }
       | undefined;
@@ -1480,7 +1437,7 @@ export class DurableSessionAgent implements AcpAgent {
       },
       assembled: undefined,
     };
-    installSelection(agentContext, selection);
+    installModelSelection(agentContext, selection);
     return selection;
   }
 
@@ -1800,8 +1757,8 @@ export class DurableSessionAgent implements AcpAgent {
         await this.#inspect(sessionId);
         handle = await this.#context.agents.resume({
           resumeSessionId: sessionId,
-          setup: (agentContext) => {
-            selection = this.#installSelection(agentContext);
+          setup: (agentContext, agent) => {
+            selection = this.#installSelection(agentContext, agent);
           },
         });
         if (this.#closed || this.#sessions.has(sessionId)) {
@@ -1916,7 +1873,7 @@ export class DurableSessionAgent implements AcpAgent {
       const session = child.agent.session;
       const identity = projections?.snapshot(session).values.subagent;
       return session.header.origin === "subagent" && identity?.mode === "continuable" &&
-        identity.seq >= (session.header.seedLength ?? 0);
+        session.isOwnSeq(identity.seq);
     }));
     const jobs = this.#context.get("jobs");
     const ownedJobs = [...launchers.values()].flatMap((owner) =>
@@ -2362,6 +2319,44 @@ export class DurableSessionAgent implements AcpAgent {
     return withAbort(result, args.signal);
   }
 
+  #projectAssistantStream(record: SessionRecord | ChildRecord, frame: AssistantStreamFrame): void {
+    const agent = "handle" in record ? record.handle.agent : record.agent;
+    const attemptKey = `${agent.id}\0${frame.attemptId}`;
+    if (frame.type === "start") {
+      this.#assistantAttempts.set(attemptKey, { turn: frame.turn, step: frame.step });
+      return;
+    }
+    if (frame.type === "end") {
+      this.#assistantAttempts.delete(attemptKey);
+      return;
+    }
+    const position = this.#assistantAttempts.get(attemptKey);
+    if (position === undefined) {
+      this.#diagnose("assistant stream", agent.id, new Error("assistant stream chunk has no start frame"));
+      return;
+    }
+    const chunk = frame.chunk;
+    if (chunk.type !== "text-delta" && chunk.type !== "reasoning-delta" && chunk.type !== "usage") return;
+    if ("handle" in record && chunk.type === "usage") {
+      const inflight = record.inflight;
+      if (inflight !== undefined && inflight.turn === position.turn && !inflight.usageByStep.has(position.step)) {
+        inflight.usageByStep.set(position.step, chunk.usage);
+      }
+    }
+    if (chunk.type === "usage") return;
+    const sessionId = String(agent.id);
+    const messageId = assistantMessageId(sessionId, position.turn, position.step);
+    this.#queueTail(record, () => this.#connection.sessionUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: chunk.type === "reasoning-delta" ? "agent_thought_chunk" : "agent_message_chunk",
+        messageId,
+        content: { type: "text", text: chunk.text },
+      },
+      ...updateMetadata(firstMessageTime(record, `assistant:${messageId}`, frame.time), undefined),
+    }));
+  }
+
   #projectChildEvent(record: ChildRecord, event: SessionEvent): void {
     const sessionId = String(record.agent.id);
     this.#queueTail(record, () =>
@@ -2470,7 +2465,7 @@ export class DurableSessionAgent implements AcpAgent {
     });
   }
 
-  async #askQuestion(value: unknown): Promise<unknown> {
+  async #askQuestion(value: unknown): Promise<AskUserQuestionAnswer> {
     const request = value as { agent?: Agent; signal?: AbortSignal; questions?: unknown[] };
     if (request.agent === undefined) {
       throw new Error("question caller is not an owned root session");
@@ -2542,15 +2537,60 @@ export class DurableSessionAgent implements AcpAgent {
   async #inspect(sessionId: SessionId): Promise<SessionInspection> {
     const resident = this.#sessions.get(sessionId);
     if (resident !== undefined) {
-      return { meta: resident.handle.agent.session.header, events: resident.handle.agent.session.events };
+      const session = resident.handle.agent.session;
+      return {
+        meta: session.header,
+        inheritedEventCount: session.inheritedEventCount,
+        events: session.snapshotEvents(),
+      };
     }
     const child = this.#children.get(sessionId);
     if (child !== undefined) {
-      return { meta: child.agent.session.header, events: child.agent.session.events };
+      const session = child.agent.session;
+      return {
+        meta: session.header,
+        inheritedEventCount: session.inheritedEventCount,
+        events: session.snapshotEvents(),
+      };
     }
-    const headers = await this.#context.sessionPersistence.list();
-    if (!headers.some((header) => header.id === sessionId)) throw invalidParams("unknown session");
-    return this.#context.sessionPersistence.inspect(sessionId);
+    // dsh 0.1.5-rc.2's query declarations conflict with its subagent projection
+    // augmentation. Keep the native observation seam structural until those agree.
+    const query = this.#context.get("sessionQuery") as
+      | {
+          observeSession(
+            id: SessionId,
+            options: { projectionMode: "none" },
+          ): Promise<{
+            header: SessionHeader;
+            inheritedEventCount: SessionInspection["inheritedEventCount"];
+            events: readonly SessionEvent[];
+            [Symbol.dispose](): void;
+          }>;
+        }
+      | undefined;
+    if (query === undefined) throw new Error("session query service is unavailable");
+    let observation;
+    try {
+      observation = await query.observeSession(sessionId, { projectionMode: "none" });
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        "code" in error &&
+        error.code === "SESSION_QUERY_SESSION_NOT_FOUND"
+      ) {
+        throw invalidParams("unknown session");
+      }
+      throw error;
+    }
+    try {
+      return {
+        meta: observation.header,
+        inheritedEventCount: observation.inheritedEventCount,
+        events: [...observation.events],
+      };
+    } finally {
+      observation[Symbol.dispose]();
+    }
   }
 
   #assertOpen(): void {
@@ -2566,6 +2606,7 @@ export class DurableSessionAgent implements AcpAgent {
       record.handle.agent.cancel({ kind: "disposed" });
       this.#settle(record, inflight);
     }
+    await this.#context.subagents.drainContinuableDescendants([record.handle.agent]);
     let handleFailure: { error: unknown } | undefined;
     await record.handle.dispose().catch((error: unknown) => {
       handleFailure = { error };
@@ -2596,6 +2637,7 @@ export class DurableSessionAgent implements AcpAgent {
     const childTails = [...this.#children.values()].map((child) => child.outputTail);
     this.#sessions.clear();
     this.#children.clear();
+    this.#assistantAttempts.clear();
     const outcomes = await Promise.allSettled([
       ...records.map((record) => this.#disposeRecord(record)),
       ...childTails,

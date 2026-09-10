@@ -177,13 +177,13 @@ async function startProviderFixture() {
         const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
         expect(request.url === "/chat/completions", `Unexpected provider fixture path: ${String(request.url)}`);
         expect(request.headers.authorization === "Bearer fixture-key", "Provider fixture received the wrong credential");
-        expect(body.model === "deepseek-v4-flash" && body.stream === true, "Provider fixture received the wrong model request");
+        expect(body.model === "deepseek-flash" && body.stream === true, "Provider fixture received the wrong model request");
         requests.push(body);
         response.writeHead(200, { "content-type": "text/event-stream" });
         response.end([
-          'data: {"id":"fixture","object":"chat.completion.chunk","created":1,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"role":"assistant","content":"fixture reply"},"finish_reason":null}]}',
+          'data: {"id":"fixture","object":"chat.completion.chunk","created":1,"model":"deepseek-flash","choices":[{"index":0,"delta":{"role":"assistant","content":"fixture reply"},"finish_reason":null}]}',
           "",
-          'data: {"id":"fixture","object":"chat.completion.chunk","created":1,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}',
+          'data: {"id":"fixture","object":"chat.completion.chunk","created":1,"model":"deepseek-flash","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}',
           "",
           "data: [DONE]",
           "",
@@ -228,7 +228,7 @@ export async function smokeAcpLifecycle({ launcher, target, packageRoot, tempora
     "  thinking: disabled",
     "  reasoningEffort: off",
     "  models:",
-    "    - id: deepseek-v4-flash",
+    "    - id: deepseek-flash",
     "      name: Fixture",
     "      contextWindow: 4096",
     "      maxTokens: 64",

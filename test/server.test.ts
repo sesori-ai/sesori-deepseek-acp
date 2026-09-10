@@ -64,6 +64,7 @@ const testRuntimeBoot: RuntimeBoot = async (args) => {
   if (prepared !== undefined) await prepared;
   context.provide("agents", {} as never);
   context.provide("sessionPersistence", {} as never);
+  context.provide("subagents", {} as never);
   context.provide(RUNTIME_READY_KEY, true);
   return context;
 };

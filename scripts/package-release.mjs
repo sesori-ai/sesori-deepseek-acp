@@ -309,7 +309,11 @@ async function smokePackage({ packageRoot, packageMetadata, config, target, temp
     'import { pathToFileURL } from "node:url";',
     'const require = createRequire(pathToFileURL(`${process.cwd()}/release-probe.cjs`));',
     'require("sharp");',
-    ...(target.startsWith("linux-") ? ['require("@deepseek-ai/node-addon-landlock-run");'] : []),
+    ...(target.startsWith("linux-") ? [
+      'const { launcherPath, probe } = require("@deepseek-ai/node-addon-system/landlock-run");',
+      'const landlockLauncher = launcherPath();',
+      'if (probe(landlockLauncher) === "unusable") throw new Error("packaged Landlock launcher is unusable");',
+    ] : []),
     'const normalized = value => realpathSync(value).toLowerCase();',
     'if (normalized(process.execPath) !== normalized(process.env.SESORI_PACKAGED_NODE)) throw new Error("unpackaged Node");',
   ].join("");

@@ -52,6 +52,7 @@ function projectStorageKey(path: string): string {
 }
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   if (originalDshHome === undefined) delete process.env.DSH_HOME;
   else process.env.DSH_HOME = originalDshHome;
   if (originalApiKey === undefined) delete process.env.DEEPSEEK_API_KEY;

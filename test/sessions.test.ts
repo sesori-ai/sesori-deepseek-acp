@@ -22,6 +22,7 @@ interface SessionServices {
   create: ReturnType<typeof vi.fn>;
   resume: ReturnType<typeof vi.fn>;
   flush: ReturnType<typeof vi.fn>;
+  drainContinuableDescendants: ReturnType<typeof vi.fn>;
   observe: ReturnType<typeof vi.fn>;
   updates: SessionNotification[];
   diagnostics: string[];
@@ -172,6 +173,7 @@ function services(): SessionServices {
     return makeHandle(inspection.meta, inspection.events, options.setup);
   });
   const flush = vi.fn(async () => true);
+  const drainContinuableDescendants = vi.fn(async () => undefined);
   const observe = vi.fn(async (id: string) => {
     const inspection = inspections.get(String(id));
     const meta = inspection?.meta ?? headers.find((candidate) => candidate.id === id);
@@ -201,6 +203,7 @@ function services(): SessionServices {
       get: (id: string) => live.get(id)?.agent,
     },
     sessions: { flush },
+    subagents: { drainContinuableDescendants },
     llm: {
       listProviders: () => [],
       listModels: async () => [],
@@ -257,6 +260,7 @@ function services(): SessionServices {
     create,
     resume,
     flush,
+    drainContinuableDescendants,
     observe,
     updates,
     diagnostics,
@@ -295,6 +299,39 @@ describe("durable ACP sessions", () => {
     expect(state.headers).toEqual([]);
     await state.agent.dispose();
     expect(state.live.size).toBe(0);
+  });
+
+  it("awaits native continuable descendant drain before disposing a root handle", async () => {
+    const state = services();
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const handle = state.live.get(created.sessionId)!;
+    const drained = Promise.withResolvers<void>();
+    state.drainContinuableDescendants.mockReturnValueOnce(drained.promise);
+
+    const closing = state.agent.closeSession({ sessionId: created.sessionId });
+    await expect.poll(() => state.drainContinuableDescendants).toHaveBeenCalledWith([handle.agent]);
+    expect(handle.dispose).not.toHaveBeenCalled();
+
+    drained.resolve();
+    await expect(closing).resolves.toEqual({});
+    expect(handle.dispose).toHaveBeenCalledOnce();
+  });
+
+  it("keeps native descendant drain failures observable and retains the root for retry", async () => {
+    const state = services();
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const handle = state.live.get(created.sessionId)!;
+    state.drainContinuableDescendants.mockRejectedValueOnce(new Error("native drain sentinel"));
+
+    await expect(state.agent.closeSession({ sessionId: created.sessionId })).rejects.toThrow(
+      "unable to close DeepSeek session",
+    );
+    expect(handle.dispose).not.toHaveBeenCalled();
+    expect(state.live.get(created.sessionId)).toBe(handle);
+    expect(state.diagnostics.join("\n")).toContain("native drain sentinel");
+
+    await expect(state.agent.closeSession({ sessionId: created.sessionId })).resolves.toEqual({});
+    expect(handle.dispose).toHaveBeenCalledOnce();
   });
 
   it("retains ownership when close disposal fails so the caller can retry", async () => {

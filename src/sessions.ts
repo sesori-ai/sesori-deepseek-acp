@@ -2606,6 +2606,7 @@ export class DurableSessionAgent implements AcpAgent {
       record.handle.agent.cancel({ kind: "disposed" });
       this.#settle(record, inflight);
     }
+    await this.#context.subagents.drainContinuableDescendants([record.handle.agent]);
     let handleFailure: { error: unknown } | undefined;
     await record.handle.dispose().catch((error: unknown) => {
       handleFailure = { error };

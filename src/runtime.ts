@@ -27,6 +27,8 @@ const SESORI_PROFILE_NAME = "sesori";
 const PROFILE_ROOT_FILENAME = "cordis.yml";
 const PROFILE_ROOT = "[]\n";
 const RESERVED_PROFILE_ENTRY_NAMES = new Map([
+  ["agent", "@deepseek-ai/dsh-agent"],
+  ["subagent", "@deepseek-ai/dsh-subagent"],
   ["session-persistence-jsonl", "@deepseek-ai/dsh-session-persistence-jsonl"],
   ["attachment-local", "@deepseek-ai/dsh-attachment-local"],
   ["session-query-sqlite", "@deepseek-ai/dsh-session-query-sqlite"],
@@ -39,6 +41,9 @@ const RESERVED_PROFILE_ENTRY_NAMES = new Map([
   ["tool-ask-user", "@deepseek-ai/dsh-tool-ask-user"],
 ]);
 const RESERVED_PROFILE_ENTRY_IDS = new Set(RESERVED_PROFILE_ENTRY_NAMES.keys());
+const RESERVED_PROFILE_ENTRY_IDS_BY_NAME = new Map(
+  [...RESERVED_PROFILE_ENTRY_NAMES].map(([id, name]) => [name, id]),
+);
 const PINNED_RESERVED_PROFILE_ENTRY_MODULES = new Map(
   [...RESERVED_PROFILE_ENTRY_NAMES].map(([id, name]) => [
     id,
@@ -103,6 +108,8 @@ function statePaths(args: { stateDir: string }): RuntimePaths {
 
 function adapterPatches(args: { paths: RuntimePaths; workspaceRoot: string }): PatchOptions[] {
   return [
+    { id: "agent", name: "@deepseek-ai/dsh-agent", disabled: false },
+    { id: "subagent", name: "@deepseek-ai/dsh-subagent", disabled: false },
     {
       id: "session-persistence-jsonl",
       name: "@deepseek-ai/dsh-session-persistence-jsonl",
@@ -207,11 +214,19 @@ interface ProfileEntryLocation {
 function profileEntryLocations(args: { entries: EntryOptions[] }): ProfileEntryLocation[] {
   const locations: ProfileEntryLocation[] = [];
   const pending = args.entries.map((entry) => ({ enabled: true, entry }));
+  const visited = new Set<EntryOptions>();
   let index = 0;
   while (index < pending.length) {
     const location = pending[index];
     index += 1;
     if (location === undefined) continue;
+    if (visited.has(location.entry)) {
+      throw new AdapterError({
+        code: AdapterErrorCode.Readiness,
+        message: "The DeepSeek profile contains a cyclic or repeated group entry",
+      });
+    }
+    visited.add(location.entry);
     const enabled = location.enabled && location.entry.disabled !== true;
     locations.push({ enabled, entry: location.entry });
     if (location.entry.group === true && Array.isArray(location.entry.config)) {
@@ -225,9 +240,17 @@ function profileEntryLocations(args: { entries: EntryOptions[] }): ProfileEntryL
 
 function assertReservedEntryIdsUnique(args: { entries: EntryOptions[] }): void {
   const counts = new Map<string, number>();
-  for (const { entry } of profileEntryLocations({ entries: args.entries })) {
-    if (!RESERVED_PROFILE_ENTRY_IDS.has(entry.id)) continue;
-    counts.set(entry.id, (counts.get(entry.id) ?? 0) + 1);
+  for (const { enabled, entry } of profileEntryLocations({ entries: args.entries })) {
+    if (RESERVED_PROFILE_ENTRY_IDS.has(entry.id)) {
+      counts.set(entry.id, (counts.get(entry.id) ?? 0) + 1);
+    }
+    const reservedId = RESERVED_PROFILE_ENTRY_IDS_BY_NAME.get(entry.name);
+    if (enabled && reservedId !== undefined && reservedId !== entry.id) {
+      throw new AdapterError({
+        code: AdapterErrorCode.Readiness,
+        message: `The DeepSeek profile mounts reserved plugin ${entry.name} under alternate row ${entry.id}`,
+      });
+    }
   }
   const duplicates = [...counts.entries()]
     .filter((entry) => entry[1] > 1)
@@ -245,6 +268,8 @@ function assertComposition(args: {
   workspaceRoot: string;
 }): void {
   assertReservedEntryIdsUnique({ entries: args.entries });
+  assertEntry({ entries: args.entries, id: "agent", enabled: true });
+  assertEntry({ entries: args.entries, id: "subagent", enabled: true });
   assertEntry({
     entries: args.entries,
     id: "session-persistence-jsonl",
@@ -344,6 +369,9 @@ function composeRuntimeProfileLayers(args: {
     ...args.layers.flat(),
     ...adapterPatches({ paths, workspaceRoot }),
   ];
+  for (const patch of patches) {
+    if (patch.insert !== undefined) profileEntryLocations({ entries: patch.insert });
+  }
   const warnings: string[] = [];
   const entries = applyEntryPatches([], structuredClone(patches), (message, ...values) => {
     warnings.push(`${message} ${values.map(String).join(" ")}`.trim());

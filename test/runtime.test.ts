@@ -173,7 +173,7 @@ describe("DeepSeek runtime composition", () => {
       ),
       writeFile(
         join(packagePath, "cordis.patch.yml"),
-        `- id: approval\n  disabled: true\n- insert:\n    - id: synthetic-profile-plugin\n      name: '${packageName}'\n`,
+        `- id: agent\n  disabled: true\n- id: subagent\n  disabled: true\n- id: approval\n  disabled: true\n- insert:\n    - id: synthetic-profile-plugin\n      name: '${packageName}'\n`,
       ),
       writeFile(
         join(packagePath, "index.js"),
@@ -214,6 +214,8 @@ describe("DeepSeek runtime composition", () => {
         name: packageName,
       }),
     );
+    expect(loaded.entries.find((entry) => entry.id === "agent")?.disabled).toBe(false);
+    expect(loaded.entries.find((entry) => entry.id === "subagent")?.disabled).toBe(false);
     expect(loaded.entries.find((entry) => entry.id === "approval")?.disabled).toBe(false);
 
     const globals = globalThis as typeof globalThis & {
@@ -227,6 +229,8 @@ describe("DeepSeek runtime composition", () => {
     try {
       expect(fallbacks).toEqual([]);
       expect(globals.__sesoriSyntheticProfilePlugin).toBe(true);
+      expect(context.get("agents")).toBeDefined();
+      expect(context.get("subagents")).toBeDefined();
       expect(context.get("sessionTelemetry")).toBeUndefined();
       expect(context.get("hmr")).toBeUndefined();
     } finally {
@@ -282,6 +286,78 @@ describe("DeepSeek runtime composition", () => {
     expect(fallbacks).toHaveLength(1);
     expect((fallbacks[0]?.error.cause as Error | undefined)?.message).toContain(
       "duplicates reserved Sesori rows: approval",
+    );
+  });
+
+  it("falls back when a profile group is cyclic", async () => {
+    const root = await tempRoot();
+    const home = join(root, "home");
+    const stateDir = join(root, "state");
+    process.env.DSH_HOME = home;
+
+    const initialized = await resolveRuntimeProfile({ stateDir });
+    if (initialized.origin.kind !== RuntimeProfileOrigin.Persisted) {
+      throw new Error("expected persisted Sesori profile");
+    }
+    await writeFile(
+      join(initialized.origin.path, "cordis.patch.yml"),
+      `- insert:
+    - id: cyclic-group
+      name: '@deepseek-ai/cordis-plugin-group'
+      group: true
+      config: []
+- id: cyclic-group
+  config:
+    - &cyclicChild
+      id: cyclic-child
+      name: '@deepseek-ai/cordis-plugin-group'
+      group: true
+      config:
+        - *cyclicChild
+`,
+    );
+
+    const fallbacks: RuntimeProfileFallback[] = [];
+    const profile = await resolveRuntimeProfile({
+      stateDir,
+      onProfileFallback: (fallback) => fallbacks.push(fallback),
+    });
+
+    expect(profile.origin).toEqual({ kind: RuntimeProfileOrigin.InMemory });
+    expect(fallbacks).toHaveLength(1);
+    expect((fallbacks[0]?.error.cause as Error | undefined)?.message).toContain(
+      "cyclic or repeated group entry",
+    );
+  });
+
+  it("falls back when a reserved plugin uses an alternate row ID", async () => {
+    const root = await tempRoot();
+    const home = join(root, "home");
+    const stateDir = join(root, "state");
+    process.env.DSH_HOME = home;
+
+    const initialized = await resolveRuntimeProfile({ stateDir });
+    if (initialized.origin.kind !== RuntimeProfileOrigin.Persisted) {
+      throw new Error("expected persisted Sesori profile");
+    }
+    await writeFile(
+      join(initialized.origin.path, "cordis.patch.yml"),
+      `- insert:
+    - id: profile-telemetry
+      name: '@deepseek-ai/dsh-session-telemetry-otel'
+`,
+    );
+
+    const fallbacks: RuntimeProfileFallback[] = [];
+    const profile = await resolveRuntimeProfile({
+      stateDir,
+      onProfileFallback: (fallback) => fallbacks.push(fallback),
+    });
+
+    expect(profile.origin).toEqual({ kind: RuntimeProfileOrigin.InMemory });
+    expect(fallbacks).toHaveLength(1);
+    expect((fallbacks[0]?.error.cause as Error | undefined)?.message).toContain(
+      "mounts reserved plugin @deepseek-ai/dsh-session-telemetry-otel under alternate row profile-telemetry",
     );
   });
 

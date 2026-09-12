@@ -6,7 +6,12 @@ import {
   type Stream,
 } from "@agentclientprotocol/sdk";
 import type { Context, Fiber } from "@deepseek-ai/cordis";
-import { bootRuntime, RUNTIME_READY_KEY } from "./runtime.js";
+import { formatDiagnostic } from "./errors.js";
+import {
+  bootRuntime,
+  RUNTIME_READY_KEY,
+  type RuntimeProfileFallbackReporter,
+} from "./runtime.js";
 import { DurableSessionAgent } from "./sessions.js";
 import { createFileSubagentBindingStore, type SubagentBindingStore } from "./subagent_bindings.js";
 
@@ -22,6 +27,7 @@ export interface SignalSource {
 export type RuntimeBoot = (args: {
   stateDir: string;
   prepare: (context: Context) => Promise<void> | void;
+  onProfileFallback: RuntimeProfileFallbackReporter;
 }) => Promise<Context>;
 
 const AcpSdkDiagnostic = {
@@ -114,6 +120,9 @@ export async function serveStdio(args: {
     const runRuntime = args.runtimeBoot ?? bootRuntime;
     context = await runRuntime({
       stateDir: args.stateDir,
+      onProfileFallback: ({ error }) => {
+        args.diagnostics.write(`sesori-deepseek-acp: warning: ${formatDiagnostic({ error })}\n`);
+      },
       prepare: (bootContext) => {
         context = bootContext;
         if (shutdownRequested) {

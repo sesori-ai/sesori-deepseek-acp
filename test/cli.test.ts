@@ -1,8 +1,8 @@
-import { chmod, mkdtemp, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import packageJson from "../package.json" with { type: "json" };
 import { runCli } from "../src/cli.ts";
 import { AdapterExitCode } from "../src/errors.ts";
@@ -10,6 +10,20 @@ import {
   ADAPTER_VERSION,
   DEEPSEEK_HARNESS_VERSION,
 } from "../src/protocol.ts";
+
+const originalDshHome = process.env.DSH_HOME;
+let testHomeRoot: string;
+
+beforeEach(async () => {
+  testHomeRoot = await mkdtemp(join(tmpdir(), "sesori-deepseek-cli-home-"));
+  process.env.DSH_HOME = join(testHomeRoot, "home");
+});
+
+afterEach(async () => {
+  if (originalDshHome === undefined) delete process.env.DSH_HOME;
+  else process.env.DSH_HOME = originalDshHome;
+  await rm(testHomeRoot, { recursive: true, force: true });
+});
 
 interface CliResult {
   exitCode: AdapterExitCode;
@@ -41,7 +55,7 @@ describe("adapter CLI", () => {
     const result = await invoke({ argv: ["--version"] });
     expect(result).toEqual({
       exitCode: AdapterExitCode.Success,
-      stdout: "sesori-deepseek-acp/0.1.5 deepseek-harness/0.1.5-rc.2 acp/1\n",
+      stdout: "sesori-deepseek-acp/0.1.6 deepseek-harness/0.1.5-rc.2 acp/1\n",
       stderr: "",
     });
     expect(packageJson.version).toBe(ADAPTER_VERSION);
@@ -74,6 +88,22 @@ describe("adapter CLI", () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  });
+
+  it("reports an in-memory fallback without failing readiness", async () => {
+    const home = process.env.DSH_HOME;
+    if (home === undefined) throw new Error("expected isolated DeepSeek home");
+    await mkdir(home, { recursive: true });
+    await writeFile(join(home, "profiles"), "occupied by a file");
+    const stateDir = join(testHomeRoot, "future-state");
+
+    const result = await invoke({ argv: ["check", "--state-dir", stateDir] });
+
+    expect(result.exitCode).toBe(AdapterExitCode.Success);
+    expect(JSON.parse(result.stdout)).toMatchObject({ status: "ok", stateDir });
+    expect(result.stderr).toContain(
+      "warning: readiness_error: The Sesori DeepSeek profile is unavailable; using the pinned in-memory profile",
+    );
   });
 
   it("rejects a state path that is a file", async () => {

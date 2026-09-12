@@ -3,6 +3,7 @@ import { PassThrough } from "node:stream";
 import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
 import { Context } from "@deepseek-ai/cordis";
 import { describe, expect, it, vi } from "vitest";
+import { AdapterError, AdapterErrorCode } from "../src/errors.ts";
 import {
   ADAPTER_NAME,
   ADAPTER_TITLE,
@@ -182,6 +183,28 @@ describe("ACP server", () => {
     expect(harness.stderr()).toContain("acp_sdk: Failed to parse JSON message:");
     expect(harness.stderr()).not.toContain(sentinel);
     await finish({ harness });
+  });
+
+  it("reports a recovered profile fallback on stderr", async () => {
+    const runtimeBoot: RuntimeBoot = async (args) => {
+      args.onProfileFallback({
+        error: new AdapterError({
+          code: AdapterErrorCode.Readiness,
+          message: "synthetic profile fallback",
+          cause: new Error("synthetic profile failure"),
+        }),
+      });
+      return testRuntimeBoot(args);
+    };
+    const harness = startHarness({ runtimeBoot });
+
+    await finish({ harness });
+
+    expect(harness.stdout()).toBe("");
+    expect(harness.stderr()).toContain(
+      "warning: readiness_error: synthetic profile fallback",
+    );
+    expect(harness.stderr()).toContain("Caused by: Error: synthetic profile failure");
   });
 
   it("closes cleanly on input EOF", async () => {

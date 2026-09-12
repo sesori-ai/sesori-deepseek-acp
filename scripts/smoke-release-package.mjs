@@ -73,6 +73,7 @@ function startAcpProcess({ launcher, target, stateDir, environment, cwd }) {
 
   return {
     notifications,
+    diagnostics: () => stderr,
     request(method, params) {
       if (protocolFailure !== undefined) return Promise.reject(protocolFailure);
       const id = nextId++;
@@ -212,6 +213,42 @@ async function startProviderFixture() {
   };
 }
 
+async function installSyntheticProfileBundle(home) {
+  const profile = join(home, "profiles", "sesori");
+  const packageName = "synthetic-sesori-profile-plugin";
+  const plugin = join(profile, "node_modules", packageName);
+  await mkdir(plugin, { recursive: true });
+  await Promise.all([
+    writeFile(
+      join(profile, "package.json"),
+      `${JSON.stringify({
+        name: "dsh-profile-sesori",
+        private: true,
+        dependencies: { [packageName]: "1.0.0" },
+        dsh: { profile: { bundles: ["@deepseek-ai/dsh-base", packageName], patchReload: "startup" } },
+      }, null, 2)}\n`,
+    ),
+    writeFile(
+      join(plugin, "package.json"),
+      `${JSON.stringify({
+        name: packageName,
+        version: "1.0.0",
+        type: "module",
+        exports: "./index.js",
+        dsh: { bundle: { patch: "./cordis.patch.yml" } },
+      }, null, 2)}\n`,
+    ),
+    writeFile(
+      join(plugin, "cordis.patch.yml"),
+      `- insert:\n    - id: synthetic-profile-plugin\n      name: '${packageName}'\n`,
+    ),
+    writeFile(
+      join(plugin, "index.js"),
+      `import { writeFileSync } from "node:fs";\nimport { join } from "node:path";\nconst name = "synthetic-profile-plugin";\nconst inject = [];\nfunction apply() { writeFileSync(join(process.env.DSH_HOME, "profiles", "sesori", "plugin-loaded"), "loaded\\n"); }\nexport { apply, inject, name };\n`,
+    ),
+  ]);
+}
+
 export async function smokeAcpLifecycle({ launcher, target, packageRoot, temporaryRoot, environment }) {
   const [provider] = await Promise.all([
     startProviderFixture(),
@@ -235,7 +272,10 @@ export async function smokeAcpLifecycle({ launcher, target, packageRoot, tempora
     "      inputModalities: [text]",
     "",
   ].join("\n");
-  await writeFile(join(home, "settings.yaml"), settings);
+  await Promise.all([
+    writeFile(join(home, "settings.yaml"), settings),
+    installSyntheticProfileBundle(home),
+  ]);
   const isolatedEnvironment = { ...environment, DSH_HOME: home, DEEPSEEK_API_KEY: "fixture-key" };
   let first;
   let restarted;
@@ -248,8 +288,12 @@ export async function smokeAcpLifecycle({ launcher, target, packageRoot, tempora
     await restarted.stop();
     provider.verify();
     expect(await readFile(join(home, "settings.yaml"), "utf8") === settings, "Packaged runtime changed DeepSeek settings");
+    expect(
+      await readFile(join(home, "profiles", "sesori", "plugin-loaded"), "utf8").catch(() => "") === "loaded\n",
+      `Packaged runtime did not load the Sesori profile plugin: ${first.diagnostics()}${restarted.diagnostics()}`,
+    );
     const homeEntries = (await readdir(home)).sort();
-    expect(JSON.stringify(homeEntries) === JSON.stringify([".anonymous-user-id", "settings.yaml"]), `Packaged runtime wrote unexpected state into DSH_HOME: ${homeEntries.join(", ")}`);
+    expect(JSON.stringify(homeEntries) === JSON.stringify([".anonymous-user-id", "profiles", "settings.yaml"]), `Packaged runtime wrote unexpected state into DSH_HOME: ${homeEntries.join(", ")}`);
     expect(/^[0-9a-f-]{36}\n$/iu.test(await readFile(join(home, ".anonymous-user-id"), "utf8")), "Packaged runtime wrote an invalid upstream anonymous id");
   } finally {
     await Promise.allSettled([first?.stop(), restarted?.stop()].filter((operation) => operation !== undefined));

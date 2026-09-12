@@ -101,7 +101,15 @@ describe("adapter CLI", () => {
         code: AdapterErrorCode.Readiness,
         message: "both runtime profiles failed",
         cause: new AggregateError(
-          [new Error("persisted profile marker"), new Error("in-memory profile marker")],
+          [
+            new AggregateError(
+              Array.from({ length: 4 }, (_, index) => new Error(
+                `nested persisted failure ${String(index)} ${"x".repeat(1_000)}`,
+              )),
+              "persisted profile marker",
+            ),
+            new Error("in-memory profile marker"),
+          ],
           "profile attempts failed",
         ),
       }),
@@ -109,6 +117,23 @@ describe("adapter CLI", () => {
 
     expect(diagnostic).toContain("persisted profile marker");
     expect(diagnostic).toContain("in-memory profile marker");
+    expect(diagnostic.length).toBeLessThanOrEqual(2_048);
+  });
+
+  it("retains an ordinary cause stack that fits the diagnostic budget", () => {
+    const cause = new Error("single cause marker");
+    cause.stack = `Error: single cause marker\n${"at synthetic frame\n".repeat(60)}single cause tail`;
+
+    const diagnostic = formatDiagnostic({
+      error: new AdapterError({
+        code: AdapterErrorCode.Readiness,
+        message: "runtime failed",
+        cause,
+      }),
+    });
+
+    expect(diagnostic).toContain("single cause tail");
+    expect(diagnostic.length).toBeGreaterThan(512);
     expect(diagnostic.length).toBeLessThanOrEqual(2_048);
   });
 

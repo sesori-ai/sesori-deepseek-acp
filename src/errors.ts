@@ -40,15 +40,31 @@ function bounded(args: { value: string; limit: number }): string {
   return `${args.value.slice(0, args.limit - 3)}...`;
 }
 
-function formatErrorDetail(args: { error: unknown; limit: number }): string {
+function formatErrorDetail(args: {
+  error: unknown;
+  limit: number;
+  depth?: number;
+  seen?: ReadonlySet<Error>;
+}): string {
+  if (args.limit <= 0) return "";
   if (!(args.error instanceof Error)) {
     return bounded({ value: String(args.error), limit: args.limit });
   }
   const summary = args.error.stack ?? args.error.message;
-  if (!(args.error instanceof AggregateError) || args.error.errors.length === 0) {
+  const depth = args.depth ?? 0;
+  if (args.seen?.has(args.error) === true) {
+    return bounded({ value: `[Circular error: ${args.error.message}]`, limit: args.limit });
+  }
+  if (
+    !(args.error instanceof AggregateError) ||
+    args.error.errors.length === 0 ||
+    depth >= 4
+  ) {
     return bounded({ value: summary, limit: args.limit });
   }
 
+  const seen = new Set(args.seen);
+  seen.add(args.error);
   const members = args.error.errors.slice(0, AGGREGATE_MEMBER_LIMIT);
   const omitted = args.error.errors.length - members.length;
   const omittedLine = omitted === 0 ? "" : `\n${String(omitted)} more failures omitted`;
@@ -60,7 +76,12 @@ function formatErrorDetail(args: { error: unknown; limit: number }): string {
   const details = members.map((error, index) => {
     const membersLeft = members.length - index;
     const memberLimit = Math.floor(remaining / membersLeft);
-    const detail = formatErrorDetail({ error, limit: memberLimit });
+    const detail = formatErrorDetail({
+      error,
+      limit: memberLimit,
+      depth: depth + 1,
+      seen,
+    });
     remaining -= detail.length;
     return `${labels[index] ?? ""}${detail}`;
   });

@@ -120,6 +120,23 @@ describe("adapter CLI", () => {
     expect(diagnostic.length).toBeLessThanOrEqual(2_048);
   });
 
+  it("bounds a self-referential aggregate without losing its sibling", () => {
+    const circular = new AggregateError([], "circular persisted profile marker");
+    circular.errors.push(circular);
+
+    const diagnostic = formatDiagnostic({
+      error: new AdapterError({
+        code: AdapterErrorCode.Readiness,
+        message: "both runtime profiles failed",
+        cause: new AggregateError([circular, new Error("in-memory sibling marker")]),
+      }),
+    });
+
+    expect(diagnostic).toContain("Circular error");
+    expect(diagnostic).toContain("in-memory sibling marker");
+    expect(diagnostic.length).toBeLessThanOrEqual(2_048);
+  });
+
   it("retains an ordinary cause stack that fits the diagnostic budget", () => {
     const cause = new Error("single cause marker");
     cause.stack = `Error: single cause marker\n${"at synthetic frame\n".repeat(60)}single cause tail`;

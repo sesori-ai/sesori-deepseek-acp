@@ -1,7 +1,9 @@
+import { EventEmitter } from "node:events";
 import { cp, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { PassThrough } from "node:stream";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { zstdCompressSync } from "node:zlib";
 import { PROTOCOL_VERSION, type AgentSideConnection, type SessionNotification } from "@agentclientprotocol/sdk";
 import { defaultDshHome, resolveDshHome } from "@deepseek-ai/dsh-home-paths";
@@ -18,8 +20,11 @@ import {
   bootRuntime,
   checkRuntimeComposition,
   composeRuntimeProfile,
+  resolveRuntimeProfile,
+  RuntimeProfileOrigin,
+  type RuntimeProfileFallback,
 } from "../src/runtime.ts";
-import { serveStdio } from "../src/server.ts";
+import { serveStdio, type SignalSource } from "../src/server.ts";
 import { DurableSessionAgent } from "../src/sessions.ts";
 import { createMemorySubagentBindingStore } from "../src/subagent_bindings.ts";
 
@@ -70,6 +75,7 @@ describe("DeepSeek runtime composition", () => {
     });
     const entries = new Map(profile.entries.map((entry) => [entry.id, entry]));
 
+    expect(profile.origin).toEqual({ kind: RuntimeProfileOrigin.InMemory });
     expect(profile.paths).toEqual({
       stateDir,
       sessions: join(stateDir, "sessions"),
@@ -100,7 +106,7 @@ describe("DeepSeek runtime composition", () => {
     );
   });
 
-  it("uses DeepSeek's default and custom home resolution", async () => {
+  it("uses DeepSeek's home resolution and initializes the Sesori profile", async () => {
     delete process.env.DSH_HOME;
     expect(resolveDshHome()).toBe(defaultDshHome());
 
@@ -109,9 +115,461 @@ describe("DeepSeek runtime composition", () => {
     await cp(new URL("./fixtures/dsh-home", import.meta.url), home, { recursive: true });
     process.env.DSH_HOME = home;
     const profile = await checkRuntimeComposition({ stateDir: join(root, "state") });
+    const profilePath = join(home, "profiles", "sesori");
+    const manifest = JSON.parse(await readFile(join(profilePath, "package.json"), "utf8")) as {
+      dsh: { profile: { bundles: string[]; patchReload: string } };
+    };
 
+    expect(profile.origin).toEqual({ kind: RuntimeProfileOrigin.Persisted, path: profilePath });
+    expect(profile.configPath).toBe(fileURLToPath(new URL("../runtime/cordis.json", import.meta.url)));
+    expect(profile.bareModuleBaseUrl).toBe(pathToFileURL(join(profilePath, "cordis.yml")).href);
     expect(profile.paths.stateDir).toBe(join(root, "state"));
+    expect(manifest.dsh.profile).toEqual({
+      bundles: ["@deepseek-ai/dsh-base"],
+      patchReload: "startup",
+    });
+    await expect(readFile(join(profilePath, "cordis.yml"), "utf8")).resolves.toBe("[]\n");
+    await expect(readFile(join(profilePath, "cordis.patch.yml"), "utf8")).resolves.toContain(
+      "Your patch layer",
+    );
+    await expect(readFile(join(profilePath, "pnpm-workspace.yaml"), "utf8")).resolves.toContain(
+      "nodeLinker: hoisted",
+    );
     expect(await readFile(join(home, "settings.yaml"), "utf8")).toContain("synthetic.invalid");
+  });
+
+  it("loads a plugin bundle installed in the Sesori profile", async () => {
+    const root = await tempRoot();
+    const home = join(root, "home");
+    const stateDir = join(root, "state");
+    process.env.DSH_HOME = home;
+    delete process.env.DEEPSEEK_API_KEY;
+
+    const initialized = await resolveRuntimeProfile({ stateDir });
+    if (initialized.origin.kind !== RuntimeProfileOrigin.Persisted) {
+      throw new Error("expected persisted Sesori profile");
+    }
+    const packageName = "synthetic-sesori-profile-plugin";
+    const packagePath = join(initialized.origin.path, "node_modules", packageName);
+    const localPluginPath = join(initialized.origin.path, "local-plugin.mjs");
+    const shadowedReservedName = "@deepseek-ai/dsh-user-approval";
+    const shadowedReservedPath = join(
+      initialized.origin.path,
+      "node_modules",
+      "@deepseek-ai",
+      "dsh-user-approval",
+    );
+    await Promise.all([
+      mkdir(packagePath, { recursive: true }),
+      mkdir(shadowedReservedPath, { recursive: true }),
+    ]);
+    await Promise.all([
+      writeFile(
+        join(packagePath, "package.json"),
+        `${JSON.stringify({
+          name: packageName,
+          version: "1.0.0",
+          type: "module",
+          exports: { import: "./index.js" },
+          dsh: { bundle: { patch: "./cordis.patch.yml" } },
+        }, null, 2)}\n`,
+      ),
+      writeFile(
+        join(packagePath, "cordis.patch.yml"),
+        `- id: agent\n  disabled: true\n- id: subagent\n  disabled: true\n- id: approval\n  disabled: true\n- insert:\n    - id: synthetic-profile-plugin\n      name: '${packageName}'\n`,
+      ),
+      writeFile(
+        join(packagePath, "index.js"),
+        `const name = "synthetic-profile-plugin";\nconst inject = [];\nfunction apply() { globalThis.__sesoriSyntheticProfilePlugin = true; }\nexport { apply, inject, name };\n`,
+      ),
+      writeFile(
+        localPluginPath,
+        `const name = "synthetic-relative-profile-plugin";\nconst inject = [];\nfunction apply() { globalThis.__sesoriRelativeProfilePlugin = true; }\nexport { apply, inject, name };\n`,
+      ),
+      writeFile(
+        join(initialized.origin.path, "cordis.patch.yml"),
+        "- insert:\n    - id: synthetic-relative-profile-plugin\n      name: './local-plugin.mjs'\n    - id: unavailable-disabled-plugin\n      name: 'unavailable-disabled-plugin'\n      disabled: true\n",
+      ),
+      writeFile(
+        join(shadowedReservedPath, "package.json"),
+        `${JSON.stringify({
+          name: shadowedReservedName,
+          version: "0.0.0",
+          type: "module",
+          exports: "./index.js",
+        }, null, 2)}\n`,
+      ),
+      writeFile(
+        join(shadowedReservedPath, "index.js"),
+        `throw new Error("profile-local reserved plugin shadow was loaded");\n`,
+      ),
+    ]);
+    const manifestPath = join(initialized.origin.path, "package.json");
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+      dependencies: Record<string, string>;
+      dsh: { profile: { bundles: string[]; patchReload: string } };
+    };
+    manifest.dependencies[packageName] = "1.0.0";
+    manifest.dependencies[shadowedReservedName] = "0.0.0";
+    manifest.dsh.profile.bundles.push(packageName);
+    await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+    const loaded = await resolveRuntimeProfile({ stateDir });
+    expect(loaded.origin).toEqual({
+      kind: RuntimeProfileOrigin.Persisted,
+      path: initialized.origin.path,
+    });
+    expect(loaded.entries).toContainEqual(
+      expect.objectContaining({
+        id: "synthetic-profile-plugin",
+        name: packageName,
+      }),
+    );
+    expect(loaded.entries).toContainEqual(
+      expect.objectContaining({
+        id: "synthetic-relative-profile-plugin",
+        name: pathToFileURL(localPluginPath).href,
+      }),
+    );
+    expect(loaded.entries).toContainEqual(
+      expect.objectContaining({
+        id: "unavailable-disabled-plugin",
+        name: "unavailable-disabled-plugin",
+        disabled: true,
+      }),
+    );
+    expect(loaded.entries.find((entry) => entry.id === "agent")?.disabled).toBe(false);
+    expect(loaded.entries.find((entry) => entry.id === "subagent")?.disabled).toBe(false);
+    expect(loaded.entries.find((entry) => entry.id === "approval")?.disabled).toBe(false);
+
+    const globals = globalThis as typeof globalThis & {
+      __sesoriRelativeProfilePlugin?: true;
+      __sesoriSyntheticProfilePlugin?: true;
+    };
+    const fallbacks: RuntimeProfileFallback[] = [];
+    const context = await bootRuntime({
+      stateDir,
+      onProfileFallback: (fallback) => fallbacks.push(fallback),
+    });
+    try {
+      expect(fallbacks).toEqual([]);
+      expect(globals.__sesoriRelativeProfilePlugin).toBe(true);
+      expect(globals.__sesoriSyntheticProfilePlugin).toBe(true);
+      expect(context.get("agents")).toBeDefined();
+      expect(context.get("subagents")).toBeDefined();
+      expect(context.get("sessionTelemetry")).toBeUndefined();
+      expect(context.get("hmr")).toBeUndefined();
+    } finally {
+      delete globals.__sesoriRelativeProfilePlugin;
+      delete globals.__sesoriSyntheticProfilePlugin;
+      await context.fiber.dispose();
+    }
+  });
+
+  it("falls back when the Sesori profile cannot be created", async () => {
+    const root = await tempRoot();
+    const home = join(root, "home");
+    await mkdir(home);
+    await writeFile(join(home, "profiles"), "occupied by a file");
+    process.env.DSH_HOME = home;
+
+    const fallbacks: RuntimeProfileFallback[] = [];
+    const profile = await resolveRuntimeProfile({
+      stateDir: join(root, "state"),
+      onProfileFallback: (fallback) => fallbacks.push(fallback),
+    });
+
+    expect(profile.origin).toEqual({ kind: RuntimeProfileOrigin.InMemory });
+    expect(fallbacks).toHaveLength(1);
+    expect(fallbacks[0]?.error.message).toBe(
+      "The Sesori DeepSeek profile is unavailable; using the pinned in-memory profile",
+    );
+    expect(fallbacks[0]?.error.cause).toBeInstanceOf(Error);
+    await expect(readFile(join(home, "profiles"), "utf8")).resolves.toBe("occupied by a file");
+  });
+
+  it("falls back when a profile duplicates a reserved Sesori row", async () => {
+    const root = await tempRoot();
+    const home = join(root, "home");
+    const stateDir = join(root, "state");
+    process.env.DSH_HOME = home;
+
+    const initialized = await resolveRuntimeProfile({ stateDir });
+    if (initialized.origin.kind !== RuntimeProfileOrigin.Persisted) {
+      throw new Error("expected persisted Sesori profile");
+    }
+    await writeFile(
+      join(initialized.origin.path, "cordis.patch.yml"),
+      "- insert:\n    - id: approval\n      name: '@deepseek-ai/dsh-user-approval'\n      config: []\n",
+    );
+
+    const fallbacks: RuntimeProfileFallback[] = [];
+    const profile = await resolveRuntimeProfile({
+      stateDir,
+      onProfileFallback: (fallback) => fallbacks.push(fallback),
+    });
+
+    expect(profile.origin).toEqual({ kind: RuntimeProfileOrigin.InMemory });
+    expect(fallbacks).toHaveLength(1);
+    expect((fallbacks[0]?.error.cause as Error | undefined)?.message).toContain(
+      "duplicates reserved Sesori rows: approval",
+    );
+  });
+
+  it("falls back when a profile group is cyclic", async () => {
+    const root = await tempRoot();
+    const home = join(root, "home");
+    const stateDir = join(root, "state");
+    process.env.DSH_HOME = home;
+
+    const initialized = await resolveRuntimeProfile({ stateDir });
+    if (initialized.origin.kind !== RuntimeProfileOrigin.Persisted) {
+      throw new Error("expected persisted Sesori profile");
+    }
+    await writeFile(
+      join(initialized.origin.path, "cordis.patch.yml"),
+      `- insert:
+    - id: cyclic-group
+      name: '@deepseek-ai/cordis-plugin-group'
+      group: true
+      config: []
+- id: cyclic-group
+  config:
+    - &cyclicChild
+      id: cyclic-child
+      name: '@deepseek-ai/cordis-plugin-group'
+      group: true
+      config:
+        - *cyclicChild
+`,
+    );
+
+    const fallbacks: RuntimeProfileFallback[] = [];
+    const profile = await resolveRuntimeProfile({
+      stateDir,
+      onProfileFallback: (fallback) => fallbacks.push(fallback),
+    });
+
+    expect(profile.origin).toEqual({ kind: RuntimeProfileOrigin.InMemory });
+    expect(fallbacks).toHaveLength(1);
+    expect((fallbacks[0]?.error.cause as Error | undefined)?.message).toContain(
+      "cyclic or repeated group entry",
+    );
+  });
+
+  it("falls back when a reserved plugin uses an alternate row ID", async () => {
+    const root = await tempRoot();
+    const home = join(root, "home");
+    const stateDir = join(root, "state");
+    process.env.DSH_HOME = home;
+
+    const initialized = await resolveRuntimeProfile({ stateDir });
+    if (initialized.origin.kind !== RuntimeProfileOrigin.Persisted) {
+      throw new Error("expected persisted Sesori profile");
+    }
+    const reservedModuleUrl = import.meta
+      .resolve("@deepseek-ai/dsh-session-telemetry-otel")
+      .replace(/^file:/u, "FiLe:");
+    await writeFile(
+      join(initialized.origin.path, "cordis.patch.yml"),
+      `- insert:
+    - id: profile-telemetry
+      name: '${reservedModuleUrl}'
+`,
+    );
+
+    const fallbacks: RuntimeProfileFallback[] = [];
+    const profile = await resolveRuntimeProfile({
+      stateDir,
+      onProfileFallback: (fallback) => fallbacks.push(fallback),
+    });
+
+    expect(profile.origin).toEqual({ kind: RuntimeProfileOrigin.InMemory });
+    expect(fallbacks).toHaveLength(1);
+    expect((fallbacks[0]?.error.cause as Error | undefined)?.message).toContain(
+      "mounts reserved plugin @deepseek-ai/dsh-session-telemetry-otel under alternate row profile-telemetry",
+    );
+  });
+
+  it("falls back when a nested profile group mounts a forbidden plugin", async () => {
+    const root = await tempRoot();
+    const home = join(root, "home");
+    const stateDir = join(root, "state");
+    process.env.DSH_HOME = home;
+
+    const initialized = await resolveRuntimeProfile({ stateDir });
+    if (initialized.origin.kind !== RuntimeProfileOrigin.Persisted) {
+      throw new Error("expected persisted Sesori profile");
+    }
+    const forbiddenPackagePath = join(
+      initialized.origin.path,
+      "node_modules",
+      "@deepseek-ai",
+      "dsh-acp",
+    );
+    await mkdir(forbiddenPackagePath, { recursive: true });
+    await Promise.all([
+      writeFile(
+        join(forbiddenPackagePath, "package.json"),
+        `${JSON.stringify({
+          name: "@deepseek-ai/dsh-acp",
+          version: "0.0.0",
+          type: "module",
+          exports: "./index.js",
+        }, null, 2)}\n`,
+      ),
+      writeFile(
+        join(forbiddenPackagePath, "index.js"),
+        "export const name = 'synthetic-forbidden-acp';\n",
+      ),
+      writeFile(
+        join(initialized.origin.path, "cordis.patch.yml"),
+        `- insert:
+    - id: synthetic-nested-group
+      name: '@deepseek-ai/cordis-plugin-group'
+      group: true
+      config:
+        - id: forbidden-nested-host
+          name: '${pathToFileURL(join(forbiddenPackagePath, "index.js")).href}'
+`,
+      ),
+    ]);
+
+    const fallbacks: RuntimeProfileFallback[] = [];
+    const profile = await resolveRuntimeProfile({
+      stateDir,
+      onProfileFallback: (fallback) => fallbacks.push(fallback),
+    });
+
+    expect(profile.origin).toEqual({ kind: RuntimeProfileOrigin.InMemory });
+    expect(fallbacks).toHaveLength(1);
+    expect((fallbacks[0]?.error.cause as Error | undefined)?.message).toContain(
+      "unexpectedly mounts @deepseek-ai/dsh-acp",
+    );
+  });
+
+  it("falls back when a profile replaces a reserved row plugin", async () => {
+    const root = await tempRoot();
+    const home = join(root, "home");
+    const stateDir = join(root, "state");
+    process.env.DSH_HOME = home;
+
+    const initialized = await resolveRuntimeProfile({ stateDir });
+    if (initialized.origin.kind !== RuntimeProfileOrigin.Persisted) {
+      throw new Error("expected persisted Sesori profile");
+    }
+    const packageName = "synthetic-replacement-bundle";
+    const packagePath = join(initialized.origin.path, "node_modules", packageName);
+    await mkdir(packagePath, { recursive: true });
+    await Promise.all([
+      writeFile(
+        join(packagePath, "package.json"),
+        `${JSON.stringify({
+          name: packageName,
+          version: "1.0.0",
+          dsh: { bundle: { patch: "./cordis.patch.yml" } },
+        }, null, 2)}\n`,
+      ),
+      writeFile(
+        join(packagePath, "cordis.patch.yml"),
+        `- insert:
+    - id: session-persistence-jsonl
+      name: '@deepseek-ai/dsh-session-persistence-jsonl'
+    - id: attachment-local
+      name: '@deepseek-ai/dsh-attachment-local'
+    - id: session-query-sqlite
+      name: '@deepseek-ai/dsh-session-query-sqlite'
+    - id: storage-json
+      name: '@deepseek-ai/dsh-storage-json'
+    - id: spill-local
+      name: '@deepseek-ai/dsh-spill-local'
+    - id: session-telemetry-otel
+      name: '${packageName}'
+    - id: hmr
+      name: '@deepseek-ai/cordis-plugin-hmr'
+    - id: sandbox-policy
+      name: '@deepseek-ai/dsh-sandbox-policy'
+    - id: approval
+      name: '@deepseek-ai/dsh-user-approval'
+`,
+      ),
+    ]);
+    const manifestPath = join(initialized.origin.path, "package.json");
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+      dependencies: Record<string, string>;
+      dsh: { profile: { bundles: string[] } };
+    };
+    manifest.dependencies[packageName] = "1.0.0";
+    manifest.dsh.profile.bundles = [packageName];
+    await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+    const fallbacks: RuntimeProfileFallback[] = [];
+    const profile = await resolveRuntimeProfile({
+      stateDir,
+      onProfileFallback: (fallback) => fallbacks.push(fallback),
+    });
+
+    expect(profile.origin).toEqual({ kind: RuntimeProfileOrigin.InMemory });
+    expect(fallbacks).toHaveLength(1);
+    expect((fallbacks[0]?.error.cause as Error | undefined)?.message).toContain(
+      "rejected the adapter overlay",
+    );
+    expect((fallbacks[0]?.error.cause as Error | undefined)?.message).toContain(
+      "session-telemetry-otel",
+    );
+  });
+
+  it("falls back when an installed profile plugin cannot boot", async () => {
+    const root = await tempRoot();
+    const home = join(root, "home");
+    const stateDir = join(root, "state");
+    process.env.DSH_HOME = home;
+    delete process.env.DEEPSEEK_API_KEY;
+
+    const initialized = await resolveRuntimeProfile({ stateDir });
+    if (initialized.origin.kind !== RuntimeProfileOrigin.Persisted) {
+      throw new Error("expected persisted Sesori profile");
+    }
+    const packageName = "failing-profile-plugin";
+    const packagePath = join(initialized.origin.path, "node_modules", packageName);
+    await mkdir(packagePath, { recursive: true });
+    await Promise.all([
+      writeFile(
+        join(packagePath, "package.json"),
+        `${JSON.stringify({
+          name: packageName,
+          version: "1.0.0",
+          type: "module",
+          exports: "./index.js",
+        }, null, 2)}\n`,
+      ),
+      writeFile(join(packagePath, "index.js"), "throw new Error('synthetic plugin boot failure');\n"),
+      writeFile(
+        join(initialized.origin.path, "cordis.patch.yml"),
+        `- insert:\n    - id: failing-profile-plugin\n      name: '${packageName}'\n`,
+      ),
+    ]);
+
+    const cancellationFallbacks: RuntimeProfileFallback[] = [];
+    await expect(bootRuntime({
+      stateDir,
+      abortSignal: AbortSignal.abort(),
+      onProfileFallback: (fallback) => cancellationFallbacks.push(fallback),
+    })).rejects.toThrow("plugin tree failed to load");
+    expect(cancellationFallbacks).toEqual([]);
+
+    const fallbacks: RuntimeProfileFallback[] = [];
+    const context = await bootRuntime({
+      stateDir,
+      onProfileFallback: (fallback) => fallbacks.push(fallback),
+    });
+    try {
+      expect(context.get("sessions")).toBeDefined();
+      expect(fallbacks).toHaveLength(1);
+      expect(fallbacks[0]?.error.cause).toBeInstanceOf(Error);
+    } finally {
+      await context.fiber.dispose();
+    }
   });
 
   it("rejects a dangling configuration symlink", async () => {
@@ -126,7 +584,7 @@ describe("DeepSeek runtime composition", () => {
     );
   });
 
-  it("boots the full profile without network or normal-home writes", async () => {
+  it("boots the full profile without network or settings writes", async () => {
     const root = await tempRoot();
     const home = join(root, "home");
     const stateDir = join(root, "state");
@@ -199,7 +657,7 @@ describe("DeepSeek runtime composition", () => {
       fetchSpy.mockRestore();
     }
 
-    expect(await readdir(home)).toEqual(before);
+    expect((await readdir(home)).sort()).toEqual([...before, "profiles"].sort());
     await expect(readFile(join(home, "settings.yaml"), "utf8")).resolves.toBe(settingsBefore);
   });
 
@@ -542,6 +1000,31 @@ describe("DeepSeek runtime composition", () => {
       await agent.dispose();
       await second.fiber.dispose();
     }
+  });
+
+  it("cancels the default runtime before profile plugins mount", async () => {
+    const root = await tempRoot();
+    process.env.DSH_HOME = join(root, "home");
+    delete process.env.DEEPSEEK_API_KEY;
+    const emitter = new EventEmitter();
+    const signalSource: SignalSource = {
+      once: (event, listener) => emitter.once(event, listener),
+      off: (event, listener) => emitter.off(event, listener),
+    };
+    const input = new PassThrough();
+    const completion = serveStdio({
+      stateDir: join(root, "state"),
+      input,
+      output: new PassThrough(),
+      diagnostics: new PassThrough(),
+      signalSource,
+    });
+
+    emitter.emit("SIGTERM");
+
+    await expect(completion).resolves.toBeUndefined();
+    expect(emitter.listenerCount("SIGINT")).toBe(0);
+    expect(emitter.listenerCount("SIGTERM")).toBe(0);
   });
 
   it("mounts ACP only after the full profile is ready", async () => {

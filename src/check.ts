@@ -8,7 +8,10 @@ import invalidFixtures from "../protocol/v2/fixtures/invalid.json" with { type: 
 import validFixtures from "../protocol/v2/fixtures/valid.json" with { type: "json" };
 import { AdapterError, AdapterErrorCode } from "./errors.js";
 import { ACP_SDK_VERSION, DEEPSEEK_HARNESS_VERSION } from "./protocol.js";
-import { checkRuntimeComposition } from "./runtime.js";
+import {
+  checkRuntimeComposition,
+  type RuntimeProfileFallbackReporter,
+} from "./runtime.js";
 import { validateFixtureCorpus } from "./schema.js";
 
 export interface ReadinessReport {
@@ -111,7 +114,10 @@ function validateProtocolCorpus(): void {
   }
 }
 
-export async function checkReadiness(args: { stateDir: string }): Promise<ReadinessReport> {
+export async function checkReadiness(args: {
+  stateDir: string;
+  onProfileFallback?: RuntimeProfileFallbackReporter;
+}): Promise<ReadinessReport> {
   if (deepSeekPackage.version !== DEEPSEEK_HARNESS_VERSION) {
     throw new AdapterError({
       code: AdapterErrorCode.Readiness,
@@ -137,7 +143,10 @@ export async function checkReadiness(args: { stateDir: string }): Promise<Readin
   }
 
   validateProtocolCorpus();
-  await checkRuntimeComposition({ stateDir: args.stateDir });
+  await checkRuntimeComposition({
+    stateDir: args.stateDir,
+    ...(args.onProfileFallback === undefined ? {} : { onProfileFallback: args.onProfileFallback }),
+  });
   return {
     stateDir: args.stateDir,
     stateDirExists: await validateStateDirectory({ stateDir: args.stateDir }),

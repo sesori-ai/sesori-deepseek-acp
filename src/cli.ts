@@ -73,7 +73,12 @@ export async function runCli(args: {
         args.output.write(`${formatVersion()}\n`);
         return AdapterExitCode.Success;
       case CliMode.Check: {
-        const report = await checkReadiness({ stateDir: invocation.stateDir });
+        const report = await checkReadiness({
+          stateDir: invocation.stateDir,
+          onProfileFallback: ({ error }) => {
+            args.diagnostics.write(`sesori-deepseek-acp: warning: ${formatDiagnostic({ error })}\n`);
+          },
+        });
         args.output.write(`${JSON.stringify({ status: "ok", ...report, version: formatVersion() })}\n`);
         return AdapterExitCode.Success;
       }

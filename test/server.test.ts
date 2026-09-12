@@ -3,6 +3,7 @@ import { PassThrough } from "node:stream";
 import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
 import { Context } from "@deepseek-ai/cordis";
 import { describe, expect, it, vi } from "vitest";
+import { AdapterError, AdapterErrorCode } from "../src/errors.ts";
 import {
   ADAPTER_NAME,
   ADAPTER_TITLE,
@@ -62,6 +63,7 @@ const testRuntimeBoot: RuntimeBoot = async (args) => {
   const context = new Context();
   const prepared = args.prepare(context);
   if (prepared !== undefined) await prepared;
+  if (args.abortSignal.aborted) return context;
   context.provide("agents", {} as never);
   context.provide("sessionPersistence", {} as never);
   context.provide("subagents", {} as never);
@@ -184,6 +186,28 @@ describe("ACP server", () => {
     await finish({ harness });
   });
 
+  it("reports a recovered profile fallback on stderr", async () => {
+    const runtimeBoot: RuntimeBoot = async (args) => {
+      args.onProfileFallback({
+        error: new AdapterError({
+          code: AdapterErrorCode.Readiness,
+          message: "synthetic profile fallback",
+          cause: new Error("synthetic profile failure"),
+        }),
+      });
+      return testRuntimeBoot(args);
+    };
+    const harness = startHarness({ runtimeBoot });
+
+    await finish({ harness });
+
+    expect(harness.stdout()).toBe("");
+    expect(harness.stderr()).toContain(
+      "warning: readiness_error: synthetic profile fallback",
+    );
+    expect(harness.stderr()).toContain("Caused by: Error: synthetic profile failure");
+  });
+
   it("closes cleanly on input EOF", async () => {
     const harness = startHarness();
     await finish({ harness });
@@ -233,7 +257,7 @@ describe("ACP server", () => {
     expect(emitter.listenerCount("SIGTERM")).toBe(0);
   });
 
-  it("cancels runtime startup when a signal arrives before prepare", async () => {
+  it("cancels runtime startup cleanly when a signal arrives before prepare", async () => {
     const emitter = new EventEmitter();
     const signalSource: SignalSource = {
       once: (event, listener) => emitter.once(event, listener),
@@ -241,27 +265,54 @@ describe("ACP server", () => {
     };
     const started = Promise.withResolvers<void>();
     const releasePrepare = Promise.withResolvers<void>();
-    const prepared = Promise.withResolvers<void>();
-    const releaseBoot = Promise.withResolvers<void>();
+    const prepareSettled = Promise.withResolvers<void>();
     const context = new Context();
     const dispose = vi.spyOn(context.fiber, "dispose");
     const runtimeBoot: RuntimeBoot = async (args) => {
       started.resolve();
       await releasePrepare.promise;
-      await args.prepare(context);
-      prepared.resolve();
-      await releaseBoot.promise;
-      return context;
+      expect(args.abortSignal.aborted).toBe(true);
+      try {
+        await args.prepare(context);
+      } finally {
+        prepareSettled.resolve();
+      }
+      throw new Error("prepare should have cancelled startup");
     };
     const harness = startHarness({ signalSource, runtimeBoot });
     await started.promise;
 
     emitter.emit("SIGTERM");
     releasePrepare.resolve();
-    await prepared.promise;
-    await expect.poll(() => dispose.mock.calls.length).toBe(1);
-    releaseBoot.resolve();
+    await prepareSettled.promise;
+    expect(dispose).toHaveBeenCalledTimes(1);
     await harness.completion;
+    expect(emitter.listenerCount("SIGINT")).toBe(0);
+    expect(emitter.listenerCount("SIGTERM")).toBe(0);
+  });
+
+  it("preserves a genuine startup failure that races with termination", async () => {
+    const emitter = new EventEmitter();
+    const signalSource: SignalSource = {
+      once: (event, listener) => emitter.once(event, listener),
+      off: (event, listener) => emitter.off(event, listener),
+    };
+    const started = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const failure = new Error("synthetic concurrent startup failure");
+    const context = new Context();
+    const runtimeBoot: RuntimeBoot = async (args) => {
+      await args.prepare(context);
+      started.resolve();
+      await release.promise;
+      throw failure;
+    };
+    const harness = startHarness({ signalSource, runtimeBoot });
+    await started.promise;
+
+    emitter.emit("SIGTERM");
+    release.resolve();
+    await expect(harness.completion).rejects.toBe(failure);
     expect(emitter.listenerCount("SIGINT")).toBe(0);
     expect(emitter.listenerCount("SIGTERM")).toBe(0);
   });

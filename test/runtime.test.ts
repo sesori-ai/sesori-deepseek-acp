@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import { cp, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -22,7 +23,7 @@ import {
   RuntimeProfileOrigin,
   type RuntimeProfileFallback,
 } from "../src/runtime.ts";
-import { serveStdio } from "../src/server.ts";
+import { serveStdio, type SignalSource } from "../src/server.ts";
 import { DurableSessionAgent } from "../src/sessions.ts";
 import { createMemorySubagentBindingStore } from "../src/subagent_bindings.ts";
 
@@ -148,7 +149,17 @@ describe("DeepSeek runtime composition", () => {
     }
     const packageName = "synthetic-sesori-profile-plugin";
     const packagePath = join(initialized.origin.path, "node_modules", packageName);
-    await mkdir(packagePath, { recursive: true });
+    const shadowedReservedName = "@deepseek-ai/dsh-user-approval";
+    const shadowedReservedPath = join(
+      initialized.origin.path,
+      "node_modules",
+      "@deepseek-ai",
+      "dsh-user-approval",
+    );
+    await Promise.all([
+      mkdir(packagePath, { recursive: true }),
+      mkdir(shadowedReservedPath, { recursive: true }),
+    ]);
     await Promise.all([
       writeFile(
         join(packagePath, "package.json"),
@@ -168,6 +179,19 @@ describe("DeepSeek runtime composition", () => {
         join(packagePath, "index.js"),
         `const name = "synthetic-profile-plugin";\nconst inject = [];\nfunction apply() { globalThis.__sesoriSyntheticProfilePlugin = true; }\nexport { apply, inject, name };\n`,
       ),
+      writeFile(
+        join(shadowedReservedPath, "package.json"),
+        `${JSON.stringify({
+          name: shadowedReservedName,
+          version: "0.0.0",
+          type: "module",
+          exports: "./index.js",
+        }, null, 2)}\n`,
+      ),
+      writeFile(
+        join(shadowedReservedPath, "index.js"),
+        `throw new Error("profile-local reserved plugin shadow was loaded");\n`,
+      ),
     ]);
     const manifestPath = join(initialized.origin.path, "package.json");
     const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
@@ -175,6 +199,7 @@ describe("DeepSeek runtime composition", () => {
       dsh: { profile: { bundles: string[]; patchReload: string } };
     };
     manifest.dependencies[packageName] = "1.0.0";
+    manifest.dependencies[shadowedReservedName] = "0.0.0";
     manifest.dsh.profile.bundles.push(packageName);
     await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
 
@@ -257,6 +282,41 @@ describe("DeepSeek runtime composition", () => {
     expect(fallbacks).toHaveLength(1);
     expect((fallbacks[0]?.error.cause as Error | undefined)?.message).toContain(
       "duplicates reserved Sesori rows: approval",
+    );
+  });
+
+  it("falls back when a nested profile group mounts a forbidden plugin", async () => {
+    const root = await tempRoot();
+    const home = join(root, "home");
+    const stateDir = join(root, "state");
+    process.env.DSH_HOME = home;
+
+    const initialized = await resolveRuntimeProfile({ stateDir });
+    if (initialized.origin.kind !== RuntimeProfileOrigin.Persisted) {
+      throw new Error("expected persisted Sesori profile");
+    }
+    await writeFile(
+      join(initialized.origin.path, "cordis.patch.yml"),
+      `- insert:
+    - id: synthetic-nested-group
+      name: '@deepseek-ai/cordis-plugin-group'
+      group: true
+      config:
+        - id: forbidden-nested-host
+          name: '@deepseek-ai/dsh-acp'
+`,
+    );
+
+    const fallbacks: RuntimeProfileFallback[] = [];
+    const profile = await resolveRuntimeProfile({
+      stateDir,
+      onProfileFallback: (fallback) => fallbacks.push(fallback),
+    });
+
+    expect(profile.origin).toEqual({ kind: RuntimeProfileOrigin.InMemory });
+    expect(fallbacks).toHaveLength(1);
+    expect((fallbacks[0]?.error.cause as Error | undefined)?.message).toContain(
+      "unexpectedly mounts @deepseek-ai/dsh-acp",
     );
   });
 
@@ -797,6 +857,31 @@ describe("DeepSeek runtime composition", () => {
       await agent.dispose();
       await second.fiber.dispose();
     }
+  });
+
+  it("cancels the default runtime before profile plugins mount", async () => {
+    const root = await tempRoot();
+    process.env.DSH_HOME = join(root, "home");
+    delete process.env.DEEPSEEK_API_KEY;
+    const emitter = new EventEmitter();
+    const signalSource: SignalSource = {
+      once: (event, listener) => emitter.once(event, listener),
+      off: (event, listener) => emitter.off(event, listener),
+    };
+    const input = new PassThrough();
+    const completion = serveStdio({
+      stateDir: join(root, "state"),
+      input,
+      output: new PassThrough(),
+      diagnostics: new PassThrough(),
+      signalSource,
+    });
+
+    emitter.emit("SIGTERM");
+
+    await expect(completion).resolves.toBeUndefined();
+    expect(emitter.listenerCount("SIGINT")).toBe(0);
+    expect(emitter.listenerCount("SIGTERM")).toBe(0);
   });
 
   it("mounts ACP only after the full profile is ready", async () => {

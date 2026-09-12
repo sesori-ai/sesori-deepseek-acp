@@ -39,6 +39,12 @@ const RESERVED_PROFILE_ENTRY_NAMES = new Map([
   ["tool-ask-user", "@deepseek-ai/dsh-tool-ask-user"],
 ]);
 const RESERVED_PROFILE_ENTRY_IDS = new Set(RESERVED_PROFILE_ENTRY_NAMES.keys());
+const PINNED_RESERVED_PROFILE_ENTRY_MODULES = new Map(
+  [...RESERVED_PROFILE_ENTRY_NAMES].map(([id, name]) => [
+    id,
+    fileURLToPath(import.meta.resolve(name)),
+  ]),
+);
 export const RUNTIME_READY_KEY = "sesoriRuntimeReady";
 const runtimeConfigPath = fileURLToPath(new URL("../runtime/cordis.json", import.meta.url));
 const basePatchPath = fileURLToPath(import.meta.resolve(`${BASE_BUNDLE_NAME}/cordis.patch.yml`));
@@ -193,9 +199,33 @@ function assertEntry(args: {
   }
 }
 
+interface ProfileEntryLocation {
+  enabled: boolean;
+  entry: EntryOptions;
+}
+
+function profileEntryLocations(args: { entries: EntryOptions[] }): ProfileEntryLocation[] {
+  const locations: ProfileEntryLocation[] = [];
+  const pending = args.entries.map((entry) => ({ enabled: true, entry }));
+  let index = 0;
+  while (index < pending.length) {
+    const location = pending[index];
+    index += 1;
+    if (location === undefined) continue;
+    const enabled = location.enabled && location.entry.disabled !== true;
+    locations.push({ enabled, entry: location.entry });
+    if (location.entry.group === true && Array.isArray(location.entry.config)) {
+      pending.push(
+        ...(location.entry.config as EntryOptions[]).map((entry) => ({ enabled, entry })),
+      );
+    }
+  }
+  return locations;
+}
+
 function assertReservedEntryIdsUnique(args: { entries: EntryOptions[] }): void {
   const counts = new Map<string, number>();
-  for (const entry of args.entries) {
+  for (const { entry } of profileEntryLocations({ entries: args.entries })) {
     if (!RESERVED_PROFILE_ENTRY_IDS.has(entry.id)) continue;
     counts.set(entry.id, (counts.get(entry.id) ?? 0) + 1);
   }
@@ -261,9 +291,9 @@ function assertComposition(args: {
   });
   assertEntry({ entries: args.entries, id: "tool-ask-user", enabled: true });
 
-  const forbidden = args.entries.find((entry) => {
+  const forbidden = profileEntryLocations({ entries: args.entries }).find(({ enabled, entry }) => {
     const name = entry.name ?? "";
-    return entry.disabled !== true && (
+    return enabled && (
       name === "@deepseek-ai/dsh-acp" ||
       name.startsWith("@deepseek-ai/dsh-host-") ||
       name.includes("frontend-static") ||
@@ -274,9 +304,18 @@ function assertComposition(args: {
   if (forbidden !== undefined) {
     throw new AdapterError({
       code: AdapterErrorCode.Readiness,
-      message: `The DeepSeek profile unexpectedly mounts ${forbidden.name ?? forbidden.id}`,
+      message: `The DeepSeek profile unexpectedly mounts ${forbidden.entry.name ?? forbidden.entry.id}`,
     });
   }
+}
+
+function pinReservedProfileEntryModules(args: { entries: EntryOptions[] }): EntryOptions[] {
+  const entries = structuredClone(args.entries);
+  for (const { entry } of profileEntryLocations({ entries })) {
+    const pinnedModule = PINNED_RESERVED_PROFILE_ENTRY_MODULES.get(entry.id);
+    if (pinnedModule !== undefined) entry.name = pinnedModule;
+  }
+  return entries;
 }
 
 function adapterInstallAnchor(): string {
@@ -321,7 +360,7 @@ function composeRuntimeProfileLayers(args: {
     configPath: args.configPath,
     entries,
     origin: args.origin,
-    patches,
+    patches: [{ insert: pinReservedProfileEntryModules({ entries }) }],
     paths,
   };
 }

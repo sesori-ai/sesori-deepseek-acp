@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 
 const requestTimeoutMilliseconds = 30_000;
+const profileStdoutSentinel = "SYNTHETIC_PROFILE_STDOUT_MUST_NOT_REACH_ACP";
 
 function timeout(promise, operation, milliseconds = requestTimeoutMilliseconds) {
   let timer;
@@ -244,7 +245,7 @@ async function installSyntheticProfileBundle(home) {
     ),
     writeFile(
       join(plugin, "index.js"),
-      `import { writeFileSync } from "node:fs";\nimport { join } from "node:path";\nconst name = "synthetic-profile-plugin";\nconst inject = [];\nfunction apply() { writeFileSync(join(process.env.DSH_HOME, "profiles", "sesori", "plugin-loaded"), "loaded\\n"); }\nexport { apply, inject, name };\n`,
+      `import { writeFileSync } from "node:fs";\nimport { join } from "node:path";\nconst name = "synthetic-profile-plugin";\nconst inject = [];\nfunction apply() { console.log("${profileStdoutSentinel}"); writeFileSync(join(process.env.DSH_HOME, "profiles", "sesori", "plugin-loaded"), "loaded\\n"); }\nexport { apply, inject, name };\n`,
     ),
   ]);
 }
@@ -288,6 +289,11 @@ export async function smokeAcpLifecycle({ launcher, target, packageRoot, tempora
       await readFile(pluginMarker, "utf8").catch(() => "") === "loaded\n",
       `Packaged runtime did not load the Sesori profile plugin initially: ${first.diagnostics()}`,
     );
+    expect(
+      first.diagnostics().includes("unframed runtime stdout was suppressed"),
+      `Packaged runtime did not report suppressed plugin stdout: ${first.diagnostics()}`,
+    );
+    expect(!first.diagnostics().includes(profileStdoutSentinel), "Packaged runtime leaked plugin stdout");
     await rm(pluginMarker, { force: true });
     restarted = startAcpProcess({ launcher, target, stateDir, environment: isolatedEnvironment, cwd: packageRoot });
     await exerciseRestart({ client: restarted, workspace, sessionId });
@@ -297,6 +303,14 @@ export async function smokeAcpLifecycle({ launcher, target, packageRoot, tempora
     expect(
       await readFile(pluginMarker, "utf8").catch(() => "") === "loaded\n",
       `Packaged runtime did not reload the Sesori profile plugin: ${restarted.diagnostics()}`,
+    );
+    expect(
+      restarted.diagnostics().includes("unframed runtime stdout was suppressed"),
+      `Packaged runtime did not report suppressed restart stdout: ${restarted.diagnostics()}`,
+    );
+    expect(
+      !restarted.diagnostics().includes(profileStdoutSentinel),
+      "Packaged runtime leaked plugin stdout after restart",
     );
     const homeEntries = (await readdir(home)).sort();
     expect(JSON.stringify(homeEntries) === JSON.stringify([".anonymous-user-id", "profiles", "settings.yaml"]), `Packaged runtime wrote unexpected state into DSH_HOME: ${homeEntries.join(", ")}`);

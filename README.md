@@ -16,7 +16,9 @@ node dist/src/bin.js check --state-dir /absolute/writable/directory
 node dist/src/bin.js serve --state-dir /absolute/writable/directory
 ```
 
-`serve` reserves stdout for ACP NDJSON. Local diagnostics use stderr and never
+`serve` reserves stdout for ACP NDJSON. Unframed runtime/plugin writes to
+`console.log` or `process.stdout` are suppressed with a metadata-only stderr
+warning; plugins should use stderr or a Harness logger. Local diagnostics never
 include protocol frames, prompts, transcripts, credentials, or tool payloads.
 
 ## Sesori profile plugins
@@ -29,8 +31,10 @@ dsh plugin --profile sesori add <package>
 ```
 
 Bundle and profile patches load before Sesori's mandatory state, telemetry,
-hot-reload, sandbox, approval, and transport constraints. Profile membership
-and patch changes take effect on the next adapter start. If the profile cannot
+hot-reload, sandbox, approval, and transport constraints. Reserved policy rows
+resolve their implementations from the pinned adapter even when a profile
+package shadows the same dependency name. Profile membership and patch changes
+take effect on the next adapter start. If the profile cannot
 be created, read, composed, prepared, or started, the adapter reports the local
 failure on stderr and continues with its pinned in-memory profile.
 

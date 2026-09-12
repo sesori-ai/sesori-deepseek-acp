@@ -63,6 +63,7 @@ const testRuntimeBoot: RuntimeBoot = async (args) => {
   const context = new Context();
   const prepared = args.prepare(context);
   if (prepared !== undefined) await prepared;
+  if (args.abortSignal.aborted) return context;
   context.provide("agents", {} as never);
   context.provide("sessionPersistence", {} as never);
   context.provide("subagents", {} as never);
@@ -256,7 +257,7 @@ describe("ACP server", () => {
     expect(emitter.listenerCount("SIGTERM")).toBe(0);
   });
 
-  it("cancels runtime startup without surfacing a resulting boot failure", async () => {
+  it("cancels runtime startup cleanly when a signal arrives before prepare", async () => {
     const emitter = new EventEmitter();
     const signalSource: SignalSource = {
       once: (event, listener) => emitter.once(event, listener),
@@ -264,28 +265,54 @@ describe("ACP server", () => {
     };
     const started = Promise.withResolvers<void>();
     const releasePrepare = Promise.withResolvers<void>();
-    const prepared = Promise.withResolvers<void>();
-    const releaseBoot = Promise.withResolvers<void>();
+    const prepareSettled = Promise.withResolvers<void>();
     const context = new Context();
     const dispose = vi.spyOn(context.fiber, "dispose");
     const runtimeBoot: RuntimeBoot = async (args) => {
       started.resolve();
       await releasePrepare.promise;
       expect(args.abortSignal.aborted).toBe(true);
-      await args.prepare(context);
-      prepared.resolve();
-      await releaseBoot.promise;
-      throw new Error("synthetic post-cancellation boot failure");
+      try {
+        await args.prepare(context);
+      } finally {
+        prepareSettled.resolve();
+      }
+      throw new Error("prepare should have cancelled startup");
     };
     const harness = startHarness({ signalSource, runtimeBoot });
     await started.promise;
 
     emitter.emit("SIGTERM");
     releasePrepare.resolve();
-    await prepared.promise;
-    await expect.poll(() => dispose.mock.calls.length).toBe(1);
-    releaseBoot.resolve();
+    await prepareSettled.promise;
+    expect(dispose).toHaveBeenCalledTimes(1);
     await harness.completion;
+    expect(emitter.listenerCount("SIGINT")).toBe(0);
+    expect(emitter.listenerCount("SIGTERM")).toBe(0);
+  });
+
+  it("preserves a genuine startup failure that races with termination", async () => {
+    const emitter = new EventEmitter();
+    const signalSource: SignalSource = {
+      once: (event, listener) => emitter.once(event, listener),
+      off: (event, listener) => emitter.off(event, listener),
+    };
+    const started = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const failure = new Error("synthetic concurrent startup failure");
+    const context = new Context();
+    const runtimeBoot: RuntimeBoot = async (args) => {
+      await args.prepare(context);
+      started.resolve();
+      await release.promise;
+      throw failure;
+    };
+    const harness = startHarness({ signalSource, runtimeBoot });
+    await started.promise;
+
+    emitter.emit("SIGTERM");
+    release.resolve();
+    await expect(harness.completion).rejects.toBe(failure);
     expect(emitter.listenerCount("SIGINT")).toBe(0);
     expect(emitter.listenerCount("SIGTERM")).toBe(0);
   });

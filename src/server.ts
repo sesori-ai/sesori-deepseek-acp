@@ -63,6 +63,70 @@ export interface AcpServer {
   dispose(): Promise<void>;
 }
 
+class RuntimeStartupCancelledError extends Error {
+  constructor() {
+    super("Runtime startup was cancelled by a termination signal");
+    this.name = "RuntimeStartupCancelledError";
+  }
+}
+
+function causedByRuntimeStartupCancellation(args: { error: unknown }): boolean {
+  const seen = new Set<Error>();
+  let error = args.error;
+  while (error instanceof Error && !seen.has(error)) {
+    if (error instanceof RuntimeStartupCancelledError) return true;
+    seen.add(error);
+    error = error.cause;
+  }
+  return false;
+}
+
+interface AcpOutputGuard {
+  output: Writable;
+  restore(): void;
+}
+
+function guardAcpOutput(args: {
+  diagnostics: DiagnosticWriter;
+  output: Writable;
+}): AcpOutputGuard {
+  if (args.output !== process.stdout) return { output: args.output, restore: () => undefined };
+
+  const originalWrite = process.stdout.write;
+  const output = new Writable({
+    write(chunk, encoding, callback) {
+      try {
+        originalWrite.call(process.stdout, chunk, encoding, callback);
+      } catch (error) {
+        callback(error instanceof Error ? error : new Error(String(error)));
+      }
+    },
+  });
+  let warningWritten = false;
+  const suppressedWrite = ((
+    _chunk: string | Uint8Array,
+    encodingOrCallback?: BufferEncoding | (() => void),
+    callback?: () => void,
+  ): boolean => {
+    if (!warningWritten) {
+      warningWritten = true;
+      args.diagnostics.write(
+        "sesori-deepseek-acp: warning: unframed runtime stdout was suppressed to preserve ACP framing\n",
+      );
+    }
+    const completion = typeof encodingOrCallback === "function" ? encodingOrCallback : callback;
+    if (completion !== undefined) queueMicrotask(completion);
+    return true;
+  }) as typeof process.stdout.write;
+  process.stdout.write = suppressedWrite;
+  return {
+    output,
+    restore: () => {
+      if (process.stdout.write === suppressedWrite) process.stdout.write = originalWrite;
+    },
+  };
+}
+
 export function startAcpServer(args: {
   stream: Stream;
   diagnostics: DiagnosticWriter;
@@ -92,14 +156,16 @@ export function startAcpServer(args: {
   }
 }
 
-export async function serveStdio(args: {
+interface ServeStdioArguments {
   stateDir: string;
   input: Readable;
   output: Writable;
   diagnostics: DiagnosticWriter;
   signalSource?: SignalSource;
   runtimeBoot?: RuntimeBoot;
-}): Promise<void> {
+}
+
+async function runStdioServer(args: ServeStdioArguments): Promise<void> {
   const input = Readable.toWeb(args.input) as unknown as ReadableStream<Uint8Array>;
   const stream = ndJsonStream(Writable.toWeb(args.output), input);
   const signalSource = args.signalSource ?? process;
@@ -125,11 +191,11 @@ export async function serveStdio(args: {
       onProfileFallback: ({ error }) => {
         args.diagnostics.write(`sesori-deepseek-acp: warning: ${formatDiagnostic({ error })}\n`);
       },
-      prepare: (bootContext) => {
+      prepare: async (bootContext) => {
         context = bootContext;
         if (shutdown.signal.aborted) {
-          void bootContext.fiber.dispose().catch(() => undefined);
-          return;
+          await bootContext.fiber.dispose();
+          throw new RuntimeStartupCancelledError();
         }
         transportFiber = bootContext.inject(
           [RUNTIME_READY_KEY, "agents", "sessionPersistence", "subagents"],
@@ -169,7 +235,7 @@ export async function serveStdio(args: {
       await connection.closed;
     }
   } catch (error) {
-    if (!shutdown.signal.aborted) operationFailure = error;
+    if (!causedByRuntimeStartupCancellation({ error })) operationFailure = error;
   }
   args.input.destroy();
   const failures: unknown[] = operationFailure === undefined ? [] : [operationFailure];
@@ -195,4 +261,13 @@ export async function serveStdio(args: {
   signalSource.off("SIGTERM", closeInput);
   if (failures.length === 1) throw failures[0];
   if (failures.length > 1) throw new AggregateError(failures, "ACP shutdown failed");
+}
+
+export async function serveStdio(args: ServeStdioArguments): Promise<void> {
+  const outputGuard = guardAcpOutput({ diagnostics: args.diagnostics, output: args.output });
+  try {
+    await runStdioServer({ ...args, output: outputGuard.output });
+  } finally {
+    outputGuard.restore();
+  }
 }

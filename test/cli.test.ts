@@ -5,7 +5,12 @@ import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import packageJson from "../package.json" with { type: "json" };
 import { runCli } from "../src/cli.ts";
-import { AdapterExitCode } from "../src/errors.ts";
+import {
+  AdapterError,
+  AdapterErrorCode,
+  AdapterExitCode,
+  formatDiagnostic,
+} from "../src/errors.ts";
 import {
   ADAPTER_VERSION,
   DEEPSEEK_HARNESS_VERSION,
@@ -88,6 +93,23 @@ describe("adapter CLI", () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  });
+
+  it("includes every bounded aggregate fallback cause in diagnostics", () => {
+    const diagnostic = formatDiagnostic({
+      error: new AdapterError({
+        code: AdapterErrorCode.Readiness,
+        message: "both runtime profiles failed",
+        cause: new AggregateError(
+          [new Error("persisted profile marker"), new Error("in-memory profile marker")],
+          "profile attempts failed",
+        ),
+      }),
+    });
+
+    expect(diagnostic).toContain("persisted profile marker");
+    expect(diagnostic).toContain("in-memory profile marker");
+    expect(diagnostic.length).toBeLessThanOrEqual(2_048);
   });
 
   it("reports an in-memory fallback without failing readiness", async () => {

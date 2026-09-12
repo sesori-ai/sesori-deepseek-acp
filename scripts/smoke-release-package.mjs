@@ -235,7 +235,7 @@ async function installSyntheticProfileBundle(home) {
         name: packageName,
         version: "1.0.0",
         type: "module",
-        exports: "./index.js",
+        exports: { import: "./index.js" },
         dsh: { bundle: { patch: "./cordis.patch.yml" } },
       }, null, 2)}\n`,
     ),

@@ -1,6 +1,7 @@
-import { constants, existsSync } from "node:fs";
+import { constants, existsSync, readFileSync, statSync } from "node:fs";
 import { access, lstat, readFile, stat, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { createRequire } from "node:module";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import type { Context } from "@deepseek-ai/cordis";
 import type { EntryOptions } from "@deepseek-ai/cordis-plugin-loader";
@@ -14,6 +15,7 @@ import {
   resolveProfileDir,
 } from "@deepseek-ai/dsh-app-boot";
 import { resolveDshHome } from "@deepseek-ai/dsh-home-paths";
+import { resolve as resolvePackageExports } from "resolve.exports";
 import {
   createLaunchEnvironmentSnapshot,
   DSH_LAUNCH_ENVIRONMENT_KEY,
@@ -334,11 +336,93 @@ function assertComposition(args: {
   }
 }
 
-function pinReservedProfileEntryModules(args: { entries: EntryOptions[] }): EntryOptions[] {
+interface BarePackageSpecifier {
+  packageName: string;
+  subpath: string;
+}
+
+function parseBarePackageSpecifier(args: { name: string }): BarePackageSpecifier | undefined {
+  if (args.name.startsWith(".") || args.name.includes(":") || isAbsolute(args.name)) {
+    return undefined;
+  }
+  const parts = args.name.split("/");
+  const packagePartCount = args.name.startsWith("@") ? 2 : 1;
+  if (parts.length < packagePartCount) return undefined;
+  const packageName = parts.slice(0, packagePartCount).join("/");
+  const subpathParts = parts.slice(packagePartCount);
+  return {
+    packageName,
+    subpath: subpathParts.length === 0 ? "." : `./${subpathParts.join("/")}`,
+  };
+}
+
+function packageDirectory(args: { anchor: string; packageName: string }): string | undefined {
+  for (const searchPath of createRequire(args.anchor).resolve.paths(args.packageName) ?? []) {
+    const candidate = join(searchPath, args.packageName);
+    if (existsSync(join(candidate, "package.json"))) return candidate;
+  }
+  return undefined;
+}
+
+function resolvePackageEntry(args: {
+  anchor: string;
+  packageName: string;
+  subpath: string;
+}): string | undefined {
+  const directory = packageDirectory({ anchor: args.anchor, packageName: args.packageName });
+  if (directory === undefined) return undefined;
+  const manifest = JSON.parse(readFileSync(join(directory, "package.json"), "utf8")) as {
+    exports?: unknown;
+  };
+  if (manifest.exports === undefined) {
+    const specifier = args.subpath === "." ? directory : join(directory, args.subpath.slice(2));
+    return createRequire(args.anchor).resolve(specifier);
+  }
+
+  const candidates = resolvePackageExports(
+    { name: args.packageName, exports: manifest.exports },
+    args.subpath,
+  );
+  for (const candidate of candidates ?? []) {
+    const entry = resolve(directory, candidate);
+    const relativeEntry = relative(directory, entry);
+    if (!candidate.startsWith("./") || /^\.\.(?:[\\/]|$)/u.test(relativeEntry)) {
+      throw new Error(
+        `Package ${args.packageName} export ${args.subpath} resolves outside its package`,
+      );
+    }
+    if (existsSync(entry) && statSync(entry).isFile()) return entry;
+  }
+  return undefined;
+}
+
+function resolveProfileEntryModules(args: {
+  adapterInstallAnchor: string;
+  entries: EntryOptions[];
+  profileInstallAnchor: string;
+}): EntryOptions[] {
   const entries = structuredClone(args.entries);
   for (const { entry } of profileEntryLocations({ entries })) {
     const pinnedModule = PINNED_RESERVED_PROFILE_ENTRY_MODULES.get(entry.id);
-    if (pinnedModule !== undefined) entry.name = pinnedModule;
+    if (pinnedModule !== undefined) {
+      entry.name = pinnedModule;
+      continue;
+    }
+    const bare = parseBarePackageSpecifier({ name: entry.name });
+    if (bare === undefined) continue;
+    const anchors = bare.packageName.startsWith("@deepseek-ai/")
+      ? [args.adapterInstallAnchor, args.profileInstallAnchor]
+      : [args.profileInstallAnchor, args.adapterInstallAnchor];
+    const resolvedEntry = anchors
+      .map((anchor) => resolvePackageEntry({ anchor, ...bare }))
+      .find((candidate) => candidate !== undefined);
+    if (resolvedEntry === undefined) {
+      throw new AdapterError({
+        code: AdapterErrorCode.Readiness,
+        message: `The DeepSeek profile cannot resolve plugin ${entry.name}`,
+      });
+    }
+    entry.name = resolvedEntry;
   }
   return entries;
 }
@@ -357,9 +441,12 @@ function adapterInstallAnchor(): string {
 }
 
 function composeRuntimeProfileLayers(args: {
+  adapterInstallAnchor: string;
+  bareModuleBaseUrl: string;
   configPath: string;
   layers: PatchOptions[][];
   origin: RuntimeProfileOrigin;
+  profileInstallAnchor: string;
   stateDir: string;
   workspaceRoot?: string;
 }): RuntimeProfile {
@@ -384,11 +471,17 @@ function composeRuntimeProfileLayers(args: {
   }
   assertComposition({ entries, paths, workspaceRoot });
   return {
-    bareModuleBaseUrl: pathToFileURL(args.configPath).href,
+    bareModuleBaseUrl: args.bareModuleBaseUrl,
     configPath: args.configPath,
     entries,
     origin: args.origin,
-    patches: [{ insert: pinReservedProfileEntryModules({ entries }) }],
+    patches: [{
+      insert: resolveProfileEntryModules({
+        adapterInstallAnchor: args.adapterInstallAnchor,
+        entries,
+        profileInstallAnchor: args.profileInstallAnchor,
+      }),
+    }],
     paths,
   };
 }
@@ -397,10 +490,14 @@ export function composeRuntimeProfile(args: {
   stateDir: string;
   workspaceRoot?: string;
 }): RuntimeProfile {
+  const installAnchor = adapterInstallAnchor();
   return composeRuntimeProfileLayers({
+    adapterInstallAnchor: installAnchor,
+    bareModuleBaseUrl: pathToFileURL(runtimeConfigPath).href,
     configPath: runtimeConfigPath,
     layers: [loadOverlayPatches(BIN_NAME, basePatchPath)],
     origin: { kind: RuntimeProfileOrigin.InMemory },
+    profileInstallAnchor: installAnchor,
     stateDir: args.stateDir,
     ...(args.workspaceRoot === undefined ? {} : { workspaceRoot: args.workspaceRoot }),
   });
@@ -430,9 +527,12 @@ async function composePersistedRuntimeProfile(args: {
   await ensureProfileRoot({ path: configPath });
   const profile = loadProfile(BIN_NAME, SESORI_PROFILE_NAME, installAnchor, home);
   const composed = composeRuntimeProfileLayers({
-    configPath,
+    adapterInstallAnchor: installAnchor,
+    bareModuleBaseUrl: pathToFileURL(configPath).href,
+    configPath: runtimeConfigPath,
     layers: [...profile.layers.map((layer) => layer.patches), profile.patches],
     origin: { kind: RuntimeProfileOrigin.Persisted, path: profilePath },
+    profileInstallAnchor: join(profilePath, "package.json"),
     stateDir: args.stateDir,
     ...(args.workspaceRoot === undefined ? {} : { workspaceRoot: args.workspaceRoot }),
   });

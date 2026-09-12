@@ -3,6 +3,7 @@ import { cp, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { PassThrough } from "node:stream";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { zstdCompressSync } from "node:zlib";
 import { PROTOCOL_VERSION, type AgentSideConnection, type SessionNotification } from "@agentclientprotocol/sdk";
 import { defaultDshHome, resolveDshHome } from "@deepseek-ai/dsh-home-paths";
@@ -120,7 +121,8 @@ describe("DeepSeek runtime composition", () => {
     };
 
     expect(profile.origin).toEqual({ kind: RuntimeProfileOrigin.Persisted, path: profilePath });
-    expect(profile.configPath).toBe(join(profilePath, "cordis.yml"));
+    expect(profile.configPath).toBe(fileURLToPath(new URL("../runtime/cordis.json", import.meta.url)));
+    expect(profile.bareModuleBaseUrl).toBe(pathToFileURL(join(profilePath, "cordis.yml")).href);
     expect(profile.paths.stateDir).toBe(join(root, "state"));
     expect(manifest.dsh.profile).toEqual({
       bundles: ["@deepseek-ai/dsh-base"],
@@ -167,7 +169,7 @@ describe("DeepSeek runtime composition", () => {
           name: packageName,
           version: "1.0.0",
           type: "module",
-          exports: "./index.js",
+          exports: { import: "./index.js" },
           dsh: { bundle: { patch: "./cordis.patch.yml" } },
         }, null, 2)}\n`,
       ),
@@ -478,10 +480,25 @@ describe("DeepSeek runtime composition", () => {
     if (initialized.origin.kind !== RuntimeProfileOrigin.Persisted) {
       throw new Error("expected persisted Sesori profile");
     }
-    await writeFile(
-      join(initialized.origin.path, "cordis.patch.yml"),
-      "- insert:\n    - id: unavailable-profile-plugin\n      name: 'unavailable-profile-plugin'\n",
-    );
+    const packageName = "failing-profile-plugin";
+    const packagePath = join(initialized.origin.path, "node_modules", packageName);
+    await mkdir(packagePath, { recursive: true });
+    await Promise.all([
+      writeFile(
+        join(packagePath, "package.json"),
+        `${JSON.stringify({
+          name: packageName,
+          version: "1.0.0",
+          type: "module",
+          exports: "./index.js",
+        }, null, 2)}\n`,
+      ),
+      writeFile(join(packagePath, "index.js"), "throw new Error('synthetic plugin boot failure');\n"),
+      writeFile(
+        join(initialized.origin.path, "cordis.patch.yml"),
+        `- insert:\n    - id: failing-profile-plugin\n      name: '${packageName}'\n`,
+      ),
+    ]);
 
     const cancellationFallbacks: RuntimeProfileFallback[] = [];
     await expect(bootRuntime({

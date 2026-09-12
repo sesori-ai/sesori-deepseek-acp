@@ -264,6 +264,14 @@ function assertReservedEntryIdsUnique(args: { entries: EntryOptions[] }): void {
   });
 }
 
+function isForbiddenProfileEntryName(args: { name: string }): boolean {
+  return args.name === "@deepseek-ai/dsh-acp" ||
+    args.name.startsWith("@deepseek-ai/dsh-host-") ||
+    args.name.includes("frontend-static") ||
+    args.name.includes("webserver") ||
+    args.name.includes("console-logger");
+}
+
 function assertComposition(args: {
   entries: EntryOptions[];
   paths: RuntimePaths;
@@ -318,16 +326,9 @@ function assertComposition(args: {
   });
   assertEntry({ entries: args.entries, id: "tool-ask-user", enabled: true });
 
-  const forbidden = profileEntryLocations({ entries: args.entries }).find(({ enabled, entry }) => {
-    const name = entry.name ?? "";
-    return enabled && (
-      name === "@deepseek-ai/dsh-acp" ||
-      name.startsWith("@deepseek-ai/dsh-host-") ||
-      name.includes("frontend-static") ||
-      name.includes("webserver") ||
-      name.includes("console-logger")
-    );
-  });
+  const forbidden = profileEntryLocations({ entries: args.entries }).find(
+    ({ enabled, entry }) => enabled && isForbiddenProfileEntryName({ name: entry.name }),
+  );
   if (forbidden !== undefined) {
     throw new AdapterError({
       code: AdapterErrorCode.Readiness,
@@ -400,10 +401,15 @@ function owningPackageName(args: { moduleName: string }): string | undefined {
   let modulePath: string;
   if (isAbsolute(args.moduleName)) {
     modulePath = args.moduleName;
-  } else if (args.moduleName.startsWith("file:")) {
-    modulePath = fileURLToPath(args.moduleName);
   } else {
-    return undefined;
+    let moduleUrl: URL;
+    try {
+      moduleUrl = new URL(args.moduleName);
+    } catch {
+      return undefined;
+    }
+    if (moduleUrl.protocol !== "file:") return undefined;
+    modulePath = fileURLToPath(moduleUrl);
   }
 
   let directory = dirname(realpathSync(modulePath));
@@ -424,6 +430,12 @@ function assertResolvedReservedModuleIdentities(args: { entries: EntryOptions[] 
     if (!enabled) continue;
     const packageName = owningPackageName({ moduleName: entry.name });
     if (packageName === undefined) continue;
+    if (isForbiddenProfileEntryName({ name: packageName })) {
+      throw new AdapterError({
+        code: AdapterErrorCode.Readiness,
+        message: `The DeepSeek profile unexpectedly mounts ${packageName}`,
+      });
+    }
     const reservedId = RESERVED_PROFILE_ENTRY_IDS_BY_NAME.get(packageName);
     if (reservedId !== undefined && reservedId !== entry.id) {
       throw new AdapterError({
@@ -440,7 +452,8 @@ function resolveProfileEntryModules(args: {
   profileInstallAnchor: string;
 }): EntryOptions[] {
   const entries = structuredClone(args.entries);
-  for (const { entry } of profileEntryLocations({ entries })) {
+  for (const { enabled, entry } of profileEntryLocations({ entries })) {
+    if (!enabled) continue;
     const pinnedModule = PINNED_RESERVED_PROFILE_ENTRY_MODULES.get(entry.id);
     if (pinnedModule !== undefined) {
       entry.name = pinnedModule;

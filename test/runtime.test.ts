@@ -188,7 +188,7 @@ describe("DeepSeek runtime composition", () => {
       ),
       writeFile(
         join(initialized.origin.path, "cordis.patch.yml"),
-        "- insert:\n    - id: synthetic-relative-profile-plugin\n      name: './local-plugin.mjs'\n",
+        "- insert:\n    - id: synthetic-relative-profile-plugin\n      name: './local-plugin.mjs'\n    - id: unavailable-disabled-plugin\n      name: 'unavailable-disabled-plugin'\n      disabled: true\n",
       ),
       writeFile(
         join(shadowedReservedPath, "package.json"),
@@ -229,6 +229,13 @@ describe("DeepSeek runtime composition", () => {
       expect.objectContaining({
         id: "synthetic-relative-profile-plugin",
         name: pathToFileURL(localPluginPath).href,
+      }),
+    );
+    expect(loaded.entries).toContainEqual(
+      expect.objectContaining({
+        id: "unavailable-disabled-plugin",
+        name: "unavailable-disabled-plugin",
+        disabled: true,
       }),
     );
     expect(loaded.entries.find((entry) => entry.id === "agent")?.disabled).toBe(false);
@@ -360,7 +367,9 @@ describe("DeepSeek runtime composition", () => {
     if (initialized.origin.kind !== RuntimeProfileOrigin.Persisted) {
       throw new Error("expected persisted Sesori profile");
     }
-    const reservedModuleUrl = import.meta.resolve("@deepseek-ai/dsh-session-telemetry-otel");
+    const reservedModuleUrl = import.meta
+      .resolve("@deepseek-ai/dsh-session-telemetry-otel")
+      .replace(/^file:/u, "FiLe:");
     await writeFile(
       join(initialized.origin.path, "cordis.patch.yml"),
       `- insert:
@@ -392,17 +401,39 @@ describe("DeepSeek runtime composition", () => {
     if (initialized.origin.kind !== RuntimeProfileOrigin.Persisted) {
       throw new Error("expected persisted Sesori profile");
     }
-    await writeFile(
-      join(initialized.origin.path, "cordis.patch.yml"),
-      `- insert:
+    const forbiddenPackagePath = join(
+      initialized.origin.path,
+      "node_modules",
+      "@deepseek-ai",
+      "dsh-acp",
+    );
+    await mkdir(forbiddenPackagePath, { recursive: true });
+    await Promise.all([
+      writeFile(
+        join(forbiddenPackagePath, "package.json"),
+        `${JSON.stringify({
+          name: "@deepseek-ai/dsh-acp",
+          version: "0.0.0",
+          type: "module",
+          exports: "./index.js",
+        }, null, 2)}\n`,
+      ),
+      writeFile(
+        join(forbiddenPackagePath, "index.js"),
+        "export const name = 'synthetic-forbidden-acp';\n",
+      ),
+      writeFile(
+        join(initialized.origin.path, "cordis.patch.yml"),
+        `- insert:
     - id: synthetic-nested-group
       name: '@deepseek-ai/cordis-plugin-group'
       group: true
       config:
         - id: forbidden-nested-host
-          name: '@deepseek-ai/dsh-acp'
+          name: '${pathToFileURL(join(forbiddenPackagePath, "index.js")).href}'
 `,
-    );
+      ),
+    ]);
 
     const fallbacks: RuntimeProfileFallback[] = [];
     const profile = await resolveRuntimeProfile({

@@ -244,7 +244,7 @@ describe("DeepSeek runtime composition", () => {
     }
     await writeFile(
       join(initialized.origin.path, "cordis.patch.yml"),
-      "- insert:\n    - id: approval\n      name: '@deepseek-ai/cordis-plugin-group'\n      config: []\n",
+      "- insert:\n    - id: approval\n      name: '@deepseek-ai/dsh-user-approval'\n      config: []\n",
     );
 
     const fallbacks: RuntimeProfileFallback[] = [];
@@ -257,6 +257,77 @@ describe("DeepSeek runtime composition", () => {
     expect(fallbacks).toHaveLength(1);
     expect((fallbacks[0]?.error.cause as Error | undefined)?.message).toContain(
       "duplicates reserved Sesori rows: approval",
+    );
+  });
+
+  it("falls back when a profile replaces a reserved row plugin", async () => {
+    const root = await tempRoot();
+    const home = join(root, "home");
+    const stateDir = join(root, "state");
+    process.env.DSH_HOME = home;
+
+    const initialized = await resolveRuntimeProfile({ stateDir });
+    if (initialized.origin.kind !== RuntimeProfileOrigin.Persisted) {
+      throw new Error("expected persisted Sesori profile");
+    }
+    const packageName = "synthetic-replacement-bundle";
+    const packagePath = join(initialized.origin.path, "node_modules", packageName);
+    await mkdir(packagePath, { recursive: true });
+    await Promise.all([
+      writeFile(
+        join(packagePath, "package.json"),
+        `${JSON.stringify({
+          name: packageName,
+          version: "1.0.0",
+          dsh: { bundle: { patch: "./cordis.patch.yml" } },
+        }, null, 2)}\n`,
+      ),
+      writeFile(
+        join(packagePath, "cordis.patch.yml"),
+        `- insert:
+    - id: session-persistence-jsonl
+      name: '@deepseek-ai/dsh-session-persistence-jsonl'
+    - id: attachment-local
+      name: '@deepseek-ai/dsh-attachment-local'
+    - id: session-query-sqlite
+      name: '@deepseek-ai/dsh-session-query-sqlite'
+    - id: storage-json
+      name: '@deepseek-ai/dsh-storage-json'
+    - id: spill-local
+      name: '@deepseek-ai/dsh-spill-local'
+    - id: session-telemetry-otel
+      name: '${packageName}'
+    - id: hmr
+      name: '@deepseek-ai/cordis-plugin-hmr'
+    - id: sandbox-policy
+      name: '@deepseek-ai/dsh-sandbox-policy'
+    - id: approval
+      name: '@deepseek-ai/dsh-user-approval'
+`,
+      ),
+    ]);
+    const manifestPath = join(initialized.origin.path, "package.json");
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+      dependencies: Record<string, string>;
+      dsh: { profile: { bundles: string[] } };
+    };
+    manifest.dependencies[packageName] = "1.0.0";
+    manifest.dsh.profile.bundles = [packageName];
+    await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+    const fallbacks: RuntimeProfileFallback[] = [];
+    const profile = await resolveRuntimeProfile({
+      stateDir,
+      onProfileFallback: (fallback) => fallbacks.push(fallback),
+    });
+
+    expect(profile.origin).toEqual({ kind: RuntimeProfileOrigin.InMemory });
+    expect(fallbacks).toHaveLength(1);
+    expect((fallbacks[0]?.error.cause as Error | undefined)?.message).toContain(
+      "rejected the adapter overlay",
+    );
+    expect((fallbacks[0]?.error.cause as Error | undefined)?.message).toContain(
+      "session-telemetry-otel",
     );
   });
 
@@ -275,6 +346,14 @@ describe("DeepSeek runtime composition", () => {
       join(initialized.origin.path, "cordis.patch.yml"),
       "- insert:\n    - id: unavailable-profile-plugin\n      name: 'unavailable-profile-plugin'\n",
     );
+
+    const cancellationFallbacks: RuntimeProfileFallback[] = [];
+    await expect(bootRuntime({
+      stateDir,
+      abortSignal: AbortSignal.abort(),
+      onProfileFallback: (fallback) => cancellationFallbacks.push(fallback),
+    })).rejects.toThrow("plugin tree failed to load");
+    expect(cancellationFallbacks).toEqual([]);
 
     const fallbacks: RuntimeProfileFallback[] = [];
     const context = await bootRuntime({
@@ -375,7 +454,7 @@ describe("DeepSeek runtime composition", () => {
       fetchSpy.mockRestore();
     }
 
-    expect(await readdir(home)).toEqual([...before, "profiles"].sort());
+    expect((await readdir(home)).sort()).toEqual([...before, "profiles"].sort());
     await expect(readFile(join(home, "settings.yaml"), "utf8")).resolves.toBe(settingsBefore);
   });
 

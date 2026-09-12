@@ -28,6 +28,7 @@ export type RuntimeBoot = (args: {
   stateDir: string;
   prepare: (context: Context) => Promise<void> | void;
   onProfileFallback: RuntimeProfileFallbackReporter;
+  abortSignal: AbortSignal;
 }) => Promise<Context>;
 
 const AcpSdkDiagnostic = {
@@ -104,9 +105,9 @@ export async function serveStdio(args: {
   const signalSource = args.signalSource ?? process;
   let context: Context | undefined;
   let server: AcpServer | undefined;
-  let shutdownRequested = false;
+  const shutdown = new AbortController();
   const closeInput = (): void => {
-    shutdownRequested = true;
+    shutdown.abort();
     args.input.destroy();
     if (server === undefined) void context?.fiber.dispose().catch(() => undefined);
   };
@@ -120,12 +121,13 @@ export async function serveStdio(args: {
     const runRuntime = args.runtimeBoot ?? bootRuntime;
     context = await runRuntime({
       stateDir: args.stateDir,
+      abortSignal: shutdown.signal,
       onProfileFallback: ({ error }) => {
         args.diagnostics.write(`sesori-deepseek-acp: warning: ${formatDiagnostic({ error })}\n`);
       },
       prepare: (bootContext) => {
         context = bootContext;
-        if (shutdownRequested) {
+        if (shutdown.signal.aborted) {
           void bootContext.fiber.dispose().catch(() => undefined);
           return;
         }
@@ -167,7 +169,7 @@ export async function serveStdio(args: {
       await connection.closed;
     }
   } catch (error) {
-    operationFailure = error;
+    if (!shutdown.signal.aborted) operationFailure = error;
   }
   args.input.destroy();
   const failures: unknown[] = operationFailure === undefined ? [] : [operationFailure];

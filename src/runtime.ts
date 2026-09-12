@@ -26,18 +26,19 @@ const BASE_BUNDLE_NAME = "@deepseek-ai/dsh-base";
 const SESORI_PROFILE_NAME = "sesori";
 const PROFILE_ROOT_FILENAME = "cordis.yml";
 const PROFILE_ROOT = "[]\n";
-const RESERVED_PROFILE_ENTRY_IDS = new Set([
-  "session-persistence-jsonl",
-  "attachment-local",
-  "session-query-sqlite",
-  "storage-json",
-  "spill-local",
-  "session-telemetry-otel",
-  "hmr",
-  "sandbox-policy",
-  "approval",
-  "tool-ask-user",
+const RESERVED_PROFILE_ENTRY_NAMES = new Map([
+  ["session-persistence-jsonl", "@deepseek-ai/dsh-session-persistence-jsonl"],
+  ["attachment-local", "@deepseek-ai/dsh-attachment-local"],
+  ["session-query-sqlite", "@deepseek-ai/dsh-session-query-sqlite"],
+  ["storage-json", "@deepseek-ai/dsh-storage-json"],
+  ["spill-local", "@deepseek-ai/dsh-spill-local"],
+  ["session-telemetry-otel", "@deepseek-ai/dsh-session-telemetry-otel"],
+  ["hmr", "@deepseek-ai/cordis-plugin-hmr"],
+  ["sandbox-policy", "@deepseek-ai/dsh-sandbox-policy"],
+  ["approval", "@deepseek-ai/dsh-user-approval"],
+  ["tool-ask-user", "@deepseek-ai/dsh-tool-ask-user"],
 ]);
+const RESERVED_PROFILE_ENTRY_IDS = new Set(RESERVED_PROFILE_ENTRY_NAMES.keys());
 export const RUNTIME_READY_KEY = "sesoriRuntimeReady";
 const runtimeConfigPath = fileURLToPath(new URL("../runtime/cordis.json", import.meta.url));
 const basePatchPath = fileURLToPath(import.meta.resolve(`${BASE_BUNDLE_NAME}/cordis.patch.yml`));
@@ -98,29 +99,52 @@ function adapterPatches(args: { paths: RuntimePaths; workspaceRoot: string }): P
   return [
     {
       id: "session-persistence-jsonl",
+      name: "@deepseek-ai/dsh-session-persistence-jsonl",
       disabled: false,
       config: { root: args.paths.sessions },
     },
     {
       id: "attachment-local",
+      name: "@deepseek-ai/dsh-attachment-local",
       disabled: false,
       config: { dshHome: args.paths.attachmentsHome },
     },
     {
       id: "session-query-sqlite",
+      name: "@deepseek-ai/dsh-session-query-sqlite",
       disabled: false,
       config: { path: args.paths.queryDatabase, openAt: "never" },
     },
-    { id: "storage-json", disabled: false, config: { root: args.paths.storages } },
-    { id: "spill-local", disabled: false, config: { root: args.paths.spills } },
-    { id: "session-telemetry-otel", disabled: true },
-    { id: "hmr", disabled: true },
+    {
+      id: "storage-json",
+      name: "@deepseek-ai/dsh-storage-json",
+      disabled: false,
+      config: { root: args.paths.storages },
+    },
+    {
+      id: "spill-local",
+      name: "@deepseek-ai/dsh-spill-local",
+      disabled: false,
+      config: { root: args.paths.spills },
+    },
+    {
+      id: "session-telemetry-otel",
+      name: "@deepseek-ai/dsh-session-telemetry-otel",
+      disabled: true,
+    },
+    { id: "hmr", name: "@deepseek-ai/cordis-plugin-hmr", disabled: true },
     {
       id: "sandbox-policy",
+      name: "@deepseek-ai/dsh-sandbox-policy",
       disabled: false,
       config: { mode: "workspace-write", workspaceRoot: args.workspaceRoot },
     },
-    { id: "approval", disabled: false, config: { policy: "ask" } },
+    {
+      id: "approval",
+      name: "@deepseek-ai/dsh-user-approval",
+      disabled: false,
+      config: { policy: "ask" },
+    },
     { insert: [{ id: "tool-ask-user", name: "@deepseek-ai/dsh-tool-ask-user" }] },
   ];
 }
@@ -142,6 +166,13 @@ function assertEntry(args: {
   enabled?: boolean;
 }): void {
   const entry = findEntry({ entries: args.entries, id: args.id });
+  const expectedName = RESERVED_PROFILE_ENTRY_NAMES.get(args.id);
+  if (expectedName === undefined || entry.name !== expectedName) {
+    throw new AdapterError({
+      code: AdapterErrorCode.Readiness,
+      message: `The DeepSeek profile row ${args.id} does not use the required plugin`,
+    });
+  }
   if (args.disabled !== undefined && entry.disabled !== args.disabled) {
     throw new AdapterError({
       code: AdapterErrorCode.Readiness,
@@ -464,6 +495,7 @@ export async function bootRuntime(args: {
   workspaceRoot?: string;
   prepare?: (context: Context) => Promise<void> | void;
   onProfileFallback?: RuntimeProfileFallbackReporter;
+  abortSignal?: AbortSignal;
 }): Promise<Context> {
   const profile = await resolveRuntimeProfile({
     stateDir: args.stateDir,
@@ -484,7 +516,8 @@ export async function bootRuntime(args: {
   } catch (persistedError) {
     if (
       profile.origin.kind !== RuntimeProfileOrigin.Persisted ||
-      !prepareCompleted
+      !prepareCompleted ||
+      args.abortSignal?.aborted === true
     ) {
       throw persistedError;
     }

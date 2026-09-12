@@ -256,7 +256,7 @@ describe("ACP server", () => {
     expect(emitter.listenerCount("SIGTERM")).toBe(0);
   });
 
-  it("cancels runtime startup when a signal arrives before prepare", async () => {
+  it("cancels runtime startup without surfacing a resulting boot failure", async () => {
     const emitter = new EventEmitter();
     const signalSource: SignalSource = {
       once: (event, listener) => emitter.once(event, listener),
@@ -271,10 +271,11 @@ describe("ACP server", () => {
     const runtimeBoot: RuntimeBoot = async (args) => {
       started.resolve();
       await releasePrepare.promise;
+      expect(args.abortSignal.aborted).toBe(true);
       await args.prepare(context);
       prepared.resolve();
       await releaseBoot.promise;
-      return context;
+      throw new Error("synthetic post-cancellation boot failure");
     };
     const harness = startHarness({ signalSource, runtimeBoot });
     await started.promise;

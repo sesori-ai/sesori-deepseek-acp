@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 
@@ -277,20 +277,26 @@ export async function smokeAcpLifecycle({ launcher, target, packageRoot, tempora
     installSyntheticProfileBundle(home),
   ]);
   const isolatedEnvironment = { ...environment, DSH_HOME: home, DEEPSEEK_API_KEY: "fixture-key" };
+  const pluginMarker = join(home, "profiles", "sesori", "plugin-loaded");
   let first;
   let restarted;
   try {
     first = startAcpProcess({ launcher, target, stateDir, environment: isolatedEnvironment, cwd: packageRoot });
     const sessionId = await exerciseFirstProcess({ client: first, workspace });
     await first.stop();
+    expect(
+      await readFile(pluginMarker, "utf8").catch(() => "") === "loaded\n",
+      `Packaged runtime did not load the Sesori profile plugin initially: ${first.diagnostics()}`,
+    );
+    await rm(pluginMarker, { force: true });
     restarted = startAcpProcess({ launcher, target, stateDir, environment: isolatedEnvironment, cwd: packageRoot });
     await exerciseRestart({ client: restarted, workspace, sessionId });
     await restarted.stop();
     provider.verify();
     expect(await readFile(join(home, "settings.yaml"), "utf8") === settings, "Packaged runtime changed DeepSeek settings");
     expect(
-      await readFile(join(home, "profiles", "sesori", "plugin-loaded"), "utf8").catch(() => "") === "loaded\n",
-      `Packaged runtime did not load the Sesori profile plugin: ${first.diagnostics()}${restarted.diagnostics()}`,
+      await readFile(pluginMarker, "utf8").catch(() => "") === "loaded\n",
+      `Packaged runtime did not reload the Sesori profile plugin: ${restarted.diagnostics()}`,
     );
     const homeEntries = (await readdir(home)).sort();
     expect(JSON.stringify(homeEntries) === JSON.stringify([".anonymous-user-id", "profiles", "settings.yaml"]), `Packaged runtime wrote unexpected state into DSH_HOME: ${homeEntries.join(", ")}`);

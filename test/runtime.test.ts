@@ -151,6 +151,7 @@ describe("DeepSeek runtime composition", () => {
     }
     const packageName = "synthetic-sesori-profile-plugin";
     const packagePath = join(initialized.origin.path, "node_modules", packageName);
+    const localPluginPath = join(initialized.origin.path, "local-plugin.mjs");
     const shadowedReservedName = "@deepseek-ai/dsh-user-approval";
     const shadowedReservedPath = join(
       initialized.origin.path,
@@ -180,6 +181,14 @@ describe("DeepSeek runtime composition", () => {
       writeFile(
         join(packagePath, "index.js"),
         `const name = "synthetic-profile-plugin";\nconst inject = [];\nfunction apply() { globalThis.__sesoriSyntheticProfilePlugin = true; }\nexport { apply, inject, name };\n`,
+      ),
+      writeFile(
+        localPluginPath,
+        `const name = "synthetic-relative-profile-plugin";\nconst inject = [];\nfunction apply() { globalThis.__sesoriRelativeProfilePlugin = true; }\nexport { apply, inject, name };\n`,
+      ),
+      writeFile(
+        join(initialized.origin.path, "cordis.patch.yml"),
+        "- insert:\n    - id: synthetic-relative-profile-plugin\n      name: './local-plugin.mjs'\n",
       ),
       writeFile(
         join(shadowedReservedPath, "package.json"),
@@ -216,11 +225,18 @@ describe("DeepSeek runtime composition", () => {
         name: packageName,
       }),
     );
+    expect(loaded.entries).toContainEqual(
+      expect.objectContaining({
+        id: "synthetic-relative-profile-plugin",
+        name: pathToFileURL(localPluginPath).href,
+      }),
+    );
     expect(loaded.entries.find((entry) => entry.id === "agent")?.disabled).toBe(false);
     expect(loaded.entries.find((entry) => entry.id === "subagent")?.disabled).toBe(false);
     expect(loaded.entries.find((entry) => entry.id === "approval")?.disabled).toBe(false);
 
     const globals = globalThis as typeof globalThis & {
+      __sesoriRelativeProfilePlugin?: true;
       __sesoriSyntheticProfilePlugin?: true;
     };
     const fallbacks: RuntimeProfileFallback[] = [];
@@ -230,12 +246,14 @@ describe("DeepSeek runtime composition", () => {
     });
     try {
       expect(fallbacks).toEqual([]);
+      expect(globals.__sesoriRelativeProfilePlugin).toBe(true);
       expect(globals.__sesoriSyntheticProfilePlugin).toBe(true);
       expect(context.get("agents")).toBeDefined();
       expect(context.get("subagents")).toBeDefined();
       expect(context.get("sessionTelemetry")).toBeUndefined();
       expect(context.get("hmr")).toBeUndefined();
     } finally {
+      delete globals.__sesoriRelativeProfilePlugin;
       delete globals.__sesoriSyntheticProfilePlugin;
       await context.fiber.dispose();
     }
@@ -342,11 +360,12 @@ describe("DeepSeek runtime composition", () => {
     if (initialized.origin.kind !== RuntimeProfileOrigin.Persisted) {
       throw new Error("expected persisted Sesori profile");
     }
+    const reservedModuleUrl = import.meta.resolve("@deepseek-ai/dsh-session-telemetry-otel");
     await writeFile(
       join(initialized.origin.path, "cordis.patch.yml"),
       `- insert:
     - id: profile-telemetry
-      name: '@deepseek-ai/dsh-session-telemetry-otel'
+      name: '${reservedModuleUrl}'
 `,
     );
 

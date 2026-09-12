@@ -1,7 +1,7 @@
-import { constants, existsSync, readFileSync, statSync } from "node:fs";
+import { constants, existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { access, lstat, readFile, stat, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, parse as parsePath, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import type { Context } from "@deepseek-ai/cordis";
 import type { EntryOptions } from "@deepseek-ai/cordis-plugin-loader";
@@ -396,6 +396,44 @@ function resolvePackageEntry(args: {
   return undefined;
 }
 
+function owningPackageName(args: { moduleName: string }): string | undefined {
+  let modulePath: string;
+  if (isAbsolute(args.moduleName)) {
+    modulePath = args.moduleName;
+  } else if (args.moduleName.startsWith("file:")) {
+    modulePath = fileURLToPath(args.moduleName);
+  } else {
+    return undefined;
+  }
+
+  let directory = dirname(realpathSync(modulePath));
+  const root = parsePath(directory).root;
+  while (true) {
+    const manifestPath = join(directory, "package.json");
+    if (existsSync(manifestPath)) {
+      const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as { name?: unknown };
+      return typeof manifest.name === "string" ? manifest.name : undefined;
+    }
+    if (directory === root) return undefined;
+    directory = dirname(directory);
+  }
+}
+
+function assertResolvedReservedModuleIdentities(args: { entries: EntryOptions[] }): void {
+  for (const { enabled, entry } of profileEntryLocations({ entries: args.entries })) {
+    if (!enabled) continue;
+    const packageName = owningPackageName({ moduleName: entry.name });
+    if (packageName === undefined) continue;
+    const reservedId = RESERVED_PROFILE_ENTRY_IDS_BY_NAME.get(packageName);
+    if (reservedId !== undefined && reservedId !== entry.id) {
+      throw new AdapterError({
+        code: AdapterErrorCode.Readiness,
+        message: `The DeepSeek profile mounts reserved plugin ${packageName} under alternate row ${entry.id}`,
+      });
+    }
+  }
+}
+
 function resolveProfileEntryModules(args: {
   adapterInstallAnchor: string;
   entries: EntryOptions[];
@@ -470,18 +508,18 @@ function composeRuntimeProfileLayers(args: {
     });
   }
   assertComposition({ entries, paths, workspaceRoot });
+  const resolvedEntries = resolveProfileEntryModules({
+    adapterInstallAnchor: args.adapterInstallAnchor,
+    entries,
+    profileInstallAnchor: args.profileInstallAnchor,
+  });
+  assertResolvedReservedModuleIdentities({ entries: resolvedEntries });
   return {
     bareModuleBaseUrl: args.bareModuleBaseUrl,
     configPath: args.configPath,
     entries,
     origin: args.origin,
-    patches: [{
-      insert: resolveProfileEntryModules({
-        adapterInstallAnchor: args.adapterInstallAnchor,
-        entries,
-        profileInstallAnchor: args.profileInstallAnchor,
-      }),
-    }],
+    patches: [{ insert: resolvedEntries }],
     paths,
   };
 }

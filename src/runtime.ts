@@ -1,5 +1,5 @@
 import { constants, existsSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { access, lstat, readFile, stat, writeFile } from "node:fs/promises";
+import { access, lstat, stat, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, isAbsolute, join, parse as parsePath, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -554,15 +554,13 @@ export function composeRuntimeProfile(args: {
   });
 }
 
+// Boot mounts the package-owned root, so this file only anchors module resolution.
+// `dsh --profile sesori` rewrites it with a commented `[]` on every launch; accept any contents.
 async function ensureProfileRoot(args: { path: string }): Promise<void> {
   try {
     await writeFile(args.path, PROFILE_ROOT, { encoding: "utf8", flag: "wx" });
-    return;
   } catch (error) {
     if ((error as NodeJS.ErrnoException | null)?.code !== "EEXIST") throw error;
-  }
-  if (await readFile(args.path, "utf8") !== PROFILE_ROOT) {
-    throw new Error(`The Sesori profile root must contain only ${JSON.stringify(PROFILE_ROOT)}`);
   }
 }
 

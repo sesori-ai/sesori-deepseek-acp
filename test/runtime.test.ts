@@ -190,6 +190,11 @@ describe("DeepSeek runtime composition", () => {
         join(initialized.origin.path, "cordis.patch.yml"),
         "- insert:\n    - id: synthetic-relative-profile-plugin\n      name: './local-plugin.mjs'\n    - id: unavailable-disabled-plugin\n      name: 'unavailable-disabled-plugin'\n      disabled: true\n",
       ),
+      // `dsh --profile sesori` rewrites the root with this header on every launch.
+      writeFile(
+        join(initialized.origin.path, "cordis.yml"),
+        "# dsh profile root — an empty entry list. The tree is composed as patches:\n# each bundle in package.json's dsh.profile.bundles, then cordis.patch.yml, then any\n# --patch overlays. Edit cordis.patch.yml, not this file.\n[]\n",
+      ),
       writeFile(
         join(shadowedReservedPath, "package.json"),
         `${JSON.stringify({

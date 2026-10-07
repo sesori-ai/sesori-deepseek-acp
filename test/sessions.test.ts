@@ -128,7 +128,6 @@ function services(): SessionServices {
         header: meta,
         inheritedEventCount: SessionLogOffset(0),
         events: storedEvents,
-        snapshotEvents: () => [...storedEvents],
         isOwnSeq: () => true,
         requestHeader: () => undefined,
         append: (type: string, data: unknown) => {
@@ -175,6 +174,19 @@ function services(): SessionServices {
   const flush = vi.fn(async () => true);
   const drainContinuableDescendants = vi.fn(async () => undefined);
   const observe = vi.fn(async (id: string) => {
+    // Live-preferred like the real query service: a resident session is read in place.
+    const resident = (live.get(String(id))?.agent as { session?: { header: SessionHeader; events: SessionEvent[] } } | undefined)?.session;
+    if (resident !== undefined) {
+      return {
+        source: "live" as const,
+        header: resident.header,
+        inheritedEventCount: SessionLogOffset(0),
+        events: [...resident.events],
+        cursor: -1 as const,
+        retain: vi.fn(),
+        [Symbol.dispose]: vi.fn(),
+      };
+    }
     const inspection = inspections.get(String(id));
     const meta = inspection?.meta ?? headers.find((candidate) => candidate.id === id);
     if (meta === undefined) {
@@ -596,7 +608,7 @@ describe("durable ACP sessions", () => {
         source: { kind: "user" },
         content: [{ type: "text", text: "question" }],
       },
-    } as SessionEvent);
+    } as unknown as SessionEvent);
     const replayOutput = Promise.withResolvers<void>();
     state.sessionUpdate.mockImplementationOnce(async (notification: SessionNotification) => {
       state.updates.push(notification);
@@ -1164,9 +1176,10 @@ describe("durable ACP sessions", () => {
         step: 1,
         message: {
           id: "result-1",
-          role: "user",
+          role: "tool",
           source: { kind: "tool", callId: collidingCallId, tool: "edit" },
-          content: [{ type: "tool-result", toolCallId: collidingCallId, content: [] }],
+          toolCallId: collidingCallId,
+          content: [],
         },
       },
     });
@@ -1220,9 +1233,10 @@ describe("durable ACP sessions", () => {
             step: 1,
             message: {
               id: "result-1",
-              role: "user",
+              role: "tool",
               source: { kind: "tool", callId: "call-1", tool: "edit" },
-              content: [{ type: "tool-result", toolCallId: "call-1", content: [] }],
+              toolCallId: "call-1",
+              content: [],
             },
           },
         },
@@ -2165,9 +2179,11 @@ describe("durable ACP sessions", () => {
         step: 1,
         message: {
           id: "result",
-          role: "user",
+          role: "tool",
           source: { kind: "tool", callId: "call-1", tool: "edit" },
-          content: [{ type: "tool-result", toolCallId: "call-1", content: [], isError: false }],
+          toolCallId: "call-1",
+          content: [],
+          isError: false,
         },
       },
     });
@@ -2263,9 +2279,10 @@ describe("durable ACP sessions", () => {
             step: 1,
             message: {
               id: "result",
-              role: "user",
+              role: "tool",
               source: { kind: "tool", callId: "call-1", tool: "edit" },
-              content: [{ type: "tool-result", toolCallId: "call-1", content: [] }],
+              toolCallId: "call-1",
+              content: [],
             },
           },
         },
@@ -2497,9 +2514,10 @@ describe("durable ACP sessions", () => {
         step: 1,
         message: {
           id: "result-secret",
-          role: "user",
+          role: "tool",
           source: { kind: "tool", callId: "call-secret", tool: "edit" },
-          content: [{ type: "tool-result", toolCallId: "call-secret", content: [{ type: "text", text: secret }] }],
+          toolCallId: "call-secret",
+          content: [{ type: "text", text: secret }],
         },
       },
     });
@@ -2664,15 +2682,10 @@ describe("durable ACP sessions", () => {
             step: 1,
             message: {
               id: "tool-result-1",
-              role: "user",
+              role: "tool",
               source: { kind: "tool", callId: "call-1", tool: "read_file" },
-              content: [
-                {
-                  type: "tool-result",
-                  toolCallId: "call-1",
-                  content: [{ type: "text", text: sentinel }],
-                },
-              ],
+              toolCallId: "call-1",
+              content: [{ type: "text", text: sentinel }],
             },
           },
         },
@@ -3176,6 +3189,8 @@ describe("sub-agent lifecycle", () => {
 
     nestedOutput.resolve();
     await closing;
+    // The native drain detaches the descendant's live session.
+    await grandchild.dispose();
     await expect(
       state.agent.extMethod("deepseek/session/history", { sessionId: "grandchild-nested-close" }),
     ).rejects.toThrow("unknown session");
@@ -3378,9 +3393,10 @@ describe("sub-agent lifecycle", () => {
         step: 1,
         message: {
           id: `result-${args.callId}`,
-          role: "user",
+          role: "tool",
           source: { kind: "tool", callId: args.callId },
-          content: [{ type: "tool-result", toolCallId: args.callId, content: [{ type: "text", text: args.text }] }],
+          toolCallId: args.callId,
+          content: [{ type: "text", text: args.text }],
         },
       },
     });
@@ -3547,16 +3563,11 @@ describe("sub-agent lifecycle follow-ups", () => {
             step: 1,
             message: {
               id: "failed-result",
-              role: "user",
+              role: "tool",
               source: { kind: "tool", callId: "call-failed" },
-              content: [
-                {
-                  type: "tool-result",
-                  toolCallId: "call-failed",
-                  isError: true,
-                  content: [{ type: "text", text: "unable to start subagent" }],
-                },
-              ],
+              toolCallId: "call-failed",
+              isError: true,
+              content: [{ type: "text", text: "unable to start subagent" }],
             },
           },
         },
@@ -3608,9 +3619,10 @@ describe("sub-agent lifecycle follow-ups", () => {
         step: 1,
         message: {
           id: `result-${callId}`,
-          role: "user",
+          role: "tool",
           source: { kind: "tool", callId },
-          content: [{ type: "tool-result", toolCallId: callId, content: [{ type: "text", text: "failed" }] }],
+          toolCallId: callId,
+          content: [{ type: "text", text: "failed" }],
         },
       },
     });
@@ -3665,7 +3677,7 @@ describe("sub-agent lifecycle follow-ups", () => {
           time: 2,
           surfaceOp: "append",
           sourceEventSeqs: [1],
-          data: { turn: 1, step: 1, message: { id: "r1", role: "user", source: { kind: "tool", callId: "call-bg" }, content: [{ type: "tool-result", toolCallId: "call-bg", content: [{ type: "text", text: "started subagent paged-child" }] }] } },
+          data: { turn: 1, step: 1, message: { id: "r1", role: "tool", source: { kind: "tool", callId: "call-bg" }, toolCallId: "call-bg", content: [{ type: "text", text: "started subagent paged-child" }] } },
         },
         userMessage(3, "u2"),
         {
@@ -3740,7 +3752,7 @@ describe("sub-agent lifecycle second review", () => {
       time: seq * 10,
       surfaceOp: "append",
       sourceEventSeqs: [seq - 2],
-      data: { turn: 1, step: 1, message: { id: `r-${callId}`, role: "user", source: { kind: "tool", callId }, content: [{ type: "tool-result", toolCallId: callId, isError, content: [{ type: "text", text }] }] } },
+      data: { turn: 1, step: 1, message: { id: `r-${callId}`, role: "tool", source: { kind: "tool", callId }, toolCallId: callId, isError, content: [{ type: "text", text }] } },
     });
     state.inspections.set("mixed", {
       meta,

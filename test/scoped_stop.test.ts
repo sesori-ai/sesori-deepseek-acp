@@ -1,4 +1,4 @@
-import { cp, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { appendFile, cp, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AgentSideConnection } from "@agentclientprotocol/sdk";
@@ -23,6 +23,8 @@ async function harness() {
   const home = join(dir, "home");
   const project = join(dir, "project");
   await cp(new URL("./fixtures/dsh-home", import.meta.url), home, { recursive: true });
+  // Nested subtrees need depth beyond the harness default of one delegation level.
+  await appendFile(join(home, "profiles", "sesori", "cordis.patch.yml"), "- id: subagent\n  config:\n    maxDepth: 3\n");
   await mkdir(project);
   const previous = process.env.DSH_HOME;
   process.env.DSH_HOME = home;
@@ -101,7 +103,7 @@ async function harness() {
       done.resolve({ status: "killed" });
     });
     const id = context.jobs.start({ kind: args.kind ?? "subagent", label: "test job",
-      ...(args.owner === undefined ? {} : { owner: args.owner }), run: () => ({ cancel, done: done.promise }) });
+      ...(args.owner === undefined ? {} : { owner: args.owner.id }), run: () => ({ cancel, done: done.promise }) });
     return { id, cancel, done };
   }
   return { context, adapter, connection, root, stop, launch, child, signals, beforeStep, output, notifications, requests, diagnostics, job };
@@ -198,7 +200,7 @@ for (const fork of [false, true]) {
       // already in the real synchronous owned-job registry at this boundary.
       const followup = vi.spyOn(child, "followup");
       const stopping = h.stop(root);
-      if (fork && !foreground) expect(h.context.jobs.list(root).filter((job) => job.kind === "subagent")[0]?.status).toBe("stopping");
+      if (fork && !foreground) expect(h.context.jobs.list(root.id).filter((job) => job.kind === "subagent")[0]?.status).toBe("stopping");
       await expect(stopping).resolves.toEqual({ workKept: false });
       release.resolve();
       await maintenance;

@@ -2,7 +2,7 @@
 
 Sesori's managed ACP runtime adapter for DeepSeek Harness. It composes the
 complete coding runtime behind an ACP v1 stdio boundary without changing the
-user's DeepSeek settings or storing Sesori sessions in the DeepSeek profile.
+user's DeepSeek configuration or storing Sesori sessions in the DeepSeek profile.
 The adapter creates and loads the application-owned
 `$DSH_HOME/profiles/sesori` profile so plugins installed for Sesori participate
 in the managed runtime. DeepSeek's provider may also initialize its standard
@@ -35,21 +35,42 @@ hot-reload, sandbox, approval, and transport constraints. Reserved policy rows
 resolve their implementations from the pinned adapter even when a profile
 package shadows the same dependency name. Profile membership and patch changes
 take effect on the next adapter start. If the profile cannot
-be created, read, composed, prepared, or started, the adapter reports the local
-failure on stderr and continues with its pinned in-memory profile.
+be created, read, composed, or prepared, or a required runtime row fails to
+start, the adapter reports the local failure on stderr and continues with its
+pinned in-memory profile. An optional plugin that fails to start is reported on
+stderr and skipped while the rest of the profile keeps running.
+
+DeepSeek Harness no longer reads `$DSH_HOME/settings.yaml`. Provider and plugin
+configuration belongs in the profile patch layer,
+`$DSH_HOME/profiles/sesori/cordis.patch.yml`, for example:
+
+```yaml
+- id: llm-deepseek
+  config:
+    baseURL: https://api.deepseek.com/anthropic
+- id: subagent
+  config:
+    maxDepth: 3
+```
+
+The DeepSeek provider speaks the Messages API, so a custom `baseURL` must be
+Messages-compatible. Credentials still come from the environment or
+`$DSH_HOME/.credentials.yaml`.
+Sub-agents may delegate one level deep and run at most eight active continuable
+children by default; raise `maxDepth` in the profile patch to allow nesting.
 
 DeepSeek plugins are trusted local process code. They can independently access
 source files, prompts, credentials, and the network; installing one into the
 `sesori` profile grants that access. Plugins installed only in another profile,
 such as `web` or `headless`, are not loaded automatically.
 
-Runtime uses DeepSeek Harness `0.1.5-rc.2`, including canonical
+Runtime uses DeepSeek Harness `0.2.0-rc.2`, including canonical
 `deepseek-flash` (`DeepSeek-V41-Flash`) catalog metadata, native model selection,
 outbound `web_search` and `web_fetch` tools, and native persisted-session format
 migration. Outbound web tools do not expose a local web server, frontend, BFF,
 or additional process. Telemetry and hot reload remain disabled. Adapter-owned
 sessions, attachments, query indexes, storage documents, and spill files remain
-under supplied `--state-dir`. The adapter does not change DeepSeek settings or
+under supplied `--state-dir`. The adapter does not change the profile patch layer or
 credentials; an explicitly installed plugin controls its own behavior.
 
 Tagged releases contain target-specific package-directory archives with a

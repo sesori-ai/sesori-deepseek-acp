@@ -177,20 +177,20 @@ async function startProviderFixture() {
     request.on("end", () => {
       try {
         const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-        expect(request.url === "/chat/completions", `Unexpected provider fixture path: ${String(request.url)}`);
-        expect(request.headers.authorization === "Bearer fixture-key", "Provider fixture received the wrong credential");
+        expect(request.url === "/v1/messages", `Unexpected provider fixture path: ${String(request.url)}`);
+        expect(request.headers["x-api-key"] === "fixture-key", "Provider fixture received the wrong credential");
         expect(body.model === "deepseek-flash" && body.stream === true, "Provider fixture received the wrong model request");
         requests.push(body);
         response.writeHead(200, { "content-type": "text/event-stream" });
+        // DeepSeek Harness speaks the Messages API to DeepSeek's Anthropic-compatible endpoint.
         response.end([
-          'data: {"id":"fixture","object":"chat.completion.chunk","created":1,"model":"deepseek-flash","choices":[{"index":0,"delta":{"role":"assistant","content":"fixture reply"},"finish_reason":null}]}',
-          "",
-          'data: {"id":"fixture","object":"chat.completion.chunk","created":1,"model":"deepseek-flash","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}',
-          "",
-          "data: [DONE]",
-          "",
-          "",
-        ].join("\n"));
+          { type: "message_start", message: { id: "fixture", type: "message", role: "assistant", model: "deepseek-flash", content: [], usage: { input_tokens: 3, output_tokens: 0 } } },
+          { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+          { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "fixture reply" } },
+          { type: "content_block_stop", index: 0 },
+          { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 2 } },
+          { type: "message_stop" },
+        ].map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(""));
       } catch (error) {
         errors.push(error);
         console.error("Provider fixture rejected packaged request:", error);
@@ -226,7 +226,7 @@ async function installSyntheticProfileBundle(home) {
         name: "dsh-profile-sesori",
         private: true,
         dependencies: { [packageName]: "1.0.0" },
-        dsh: { profile: { bundles: ["@deepseek-ai/dsh-base", packageName], patchReload: "startup" } },
+        dsh: { profile: { bundles: ["@deepseek-ai/dsh-base", packageName] } },
       }, null, 2)}\n`,
     ),
     writeFile(
@@ -260,23 +260,24 @@ export async function smokeAcpLifecycle({ launcher, target, packageRoot, tempora
   const workspace = join(temporaryRoot, "workspace");
   const stateDir = join(temporaryRoot, "state");
   const home = join(temporaryRoot, "home");
-  const settings = [
-    "llm-deepseek:",
-    `  baseURL: http://127.0.0.1:${provider.port}`,
-    "  thinking: disabled",
-    "  reasoningEffort: off",
-    "  models:",
-    "    - id: deepseek-flash",
-    "      name: Fixture",
-    "      contextWindow: 4096",
-    "      maxTokens: 64",
-    "      inputModalities: [text]",
+  // Provider configuration lives in the Sesori profile's patch layer.
+  const profilePatchPath = join(home, "profiles", "sesori", "cordis.patch.yml");
+  const profilePatch = [
+    "- id: llm-deepseek",
+    "  config:",
+    `    baseURL: http://127.0.0.1:${provider.port}`,
+    "    thinking: disabled",
+    "    reasoningEffort: off",
+    "    models:",
+    "      - id: deepseek-flash",
+    "        name: Fixture",
+    "        contextWindow: 4096",
+    "        maxTokens: 64",
+    "        inputModalities: [text]",
     "",
   ].join("\n");
-  await Promise.all([
-    writeFile(join(home, "settings.yaml"), settings),
-    installSyntheticProfileBundle(home),
-  ]);
+  await installSyntheticProfileBundle(home);
+  await writeFile(profilePatchPath, profilePatch);
   const isolatedEnvironment = { ...environment, DSH_HOME: home, DEEPSEEK_API_KEY: "fixture-key" };
   const pluginMarker = join(home, "profiles", "sesori", "plugin-loaded");
   let first;
@@ -299,7 +300,7 @@ export async function smokeAcpLifecycle({ launcher, target, packageRoot, tempora
     await exerciseRestart({ client: restarted, workspace, sessionId });
     await restarted.stop();
     provider.verify();
-    expect(await readFile(join(home, "settings.yaml"), "utf8") === settings, "Packaged runtime changed DeepSeek settings");
+    expect(await readFile(profilePatchPath, "utf8") === profilePatch, "Packaged runtime changed the Sesori profile patch");
     expect(
       await readFile(pluginMarker, "utf8").catch(() => "") === "loaded\n",
       `Packaged runtime did not reload the Sesori profile plugin: ${restarted.diagnostics()}`,
@@ -313,7 +314,7 @@ export async function smokeAcpLifecycle({ launcher, target, packageRoot, tempora
       "Packaged runtime leaked plugin stdout after restart",
     );
     const homeEntries = (await readdir(home)).sort();
-    expect(JSON.stringify(homeEntries) === JSON.stringify([".anonymous-user-id", "profiles", "settings.yaml"]), `Packaged runtime wrote unexpected state into DSH_HOME: ${homeEntries.join(", ")}`);
+    expect(JSON.stringify(homeEntries) === JSON.stringify([".anonymous-user-id", "profiles"]), `Packaged runtime wrote unexpected state into DSH_HOME: ${homeEntries.join(", ")}`);
     expect(/^[0-9a-f-]{36}\n$/iu.test(await readFile(join(home, ".anonymous-user-id"), "utf8")), "Packaged runtime wrote an invalid upstream anonymous id");
   } finally {
     await Promise.allSettled([first?.stop(), restarted?.stop()].filter((operation) => operation !== undefined));

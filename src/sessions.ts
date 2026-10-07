@@ -722,10 +722,7 @@ async function projectSessionEvent(args: EventProjection, event: SessionEvent): 
     }
     const messageId = assistantMessageId(args.sessionId, event.data.turn, event.data.step);
     for (const block of event.data.message.content) {
-      if (block.type === "tool-call") continue;
-      if (block.type === "tool-result") {
-        throw new Error("session history contains unsupported assistant tool-result content");
-      }
+      if (block.type === "tool-call" || block.type === "tool-addition" || block.type === "tool-removal") continue;
       if (args.mode === "live" && block.type !== "image" && block.type !== "file") continue;
       if (block.type === "file") continue;
       await args.emitUpdate(
@@ -795,7 +792,7 @@ async function projectSessionEvent(args: EventProjection, event: SessionEvent): 
     return;
   }
   if (event.type === "tool/result" && isAppendSurfaceEvent(event)) {
-    const result = event.data.message.content[0];
+    const result = event.data.message;
     const callId = String(result.toolCallId);
     const update: Extract<SessionNotification["update"], { sessionUpdate: "tool_call_update" }> = {
       sessionUpdate: "tool_call_update",
@@ -979,7 +976,7 @@ function priorContinuable(events: readonly SessionEvent[]): ReplayChildren["cont
     if (event.type === "tool/call" && event.data.name === "subagent") {
       calls.set(String(event.data.callId), { name: event.data.name, arguments: event.data.arguments });
     } else if (event.type === "tool/result" && isAppendSurfaceEvent(event)) {
-      const result = event.data.message.content[0];
+      const result = event.data.message;
       const callId = String(result.toolCallId);
       const call = calls.get(callId);
       calls.delete(callId);
@@ -1858,14 +1855,14 @@ export class DurableSessionAgent implements AcpAgent {
       throw invalidParams("DeepSeek stop target is not owned by the named session");
     }
     const target = root?.handle.agent ?? named!.agent;
-    const launchers = new Map<SessionId, Agent>([[target.id, target]]);
+    const launchers = new Set<SessionId>([target.id]);
     const children: ChildRecord[] = named === undefined ? [] : [named];
     // Map traversal is only a live ownership walk, never a durable catalog scan.
-    for (const id of launchers.keys()) {
+    for (const id of launchers) {
       for (const child of this.#children.values()) {
         if (child.parentId !== id || launchers.has(child.agent.id)) continue;
         children.push(child);
-        launchers.set(child.agent.id, child.agent);
+        launchers.add(child.agent.id);
       }
     }
     const projections = this.#context.get("sessionProjections");
@@ -1876,9 +1873,9 @@ export class DurableSessionAgent implements AcpAgent {
         session.isOwnSeq(identity.seq);
     }));
     const jobs = this.#context.get("jobs");
-    const ownedJobs = [...launchers.values()].flatMap((owner) =>
-      (jobs?.list(owner) ?? []).filter((job) => job.kind === "subagent" && job.ownerSession === owner.id &&
-        (job.status === "running" || job.status === "stopping")).map((job) => ({ owner, job })),
+    const ownedJobs = jobs === undefined ? [] : [...launchers].flatMap((owner) =>
+      jobs.list(owner).filter((job) => job.kind === "subagent" && job.owner === owner &&
+        (job.status === "running" || job.status === "stopping")).map((job) => ({ owner, job, jobs })),
     );
     const failures: unknown[] = [];
     const attempt = (args: { operation: string; id: SessionId; signal: () => void }): boolean => {
@@ -1918,11 +1915,11 @@ export class DurableSessionAgent implements AcpAgent {
         covered.add(child.agent.id);
       }
     }
-    for (const { owner, job } of ownedJobs) {
+    for (const { owner, job, jobs } of ownedJobs) {
       attempt({
         operation: `deepseek/session/stop job=${job.id}`,
-        id: owner.id,
-        signal: () => { jobs!.kill(job.id, owner, "ACP scoped stop"); },
+        id: owner,
+        signal: () => { jobs.kill(job.id, owner, "ACP scoped stop"); },
       });
     }
     if (failures.length > 0) throw new AggregateError(failures, "DeepSeek scoped stop partially failed");
@@ -2535,39 +2532,8 @@ export class DurableSessionAgent implements AcpAgent {
   }
 
   async #inspect(sessionId: SessionId): Promise<SessionInspection> {
-    const resident = this.#sessions.get(sessionId);
-    if (resident !== undefined) {
-      const session = resident.handle.agent.session;
-      return {
-        meta: session.header,
-        inheritedEventCount: session.inheritedEventCount,
-        events: session.snapshotEvents(),
-      };
-    }
-    const child = this.#children.get(sessionId);
-    if (child !== undefined) {
-      const session = child.agent.session;
-      return {
-        meta: session.header,
-        inheritedEventCount: session.inheritedEventCount,
-        events: session.snapshotEvents(),
-      };
-    }
-    // dsh 0.1.5-rc.2's query declarations conflict with its subagent projection
-    // augmentation. Keep the native observation seam structural until those agree.
-    const query = this.#context.get("sessionQuery") as
-      | {
-          observeSession(
-            id: SessionId,
-            options: { projectionMode: "none" },
-          ): Promise<{
-            header: SessionHeader;
-            inheritedEventCount: SessionInspection["inheritedEventCount"];
-            events: readonly SessionEvent[];
-            [Symbol.dispose](): void;
-          }>;
-        }
-      | undefined;
+    // Live-preferred: resident roots and children are read from their live session.
+    const query = this.#context.get("sessionQuery");
     if (query === undefined) throw new Error("session query service is unavailable");
     let observation;
     try {

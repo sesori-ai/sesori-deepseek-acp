@@ -8,11 +8,14 @@ import type { EntryOptions } from "@deepseek-ai/cordis-plugin-loader";
 import { applyEntryPatches, type PatchOptions } from "@deepseek-ai/cordis-plugin-include";
 import {
   boot,
-  healProfilesModuleFallback,
+  createRuntimeResolution,
   initProfile,
   loadOverlayPatches,
   loadProfile,
+  PluginPackages,
+  reportSkippedBundles,
   resolveProfileDir,
+  type RuntimeResolution,
 } from "@deepseek-ai/dsh-app-boot";
 import { resolveDshHome } from "@deepseek-ai/dsh-home-paths";
 import { resolve as resolvePackageExports } from "resolve.exports";
@@ -37,7 +40,7 @@ const RESERVED_PROFILE_ENTRY_NAMES = new Map([
   ["storage-json", "@deepseek-ai/dsh-storage-json"],
   ["spill-local", "@deepseek-ai/dsh-spill-local"],
   ["session-telemetry-otel", "@deepseek-ai/dsh-session-telemetry-otel"],
-  ["hmr", "@deepseek-ai/cordis-plugin-hmr"],
+  ["hmr", "@deepseek-ai/dsh-hmr"],
   ["sandbox-policy", "@deepseek-ai/dsh-sandbox-policy"],
   ["approval", "@deepseek-ai/dsh-user-approval"],
   ["tool-ask-user", "@deepseek-ai/dsh-tool-ask-user"],
@@ -62,7 +65,7 @@ export const RuntimeProfileOrigin = {
 } as const;
 export type RuntimeProfileOrigin =
   | { kind: typeof RuntimeProfileOrigin.InMemory }
-  | { kind: typeof RuntimeProfileOrigin.Persisted; path: string };
+  | { kind: typeof RuntimeProfileOrigin.Persisted; path: string; resolution: RuntimeResolution };
 
 export interface RuntimeProfileFallback {
   error: AdapterError;
@@ -147,7 +150,7 @@ function adapterPatches(args: { paths: RuntimePaths; workspaceRoot: string }): P
       name: "@deepseek-ai/dsh-session-telemetry-otel",
       disabled: true,
     },
-    { id: "hmr", name: "@deepseek-ai/cordis-plugin-hmr", disabled: true },
+    { id: "hmr", name: "@deepseek-ai/dsh-hmr", disabled: true },
     {
       id: "sandbox-policy",
       name: "@deepseek-ai/dsh-sandbox-policy",
@@ -571,22 +574,23 @@ async function composePersistedRuntimeProfile(args: {
   const home = resolveDshHome();
   const profilePath = resolveProfileDir(SESORI_PROFILE_NAME, home);
   const installAnchor = adapterInstallAnchor();
-  initProfile(profilePath, [BASE_BUNDLE_NAME], "startup");
+  initProfile(profilePath, [BASE_BUNDLE_NAME]);
   const configPath = join(profilePath, PROFILE_ROOT_FILENAME);
   await ensureProfileRoot({ path: configPath });
   const profile = loadProfile(BIN_NAME, SESORI_PROFILE_NAME, installAnchor, home);
-  const composed = composeRuntimeProfileLayers({
+  reportSkippedBundles(BIN_NAME, profile);
+  // Profile plugins resolve installation packages through this in-process table at boot.
+  const resolution = await createRuntimeResolution({ installAnchor, profile, home });
+  return composeRuntimeProfileLayers({
     adapterInstallAnchor: installAnchor,
     bareModuleBaseUrl: pathToFileURL(configPath).href,
     configPath: runtimeConfigPath,
     layers: [...profile.layers.map((layer) => layer.patches), profile.patches],
-    origin: { kind: RuntimeProfileOrigin.Persisted, path: profilePath },
+    origin: { kind: RuntimeProfileOrigin.Persisted, path: profilePath, resolution },
     profileInstallAnchor: join(profilePath, "package.json"),
     stateDir: args.stateDir,
     ...(args.workspaceRoot === undefined ? {} : { workspaceRoot: args.workspaceRoot }),
   });
-  await healProfilesModuleFallback({ home, installAnchor, profile });
-  return composed;
 }
 
 function fallbackError(args: { error: unknown }): AdapterError {
@@ -675,7 +679,6 @@ export async function checkRuntimeComposition(args: {
     ...(args.onProfileFallback === undefined ? {} : { onProfileFallback: args.onProfileFallback }),
   });
   const dshHome = resolveDshHome();
-  await assertReadableIfPresent({ path: join(dshHome, "settings.yaml") });
   await assertReadableIfPresent({ path: join(dshHome, ".credentials.yaml") });
   return profile;
 }
@@ -694,6 +697,10 @@ async function startRuntimeProfile(args: {
         DSH_LAUNCH_ENVIRONMENT_KEY,
         createLaunchEnvironmentSnapshot([{ source: "process", values: inheritedEnvironment() }]),
       );
+      const origin = args.profile.origin;
+      if (origin.kind === RuntimeProfileOrigin.Persisted) {
+        await bootContext.plugin(PluginPackages, { resolution: origin.resolution });
+      }
       await args.prepare?.(bootContext);
       args.onPrepared();
     },

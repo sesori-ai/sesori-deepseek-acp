@@ -692,7 +692,9 @@ describe("DeepSeek runtime composition", () => {
     await cp(new URL("./fixtures/dsh-home", import.meta.url), home, { recursive: true });
     await mkdir(project);
     process.env.DSH_HOME = home;
-    delete process.env.DEEPSEEK_API_KEY;
+    // Model discovery hides a provider without a credential. The fixture's custom
+    // baseURL serves the built-in catalog and never requests the official listing.
+    process.env.DEEPSEEK_API_KEY = "synthetic-key";
 
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("network disabled"));
     const context = await bootRuntime({ stateDir, workspaceRoot: project });
@@ -734,7 +736,7 @@ describe("DeepSeek runtime composition", () => {
               models: expect.arrayContaining([
                 expect.objectContaining({
                   upstreamModelId: "deepseek-flash",
-                  name: "DeepSeek-V41-Flash",
+                  name: "DeepSeek-V4.1-Flash",
                   reasoningEfforts: ["off", "low", "high", "max"],
                   defaultReasoningEffort: "high",
                   supportsImages: true,
@@ -905,8 +907,11 @@ describe("DeepSeek runtime composition", () => {
     const stateDir = join(root, "state");
     const project = join(root, "project");
     await mkdir(project);
-    process.env.DSH_HOME = join(root, "home");
-    delete process.env.DEEPSEEK_API_KEY;
+    const home = join(root, "home");
+    await cp(new URL("./fixtures/dsh-home", import.meta.url), home, { recursive: true });
+    process.env.DSH_HOME = home;
+    // The config options need a non-empty catalog, which requires a credential.
+    process.env.DEEPSEEK_API_KEY = "synthetic-key";
     const sessionId = SessionId("restart-session");
     const sessionEvents = [
       { type: "turn/start", seq: 0, time: 10, data: { turn: 1 } },

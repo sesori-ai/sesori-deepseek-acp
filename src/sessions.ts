@@ -91,10 +91,14 @@ const MAX_SUBAGENT_SUMMARY_LENGTH = 512;
 type SubagentMode = "foreground" | "background";
 type SubagentStopReason = "completed" | "aborted" | "error" | "max-tokens" | "refusal";
 
-/** Delegation tools of the pinned dsh profile and the mode each uses when `run_in_background` is omitted. */
+/**
+ * Delegation tools of the pinned dsh profile and the mode each uses when `run_in_background` is omitted.
+ * Every pinned delegation now starts a managed continuable child, so only history recorded by
+ * harness 0.2.0 and earlier carries `run_in_background` or a foreground fork result.
+ */
 const SUBAGENT_TOOL_DEFAULT_MODES: ReadonlyMap<string, SubagentMode> = new Map([
   ["subagent", "background"],
-  ["subagent_fork", "foreground"],
+  ["subagent_fork", "background"],
 ]);
 const SUBAGENT_STOP_REASONS: ReadonlySet<string> = new Set<SubagentStopReason>([
   "completed",
@@ -166,7 +170,7 @@ function subagentSummary(blocks: readonly ContentBlock[] | undefined): string | 
   );
 }
 
-/** The `subagent` tool renders a continuable start as `started subagent <id>`; the id is the child session id. */
+/** Delegation tools render a continuable start as `started subagent <id>`; the id is the child session id. */
 function continuableChildId(blocks: readonly ContentBlock[]): string | undefined {
   const text = blocks.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("");
   const match = /^started subagent (\S+)$/u.exec(text.trim());
@@ -931,7 +935,7 @@ function replaySubagentResult(args: {
   if (view === undefined) return undefined;
   const bound = args.children?.bindings.get(args.callId);
   if (view.mode === "background") {
-    const childSessionId = (args.call.name === "subagent" ? continuableChildId(args.content) : undefined) ?? bound;
+    const childSessionId = continuableChildId(args.content) ?? bound;
     if (childSessionId === undefined) {
       return args.failed ? { ...view, ended: { stopReason: "error" } } : view;
     }
@@ -973,7 +977,7 @@ function priorContinuable(events: readonly SessionEvent[]): ReplayChildren["cont
   const continuable: ReplayChildren["continuable"] = new Map();
   const calls = new Map<string, ToolCallRecord>();
   for (const event of events) {
-    if (event.type === "tool/call" && event.data.name === "subagent") {
+    if (event.type === "tool/call" && SUBAGENT_TOOL_DEFAULT_MODES.has(event.data.name)) {
       calls.set(String(event.data.callId), { name: event.data.name, arguments: event.data.arguments });
     } else if (event.type === "tool/result" && isAppendSurfaceEvent(event)) {
       const result = event.data.message;
@@ -1807,9 +1811,8 @@ export class DurableSessionAgent implements AcpAgent {
   }
 
   /**
-   * Interrupt one continuable child on behalf of the user. One-shot children
-   * (foreground runs and fork jobs) are cancelled only through their parent
-   * tool call, so they report `not_cancellable`.
+   * Interrupt one continuable child on behalf of the user. A child that was not
+   * announced as background reports `not_cancellable`.
    */
   #interruptSubagent(params: Record<string, unknown>): Record<string, unknown> {
     if (!validateProtocolValue({ definition: "subagentInterruptRequest", value: params }).valid) {
@@ -1872,11 +1875,6 @@ export class DurableSessionAgent implements AcpAgent {
       return session.header.origin === "subagent" && identity?.mode === "continuable" &&
         session.isOwnSeq(identity.seq);
     }));
-    const jobs = this.#context.get("jobs");
-    const ownedJobs = jobs === undefined ? [] : [...launchers].flatMap((owner) =>
-      jobs.list(owner).filter((job) => job.kind === "subagent" && job.owner === owner &&
-        (job.status === "running" || job.status === "stopping")).map((job) => ({ owner, job, jobs })),
-    );
     const failures: unknown[] = [];
     const attempt = (args: { operation: string; id: SessionId; signal: () => void }): boolean => {
       try {
@@ -1901,26 +1899,14 @@ export class DurableSessionAgent implements AcpAgent {
       },
     })) covered.add(target.id);
     for (const child of children) {
-      if (continuable.has(child)) {
-        // STOP discards accepted inbox work; the legacy manager interrupt intentionally
-        // keeps it. Authority and own-suffix provenance have already been checked above.
-        if (attempt({
-          operation: "deepseek/session/stop child",
-          id: child.agent.id,
-          signal: () => child.agent.cancel({ kind: "user" }, { keepInbox: false }),
-        })) covered.add(child.agent.id);
-      } else if (covered.has(child.parentId)) {
-        // Pinned one-shot producers are exhaustive: foreground uses the launching tool
-        // signal; background forks use the complete owner-job set captured above.
-        covered.add(child.agent.id);
-      }
-    }
-    for (const { owner, job, jobs } of ownedJobs) {
-      attempt({
-        operation: `deepseek/session/stop job=${job.id}`,
-        id: owner,
-        signal: () => { jobs.kill(job.id, owner, "ACP scoped stop"); },
-      });
+      if (!continuable.has(child)) continue;
+      // STOP discards accepted inbox work; the legacy manager interrupt intentionally
+      // keeps it. Authority and own-suffix provenance have already been checked above.
+      if (attempt({
+        operation: "deepseek/session/stop child",
+        id: child.agent.id,
+        signal: () => child.agent.cancel({ kind: "user" }, { keepInbox: false }),
+      })) covered.add(child.agent.id);
     }
     if (failures.length > 0) throw new AggregateError(failures, "DeepSeek scoped stop partially failed");
     return { workKept: children.some((child) => !child.ended && !covered.has(child.agent.id)) };
@@ -2572,7 +2558,7 @@ export class DurableSessionAgent implements AcpAgent {
       record.handle.agent.cancel({ kind: "disposed" });
       this.#settle(record, inflight);
     }
-    await this.#context.subagents.drainContinuableDescendants([record.handle.agent]);
+    await this.#context.subagents.drainDescendants([record.handle.agent]);
     let handleFailure: { error: unknown } | undefined;
     await record.handle.dispose().catch((error: unknown) => {
       handleFailure = { error };

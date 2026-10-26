@@ -22,7 +22,7 @@ interface SessionServices {
   create: ReturnType<typeof vi.fn>;
   resume: ReturnType<typeof vi.fn>;
   flush: ReturnType<typeof vi.fn>;
-  drainContinuableDescendants: ReturnType<typeof vi.fn>;
+  drainDescendants: ReturnType<typeof vi.fn>;
   observe: ReturnType<typeof vi.fn>;
   updates: SessionNotification[];
   diagnostics: string[];
@@ -172,7 +172,7 @@ function services(): SessionServices {
     return makeHandle(inspection.meta, inspection.events, options.setup);
   });
   const flush = vi.fn(async () => true);
-  const drainContinuableDescendants = vi.fn(async () => undefined);
+  const drainDescendants = vi.fn(async () => undefined);
   const observe = vi.fn(async (id: string) => {
     // Live-preferred like the real query service: a resident session is read in place.
     const resident = (live.get(String(id))?.agent as { session?: { header: SessionHeader; events: SessionEvent[] } } | undefined)?.session;
@@ -215,7 +215,7 @@ function services(): SessionServices {
       get: (id: string) => live.get(id)?.agent,
     },
     sessions: { flush },
-    subagents: { drainContinuableDescendants },
+    subagents: { drainDescendants },
     llm: {
       listProviders: () => [],
       listModels: async () => [],
@@ -272,7 +272,7 @@ function services(): SessionServices {
     create,
     resume,
     flush,
-    drainContinuableDescendants,
+    drainDescendants,
     observe,
     updates,
     diagnostics,
@@ -313,15 +313,15 @@ describe("durable ACP sessions", () => {
     expect(state.live.size).toBe(0);
   });
 
-  it("awaits native continuable descendant drain before disposing a root handle", async () => {
+  it("awaits native descendant drain before disposing a root handle", async () => {
     const state = services();
     const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
     const handle = state.live.get(created.sessionId)!;
     const drained = Promise.withResolvers<void>();
-    state.drainContinuableDescendants.mockReturnValueOnce(drained.promise);
+    state.drainDescendants.mockReturnValueOnce(drained.promise);
 
     const closing = state.agent.closeSession({ sessionId: created.sessionId });
-    await expect.poll(() => state.drainContinuableDescendants).toHaveBeenCalledWith([handle.agent]);
+    await expect.poll(() => state.drainDescendants).toHaveBeenCalledWith([handle.agent]);
     expect(handle.dispose).not.toHaveBeenCalled();
 
     drained.resolve();
@@ -333,7 +333,7 @@ describe("durable ACP sessions", () => {
     const state = services();
     const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
     const handle = state.live.get(created.sessionId)!;
-    state.drainContinuableDescendants.mockRejectedValueOnce(new Error("native drain sentinel"));
+    state.drainDescendants.mockRejectedValueOnce(new Error("native drain sentinel"));
 
     await expect(state.agent.closeSession({ sessionId: created.sessionId })).rejects.toThrow(
       "unable to close DeepSeek session",
@@ -3230,7 +3230,7 @@ describe("sub-agent lifecycle", () => {
     ).resolves.toEqual({ provider: "synthetic", model: "synthetic" });
   });
 
-  it("derives the mode from run_in_background with the tool defaults", async () => {
+  it("announces both pinned delegation tools as background children by default", async () => {
     const state = services();
     const { root, child } = await rootWithChild(state, "child-bg");
     const other = await state.context.agents.create({ sessionId: SessionId("child-fork"), meta: { cwd: "/project" } });
@@ -3249,7 +3249,7 @@ describe("sub-agent lifecycle", () => {
 
     expect(state.extNotifications.map((item) => item.params)).toEqual([
       expect.objectContaining({ kind: "started", childSessionId: "child-bg", toolCallId: "call-bg", prompt: "p", mode: "background" }),
-      expect.objectContaining({ kind: "started", childSessionId: "child-fork", toolCallId: "call-fork", prompt: "p", mode: "foreground" }),
+      expect.objectContaining({ kind: "started", childSessionId: "child-fork", toolCallId: "call-fork", prompt: "p", mode: "background" }),
     ]);
   });
 
@@ -3381,7 +3381,6 @@ describe("sub-agent lifecycle", () => {
     const state = services();
     const meta = header({ id: "parent", cwd: "/project", createdAt: 1 });
     state.headers.push(meta);
-    await state.bindings.record({ parentId: "parent", toolCallId: "call-fork", childSessionId: "fork-child" });
     const toolResult = (args: { seq: number; time: number; callId: string; text: string }) => ({
       type: "tool/result",
       seq: args.seq,
@@ -3423,7 +3422,7 @@ describe("sub-agent lifecycle", () => {
           time: 100,
           data: { turn: 1, step: 1, callId: "call-fork", name: "subagent_fork", arguments: JSON.stringify({ description: "Fork child", prompt: "fork prompt" }) },
         },
-        toolResult({ seq: 4, time: 200, callId: "call-fork", text: "OK" }),
+        toolResult({ seq: 4, time: 200, callId: "call-fork", text: "started subagent fork-child" }),
         {
           type: "user/message",
           seq: 5,
@@ -3441,6 +3440,23 @@ describe("sub-agent lifecycle", () => {
             content: [{ type: "text", text: "SENTINEL_SETTLEMENT_CONTENT" }],
           },
         },
+        {
+          type: "user/message",
+          seq: 6,
+          time: 400,
+          surfaceOp: "append",
+          data: {
+            id: "notice-2",
+            role: "user",
+            source: {
+              kind: "subagent-settled",
+              form: "notice",
+              summary: "Subagent fork-child finished and will do no further work unless you send it more.",
+              senderSessionId: "fork-child",
+            },
+            content: [{ type: "text", text: "SENTINEL_SETTLEMENT_CONTENT" }],
+          },
+        },
       ] as unknown as SessionEvent[],
     });
 
@@ -3452,9 +3468,10 @@ describe("sub-agent lifecycle", () => {
       ["user_message_chunk", undefined],
       ["tool_call", { label: "Background child", prompt: "background prompt", mode: "background" }],
       ["tool_call_update", { label: "Background child", prompt: "background prompt", mode: "background", childSessionId: "bg-child" }],
-      ["tool_call", { label: "Fork child", prompt: "fork prompt", mode: "foreground" }],
-      ["tool_call_update", { label: "Fork child", prompt: "fork prompt", mode: "foreground", childSessionId: "fork-child", ended: { stopReason: "completed" } }],
+      ["tool_call", { label: "Fork child", prompt: "fork prompt", mode: "background" }],
+      ["tool_call_update", { label: "Fork child", prompt: "fork prompt", mode: "background", childSessionId: "fork-child" }],
       ["tool_call_update", { label: "Background child", prompt: "background prompt", mode: "background", childSessionId: "bg-child", ended: { stopReason: "aborted" } }],
+      ["tool_call_update", { label: "Fork child", prompt: "fork prompt", mode: "background", childSessionId: "fork-child", ended: { stopReason: "completed" } }],
     ]);
   });
 });

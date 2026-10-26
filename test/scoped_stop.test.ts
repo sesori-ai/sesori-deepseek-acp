@@ -5,7 +5,6 @@ import { AgentSideConnection } from "@agentclientprotocol/sdk";
 import type { Agent, CreateAgentOptions } from "@deepseek-ai/dsh-agent";
 import { createUserMessage, ToolCallId } from "@deepseek-ai/dsh-llm";
 import { SessionId, SessionLogOffset, SessionSeq } from "@deepseek-ai/dsh-session";
-import type { JobKind, JobOutcome } from "@deepseek-ai/dsh-jobs";
 import type {} from "@deepseek-ai/dsh-user-questions";
 import { afterEach, expect, it, vi } from "vitest";
 import { bootRuntime } from "../src/runtime.ts";
@@ -77,7 +76,7 @@ async function harness() {
     ? { kind: "session", sessionId: String(target.id) }
     : { kind: "child", sessionId: String(parent.id), childSessionId: String(target.id) });
   const nativeScopes = new Set<Agent>();
-  const launch = (args: { parent: Agent; signal: AbortSignal; fork?: boolean; foreground?: boolean }) => {
+  const launch = (args: { parent: Agent; signal: AbortSignal; fork?: boolean }) => {
     if (!nativeScopes.has(args.parent)) {
       args.parent.ctx.tools.presentAs("native");
       nativeScopes.add(args.parent);
@@ -85,7 +84,7 @@ async function harness() {
     return context.tools.execute({
     agent: args.parent, signal: args.signal, callId: ToolCallId(crypto.randomUUID()),
     name: args.fork ? "subagent_fork" : "subagent",
-    arguments: { description: "child", prompt: "wait", run_in_background: !args.foreground },
+    arguments: { description: "child", prompt: "wait" },
     });
   };
   async function child(args: { parent: Agent; signal: AbortSignal }) {
@@ -96,17 +95,7 @@ async function harness() {
     await expect.poll(() => signals.has(agent)).toBe(true);
     return agent;
   }
-  function job(args: { owner?: Agent; kind?: JobKind; fail?: boolean }) {
-    const done = Promise.withResolvers<JobOutcome>();
-    const cancel = vi.fn(() => {
-      if (args.fail) throw new Error("producer sentinel failure");
-      done.resolve({ status: "killed" });
-    });
-    const id = context.jobs.start({ kind: args.kind ?? "subagent", label: "test job",
-      ...(args.owner === undefined ? {} : { owner: args.owner.id }), run: () => ({ cancel, done: done.promise }) });
-    return { id, cancel, done };
-  }
-  return { context, adapter, connection, root, stop, launch, child, signals, beforeStep, output, notifications, requests, diagnostics, job };
+  return { context, adapter, connection, root, stop, launch, child, signals, beforeStep, output, notifications, requests, diagnostics };
 }
 
 it("cancels root maintenance while prompt admission is still pending", async () => {
@@ -156,62 +145,55 @@ it("signals nested native children before delayed root/child announcements and p
   await h.stop(root);
 });
 
-it("checks exact parent authority and cancels only the named subtree and its owned subagent jobs", async () => {
+it("checks exact parent authority and cancels only the named subtree", async () => {
   const h = await harness();
   const root = await h.root();
   const child = await h.child({ parent: root, signal: new AbortController().signal });
   const sibling = await h.child({ parent: root, signal: new AbortController().signal });
   const grandchild = await h.child({ parent: child, signal: h.signals.get(child)! });
-  const jobs = [h.job({ owner: root }), h.job({ owner: child }), h.job({ owner: grandchild }),
-    h.job({ owner: sibling }), h.job({ owner: child, kind: "bash" }), h.job({})];
   await expect(h.stop(child, sibling)).rejects.toThrow("not owned");
-  expect(jobs.every((job) => job.cancel.mock.calls.length === 0)).toBe(true);
+  expect(h.signals.get(child)!.aborted).toBe(false);
   const stopping = h.stop(child, root);
   expect(h.signals.get(child)!.aborted).toBe(true);
   expect(h.signals.get(grandchild)!.aborted).toBe(true);
   expect(h.signals.get(sibling)!.aborted).toBe(false);
-  expect(jobs.map((job) => job.cancel.mock.calls.length)).toEqual([0, 1, 1, 0, 0, 0]);
   await expect(stopping).resolves.toEqual({ workKept: false });
   await h.stop(root);
 });
 
 for (const fork of [false, true]) {
-  for (const foreground of [false, true]) {
-    it(`covers pending ${fork ? "fork" : "spawn"} ${foreground ? "foreground handoff" : "background admission"}`, async () => {
-      const h = await harness();
-      const root = await h.root();
-      const published = Promise.withResolvers<Agent>();
-      const release = Promise.withResolvers<void>();
-      const create = h.context.agents.create.bind(h.context.agents);
-      vi.spyOn(h.context.agents, "create").mockImplementation(async (options: CreateAgentOptions) => {
-        const handle = await create(options);
-        published.resolve(handle.agent);
-        await release.promise;
-        return handle;
-      });
-      let launching!: ReturnType<typeof h.launch>;
-      const maintenance = root.runMaintenance(async (signal) => {
-        launching = h.launch({ parent: root, signal, fork, foreground });
-        await launching;
-      });
-      const child = await published.promise;
-      // The real child registry has published, but the caller has not crossed
-      // continuable admission / foreground signal handoff. Background forks are
-      // already in the real synchronous owned-job registry at this boundary.
-      const followup = vi.spyOn(child, "followup");
-      const stopping = h.stop(root);
-      if (fork && !foreground) expect(h.context.jobs.list(root.id).filter((job) => job.kind === "subagent")[0]?.status).toBe("stopping");
-      await expect(stopping).resolves.toEqual({ workKept: false });
-      release.resolve();
-      await maintenance;
-      await launching;
-      await expect.poll(() => h.context.agents.get(child.id)).toBeUndefined();
-      expect(followup).not.toHaveBeenCalled();
+  it(`covers pending ${fork ? "fork" : "spawn"} admission`, async () => {
+    const h = await harness();
+    const root = await h.root();
+    const published = Promise.withResolvers<Agent>();
+    const release = Promise.withResolvers<void>();
+    const create = h.context.agents.create.bind(h.context.agents);
+    vi.spyOn(h.context.agents, "create").mockImplementation(async (options: CreateAgentOptions) => {
+      const handle = await create(options);
+      published.resolve(handle.agent);
+      await release.promise;
+      return handle;
     });
-  }
+    let launching!: ReturnType<typeof h.launch>;
+    const maintenance = root.runMaintenance(async (signal) => {
+      launching = h.launch({ parent: root, signal, fork });
+      await launching;
+    });
+    const child = await published.promise;
+    // The real child registry has published, but the caller has not crossed
+    // continuable admission.
+    const followup = vi.spyOn(child, "followup");
+    const stopping = h.stop(root);
+    await expect(stopping).resolves.toEqual({ workKept: false });
+    release.resolve();
+    await maintenance;
+    await launching;
+    await expect.poll(() => h.context.agents.get(child.id)).toBeUndefined();
+    expect(followup).not.toHaveBeenCalled();
+  });
 }
 
-it("cancels a published background fork via the exact launcher's job, not its parent signal", async () => {
+it("stops a published fork by name, independently of its launching call signal", async () => {
   const h = await harness();
   const root = await h.root();
   const caller = new AbortController();
@@ -221,26 +203,11 @@ it("cancels a published background fork via the exact launcher's job, not its pa
   const child = [...h.signals.keys()][0]!;
   caller.abort();
   expect(h.signals.get(child)!.aborted).toBe(false);
-  await expect(h.stop(child, root)).resolves.toEqual({ workKept: true });
-  expect(h.signals.get(child)!.aborted).toBe(false);
-  const stopping = h.stop(root);
+  const stopping = h.stop(child, root);
   expect(h.signals.get(child)!.aborted).toBe(true);
   await expect(stopping).resolves.toEqual({ workKept: false });
-});
-
-it("continues independent cancellation after a throwing job and preserves original cause", async () => {
-  const h = await harness();
-  const root = await h.root();
-  const first = h.job({ owner: root, fail: true });
-  const second = h.job({ owner: root });
-  const child = await h.child({ parent: root, signal: new AbortController().signal });
-  const stopping = h.stop(root);
-  expect(h.signals.get(child)!.aborted).toBe(true);
-  expect(second.cancel).toHaveBeenCalledOnce();
-  await expect(stopping).rejects.toMatchObject({ errors: [expect.objectContaining({ cause: expect.objectContaining({ message: "producer sentinel failure" }) })] });
-  expect(h.diagnostics.join("\n")).toContain(`job=${first.id}`);
-  expect(h.diagnostics.join("\n")).toContain("producer sentinel failure");
-  first.done.resolve({ status: "failed" });
+  await expect(h.stop(root)).resolves.toEqual({ workKept: false });
+  await expect(h.adapter.extMethod("deepseek/session/stop", { kind: "session", sessionId: "absent" })).rejects.toThrow("not owned");
 });
 
 it("orders old input, cancel SERVER REQUEST, new reused-id input through the real SDK without either ACK", async () => {
@@ -319,38 +286,6 @@ it("settles pending permissions and logs unsupported input-cancel without blocki
   root.session.append("session/title", { title: "after abort", messageSeqs: [], source: { kind: "user" } });
   await expect.poll(() => h.requests.some((request) => request.method === "session/update" &&
     (request.params.update as { title?: string }).title === "after abort")).toBe(true);
-});
-
-it("stops live delegates through an ended retained one-shot ancestor", async () => {
-  const h = await harness();
-  const root = await h.root();
-  const foreground = root.runMaintenance((signal) => h.launch({ parent: root, signal, foreground: true }));
-  await expect.poll(() => h.signals.size).toBe(1);
-  const child = [...h.signals.keys()][0]!;
-  const grandchild = await h.child({ parent: child, signal: h.signals.get(child)! });
-  child.cancel({ kind: "user" });
-  await foreground;
-  await expect.poll(() => h.context.agents.get(child.id)).toBeUndefined();
-  expect(h.signals.get(grandchild)!.aborted).toBe(false);
-  const stopping = h.stop(child, root);
-  expect(h.signals.get(grandchild)!.aborted).toBe(true);
-  await expect(stopping).resolves.toEqual({ workKept: false });
-});
-
-it("retains independently named foreground work but parent stop covers the published signal handoff", async () => {
-  const h = await harness();
-  const root = await h.root();
-  const foreground = root.runMaintenance((signal) => h.launch({ parent: root, signal, foreground: true }));
-  await expect.poll(() => h.signals.size).toBe(1);
-  const child = [...h.signals.keys()][0]!;
-  await expect(h.stop(child, root)).resolves.toEqual({ workKept: true });
-  expect(h.signals.get(child)!.aborted).toBe(false);
-  const stopping = h.stop(root);
-  expect(h.signals.get(child)!.aborted).toBe(true);
-  await expect(stopping).resolves.toEqual({ workKept: false });
-  await foreground;
-  await expect(h.stop(root)).resolves.toEqual({ workKept: false });
-  await expect(h.adapter.extMethod("deepseek/session/stop", { kind: "session", sessionId: "absent" })).rejects.toThrow("not owned");
 });
 
 it("continues independent child cancellation when another child's cancel hook throws", async () => {

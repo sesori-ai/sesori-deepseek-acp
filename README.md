@@ -55,17 +55,22 @@ configuration belongs in the profile patch layer,
 
 The DeepSeek provider speaks the Messages API, so a custom `baseURL` must be
 Messages-compatible. Credentials still come from the environment or
-`$DSH_HOME/.credentials.yaml`.
-Sub-agents may delegate one level deep and run at most eight active continuable
-children by default; raise `maxDepth` in the profile patch to allow nesting.
+`$DSH_HOME/.credentials.yaml`. Without a credential the provider offers no
+models, so the model catalog and session config options are empty. With a key
+and the official endpoint, the catalog follows DeepSeek's `GET /models` listing;
+a custom `baseURL` serves the built-in catalog and sends no listing request.
+Every delegation, through `subagent` or `subagent_fork`, starts a managed
+background child that can be interrupted and continued. Sub-agents may delegate
+one level deep and run at most eight active continuable children by default;
+raise `maxDepth` in the profile patch to allow nesting.
 
 DeepSeek plugins are trusted local process code. They can independently access
 source files, prompts, credentials, and the network; installing one into the
 `sesori` profile grants that access. Plugins installed only in another profile,
 such as `web` or `headless`, are not loaded automatically.
 
-Runtime uses DeepSeek Harness `0.2.0-rc.2`, including canonical
-`deepseek-flash` (`DeepSeek-V41-Flash`) catalog metadata, native model selection,
+Runtime uses DeepSeek Harness `0.2.1-rc.3`, including canonical
+`deepseek-flash` (`DeepSeek-V4.1-Flash`) catalog metadata, native model selection,
 outbound `web_search` and `web_fetch` tools, and native persisted-session format
 migration. Outbound web tools do not expose a local web server, frontend, BFF,
 or additional process. Telemetry and hot reload remain disabled. Adapter-owned

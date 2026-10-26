@@ -375,7 +375,7 @@ export async function packageRelease({ target, output }) {
     readJson(join(repositoryRoot, "package.json")),
   ]);
   if (packageMetadata.version.includes("-")) throw new Error("Release package version must be stable");
-  if (config.deepSeekHarnessVersion !== "0.2.0-rc.2") throw new Error("Unexpected DeepSeek Harness release pin");
+  if (config.deepSeekHarnessVersion !== "0.2.1-rc.3") throw new Error("Unexpected DeepSeek Harness release pin");
 
   runNpm(["run", "build"], { cwd: repositoryRoot });
   const temporaryRoot = await mkdtemp(join(tmpdir(), "sesori-deepseek-release-"));

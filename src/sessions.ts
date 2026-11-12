@@ -35,7 +35,6 @@ import {
   type AgentHandle,
   type AssistantStreamFrame,
   type ModelSelection,
-  type ModelSelectionRef,
 } from "@deepseek-ai/dsh-agent";
 import type {} from "@deepseek-ai/dsh-agent-default-model";
 import { isImageAdmissionError, type EncodedImageAttachment } from "@deepseek-ai/dsh-attachment";
@@ -48,7 +47,6 @@ import {
   MessageId,
   ReasoningEffortId,
   type ContentBlock,
-  type LlmCallConfig,
   type TokenUsage,
   type UserMessage,
 } from "@deepseek-ai/dsh-llm";
@@ -170,11 +168,25 @@ function subagentSummary(blocks: readonly ContentBlock[] | undefined): string | 
   );
 }
 
-/** Delegation tools render a continuable start as `started subagent <id>`; the id is the child session id. */
-function continuableChildId(blocks: readonly ContentBlock[]): string | undefined {
+/**
+ * Delegation tools render a continuable start as `started subagent <name>`. dsh 0.2.2 names
+ * the child by its parent-catalog name; earlier sessions named it by its session id.
+ */
+function continuableChildId(blocks: readonly ContentBlock[], names: ReadonlyMap<string, string>): string | undefined {
   const text = blocks.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("");
-  const match = /^started subagent (\S+)$/u.exec(text.trim());
-  return match?.[1];
+  const token = /^started subagent (\S+)$/u.exec(text.trim())?.[1];
+  return token === undefined ? undefined : (names.get(token) ?? token);
+}
+
+/** Child name to child session id, from the parent's named (v3) `subagent/catalog` facts. */
+function catalogChildNames(events: readonly SessionEvent[]): Map<string, string> {
+  const names = new Map<string, string>();
+  for (const event of events) {
+    if (event.type !== "subagent/catalog") continue;
+    const data = event.data as { name?: unknown; childId?: unknown };
+    if (typeof data.name === "string" && typeof data.childId === "string") names.set(data.name, data.childId);
+  }
+  return names;
 }
 
 /** Map the `subagent` tool's failed-result headline (`stopReasonError`) back to the closed stop-reason vocabulary. */
@@ -198,6 +210,8 @@ function settledStopReason(summary: string): SubagentStopReason {
 interface ReplayChildren {
   /** Durable `toolCallId -> childSessionId` bindings recorded at each live `subagent/start`. */
   bindings: ReadonlyMap<string, string>;
+  /** Child name to child session id, for start results that name the child. */
+  names: ReadonlyMap<string, string>;
   /** Continuable child id to the parent call that started it, for the later settlement notice. */
   continuable: Map<string, { callId: string; label: string; prompt: string }>;
 }
@@ -273,7 +287,6 @@ interface ToolCallRecord {
 
 interface SessionRecord {
   readonly handle: AgentHandle;
-  readonly selection: ModelSelectionRef;
   readonly toolCalls: Map<string, ToolCallRecord>;
   readonly messageCreatedAt: Map<string, number>;
   outputTail: Promise<void>;
@@ -682,7 +695,12 @@ async function projectSessionEvent(args: EventProjection, event: SessionEvent): 
   }
   if (event.type === "user/message" && isAppendSurfaceEvent(event)) {
     if (args.mode === "live") return;
-    const source = event.data.source as { kind: string; senderSessionId?: unknown; summary?: unknown };
+    const source = event.data.source as {
+      kind: string;
+      senderSessionId?: unknown;
+      summary?: unknown;
+      stopReason?: unknown;
+    };
     if (source.kind === "subagent-settled") {
       const childSessionId = typeof source.senderSessionId === "string" ? source.senderSessionId : undefined;
       const started = childSessionId === undefined ? undefined : args.replayChildren?.continuable.get(childSessionId);
@@ -696,7 +714,12 @@ async function projectSessionEvent(args: EventProjection, event: SessionEvent): 
           prompt: started.prompt,
           mode: "background",
           childSessionId,
-          ended: { stopReason: settledStopReason(typeof source.summary === "string" ? source.summary : "") },
+          ended: {
+            // dsh 0.2.2 records the exact reason; earlier notices carry only the summary wording.
+            stopReason: typeof source.stopReason === "string"
+              ? subagentStopReason(source.stopReason)
+              : settledStopReason(typeof source.summary === "string" ? source.summary : ""),
+          },
         },
       );
       return;
@@ -935,7 +958,7 @@ function replaySubagentResult(args: {
   if (view === undefined) return undefined;
   const bound = args.children?.bindings.get(args.callId);
   if (view.mode === "background") {
-    const childSessionId = continuableChildId(args.content) ?? bound;
+    const childSessionId = (args.children === undefined ? undefined : continuableChildId(args.content, args.children.names)) ?? bound;
     if (childSessionId === undefined) {
       return args.failed ? { ...view, ended: { stopReason: "error" } } : view;
     }
@@ -973,7 +996,10 @@ function updateMetadata(
  * Continuable children started before the replayed page, so a settlement notice
  * on this page still folds onto the call that started it on an earlier page.
  */
-function priorContinuable(events: readonly SessionEvent[]): ReplayChildren["continuable"] {
+function priorContinuable(
+  events: readonly SessionEvent[],
+  names: ReadonlyMap<string, string>,
+): ReplayChildren["continuable"] {
   const continuable: ReplayChildren["continuable"] = new Map();
   const calls = new Map<string, ToolCallRecord>();
   for (const event of events) {
@@ -985,7 +1011,7 @@ function priorContinuable(events: readonly SessionEvent[]): ReplayChildren["cont
       const call = calls.get(callId);
       calls.delete(callId);
       const view = call === undefined ? undefined : replaySubagentCall(call.name, call.arguments);
-      const childSessionId = view?.mode === "background" ? continuableChildId(result.content) : undefined;
+      const childSessionId = view?.mode === "background" ? continuableChildId(result.content, names) : undefined;
       if (view !== undefined && childSessionId !== undefined) {
         continuable.set(childSessionId, { callId, label: view.label, prompt: view.prompt });
       }
@@ -1009,6 +1035,7 @@ async function replayUpdates(args: {
   diagnose: (operation: string, error: unknown) => void;
 }): Promise<SessionNotification[]> {
   assertKnownEvents(args.events);
+  const names = catalogChildNames([...args.priorEvents, ...args.events]);
   const updates: SessionNotification[] = [];
   const messageCreatedAt = new Map<string, number>();
   for (const event of args.events) {
@@ -1025,7 +1052,8 @@ async function replayUpdates(args: {
     messageCreatedAt,
     replayChildren: {
       bindings: args.bindings,
-      continuable: priorContinuable(args.priorEvents),
+      names,
+      continuable: priorContinuable(args.priorEvents, names),
     },
     emitUpdate: (update, messageTime, subagent) => {
       updates.push({ sessionId: args.sessionId, update, ...updateMetadata(messageTime, subagent) });
@@ -1092,27 +1120,6 @@ export class DurableSessionAgent implements AcpAgent {
     }));
     this.#hooks.push(this.#context.on("subagent/end", (info: SubagentRunEndInfo) => {
       this.#childEnded(info);
-    }));
-    this.#hooks.push(this.#context.on("agent/request", async ({ agent }, next): Promise<LlmCallConfig> => {
-      const resolved = await next();
-      const root = this.#children.has(agent.id) ? this.#rootOf(agent.id) : undefined;
-      if (root === undefined) return resolved;
-      // dsh children inherit only `AgentOptions`, which owned roots never set; give descendants
-      // the owning root's live selection instead so they can run at all.
-      let selected: ModelSelection | undefined;
-      try {
-        selected = root.selection.current;
-      } catch {
-        return resolved;
-      }
-      if (selected === undefined) return resolved;
-      const { reasoningEffort: _inheritedEffort, ...rest } = resolved;
-      return {
-        ...rest,
-        provider: selected.provider,
-        model: selected.model,
-        ...(selected.reasoningEffort === undefined ? {} : { reasoningEffort: selected.reasoningEffort }),
-      };
     }));
     this.#hooks.push(this.#context.on("agent/inbox/claimed", ({ agent, message, turn }) => {
       const inflight = this.#ownedRecord(agent)?.inflight;
@@ -1227,24 +1234,22 @@ export class DurableSessionAgent implements AcpAgent {
     void creationDone.promise.catch(() => undefined);
     this.#creations.add(creationDone.promise);
     let handle: AgentHandle | undefined;
-    let selection: ModelSelectionRef | undefined;
     let cleanupFailure: { error: unknown } | undefined;
     try {
       handle = await this.#context.agents.create({
         sessionId,
         meta: { cwd: params.cwd },
-        setup: (agentContext, agent) => {
-          selection = this.#installSelection(agentContext, agent);
+        agentOptions: this.#defaultSelection(),
+        setup: (agentContext) => {
+          installModelSelection(agentContext);
         },
       });
       if (this.#closed) throw new Error("adapter disposed during session creation");
       if (handle.agent.session.id !== sessionId || this.#sessions.has(sessionId)) {
         throw new Error("agent factory returned a duplicate or mismatched session id");
       }
-      if (selection === undefined) throw new Error("agent setup did not install model selection");
       const record: SessionRecord = {
         handle,
-        selection,
         toolCalls: new Map(),
         messageCreatedAt: new Map(),
         outputTail: Promise.resolve(),
@@ -1291,7 +1296,6 @@ export class DurableSessionAgent implements AcpAgent {
     let adopted = false;
     let resumed = false;
     let handle: AgentHandle | undefined;
-    let selection: ModelSelectionRef | undefined;
     let cleanupFailure: { error: unknown } | undefined;
     try {
       const inspection = await this.#inspect(sessionId);
@@ -1315,25 +1319,23 @@ export class DurableSessionAgent implements AcpAgent {
           throw new Error("owned session is no longer registered");
         }
         handle = resident.handle;
-        selection = resident.selection;
       } else {
         if (this.#context.agents.get(sessionId) !== undefined) {
           throw new Error("session is already owned outside this ACP connection");
         }
         handle = await this.#context.agents.resume({
           resumeSessionId: sessionId,
-          setup: (agentContext, agent) => {
-            selection = this.#installSelection(agentContext, agent);
+          agentOptions: this.#defaultSelection(),
+          setup: (agentContext) => {
+            installModelSelection(agentContext);
           },
         });
         resumed = true;
         if (this.#closed || this.#sessions.has(sessionId)) {
           throw new Error("adapter ownership changed during session load");
         }
-        if (selection === undefined) throw new Error("agent setup did not install model selection");
         this.#sessions.set(sessionId, {
           handle,
-          selection,
           toolCalls: new Map(),
           messageCreatedAt: new Map(),
           outputTail: Promise.resolve(),
@@ -1410,36 +1412,21 @@ export class DurableSessionAgent implements AcpAgent {
     }
   }
 
-  #installSelection(agentContext: Context, agent: Agent): ModelSelectionRef {
-    const defaults = agentContext.get("agentDefaultModel") as
+  /**
+   * The profile's default route, passed as a root's `AgentOptions`. dsh prefers the
+   * Session's recorded selection and then its last request, so this applies only
+   * until the Session records either.
+   */
+  #defaultSelection(): ModelSelection {
+    const defaults = this.#context.get("agentDefaultModel") as
       | { currentSelection(): ModelSelection }
       | undefined;
     if (defaults === undefined) throw new Error("default model service is unavailable");
-    let selected: ModelSelection | undefined;
-    const selection: ModelSelectionRef = {
-      get current(): ModelSelection {
-        if (selected !== undefined) return selected;
-        const logged = agent.session.requestHeader()?.config;
-        if (logged === undefined) {
-          try {
-            return defaults.currentSelection();
-          } catch {
-            throw new Error("default model selection unavailable");
-          }
-        }
-        return {
-          provider: logged.provider,
-          model: logged.model,
-          ...(logged.reasoningEffort === undefined ? {} : { reasoningEffort: logged.reasoningEffort }),
-        };
-      },
-      set current(value: ModelSelection | undefined) {
-        selected = value;
-      },
-      assembled: undefined,
-    };
-    installModelSelection(agentContext, selection);
-    return selection;
+    try {
+      return defaults.currentSelection();
+    } catch {
+      throw new Error("default model selection unavailable");
+    }
   }
 
   #sendCommands(record: SessionRecord, emitEmpty = false): Promise<void> {
@@ -1588,7 +1575,7 @@ export class DurableSessionAgent implements AcpAgent {
   async #configOptions(record: SessionRecord, catalog?: CatalogResponse): Promise<SessionConfigOption[]> {
     catalog ??= await this.#catalog();
     if (catalog.providers.length === 0) return [];
-    const current = record.selection.current;
+    const current = record.handle.agent.model.current();
     if (current === undefined) throw new Error("session has no model selection");
     let selectedId: string;
     try {
@@ -1639,18 +1626,18 @@ export class DurableSessionAgent implements AcpAgent {
     if (this.#loads.has(sessionId)) throw invalidParams("session load is in progress");
     if (this.#sessions.get(sessionId) !== record) throw invalidParams("unknown session");
     if (record.inflight !== undefined) throw invalidParams("a prompt is in flight for this session");
-    const current = record.selection.current;
+    const current = record.handle.agent.model.current();
     if (current === undefined) throw internalError("session has no model selection");
     if (params.configId === MODEL_CONFIG_ID) {
       const decoded = decodeSelectionId(params.value);
       const model = catalog.providers.flatMap((provider) => provider.models).find((item) => item.id === params.value);
       if (decoded === undefined || model === undefined) throw invalidParams("unknown DeepSeek model selection");
-      record.selection.current = {
+      record.handle.agent.model.select({
         ...decoded,
         ...(model.defaultReasoningEffort === null
           ? {}
           : { reasoningEffort: ReasoningEffortId(model.defaultReasoningEffort) }),
-      };
+      });
     } else if (params.configId === REASONING_CONFIG_ID) {
       const model = catalog.providers
         .flatMap((provider) => provider.models)
@@ -1658,7 +1645,7 @@ export class DurableSessionAgent implements AcpAgent {
       if (model === undefined || !model.reasoningEfforts.includes(params.value)) {
         throw invalidParams("unknown DeepSeek reasoning effort");
       }
-      record.selection.current = { ...current, reasoningEffort: ReasoningEffortId(params.value) };
+      record.handle.agent.model.select({ ...current, reasoningEffort: ReasoningEffortId(params.value) });
     } else {
       throw invalidParams("unknown DeepSeek config option");
     }
@@ -1746,7 +1733,6 @@ export class DurableSessionAgent implements AcpAgent {
     void transition.promise.catch(() => undefined);
     this.#loads.set(sessionId, transition.promise);
     let handle: AgentHandle | undefined;
-    let selection: ModelSelectionRef | undefined;
     let cleanupFailure: unknown;
     let operationFailure: RequestError | undefined;
     let response: Record<string, unknown> | undefined;
@@ -1758,8 +1744,9 @@ export class DurableSessionAgent implements AcpAgent {
         await this.#inspect(sessionId);
         handle = await this.#context.agents.resume({
           resumeSessionId: sessionId,
-          setup: (agentContext, agent) => {
-            selection = this.#installSelection(agentContext, agent);
+          agentOptions: this.#defaultSelection(),
+          setup: (agentContext) => {
+            installModelSelection(agentContext);
           },
         });
         if (this.#closed || this.#sessions.has(sessionId)) {
@@ -1785,13 +1772,13 @@ export class DurableSessionAgent implements AcpAgent {
               : error
             : internalError("unable to rename DeepSeek session");
       }
-      await handle?.dispose().catch((error: unknown) => {
+      const resumed = handle;
+      await resumed?.dispose().catch((error: unknown) => {
         cleanupFailure = error;
         this.#diagnose("deepseek/session/rename cleanup", sessionId, error);
-        if (selection !== undefined && !this.#closed && !this.#sessions.has(sessionId)) {
+        if (!this.#closed && !this.#sessions.has(sessionId)) {
           this.#sessions.set(sessionId, {
-            handle: handle!,
-            selection,
+            handle: resumed,
             toolCalls: new Map(),
             messageCreatedAt: new Map(),
             outputTail: Promise.resolve(),
@@ -2047,24 +2034,11 @@ export class DurableSessionAgent implements AcpAgent {
     return this.#sessions.get(id) ?? this.#children.get(id);
   }
 
-  /** The owned root above a registered child, following `parentSession` links through nested children. */
-  #rootOf(childId: SessionId): SessionRecord | undefined {
-    const visited = new Set<SessionId>();
-    let cursor = this.#children.get(childId);
-    while (cursor !== undefined && !visited.has(cursor.agent.id)) {
-      visited.add(cursor.agent.id);
-      const root = this.#sessions.get(cursor.parentId);
-      if (root !== undefined) return root;
-      cursor = this.#children.get(cursor.parentId);
-    }
-    return undefined;
-  }
-
   /**
    * Drop a settled child once its output is drained and nothing below it is
    * registered, then re-check its settled parent. A background grandchild may
-   * outlive the child that started it, and its model selection, transcript, and
-   * `ended` notification still resolve through that retained lineage.
+   * outlive the child that started it, and its transcript and `ended`
+   * notification still resolve through that retained lineage.
    */
   #releaseSettled(id: SessionId): void {
     const current = this.#children.get(id);

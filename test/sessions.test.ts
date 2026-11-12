@@ -1,6 +1,6 @@
 import type { AgentSideConnection, SessionNotification } from "@agentclientprotocol/sdk";
 import type { Context } from "@deepseek-ai/cordis";
-import type { Agent, AgentHandle } from "@deepseek-ai/dsh-agent";
+import type { Agent, AgentHandle, AgentOptions, ModelSelection } from "@deepseek-ai/dsh-agent";
 import { CommandId } from "@deepseek-ai/dsh-commands";
 import { LlmAttemptId, type StreamChunk } from "@deepseek-ai/dsh-llm";
 import {
@@ -32,7 +32,6 @@ interface SessionServices {
   extNotification: ReturnType<typeof vi.fn>;
   sessionUpdate: ReturnType<typeof vi.fn>;
   invoke(name: string, ...args: unknown[]): unknown;
-  invokeFirst(name: string, ...args: unknown[]): unknown;
   askQuestion(request: unknown): Promise<unknown>;
   contextServices: Map<string, unknown>;
   bindings: SubagentBindingStore;
@@ -119,10 +118,30 @@ function services(): SessionServices {
     meta: SessionHeader,
     sessionEvents: readonly SessionEvent[],
     setup?: (context: Context, agent: Agent) => void | Promise<void>,
+    options: AgentOptions = {},
   ): Promise<AgentHandle> => {
     const storedEvents = [...sessionEvents];
+    // Like dsh's AgentModel: the latest recorded selection, else the route fallback.
+    const recordedSelection = () =>
+      storedEvents.findLast((event) => event.type === ("model/selection" as SessionEvent["type"]))?.data as
+        | ModelSelection
+        | undefined;
     const agent = {
       id: meta.id,
+      model: {
+        current: () =>
+          recordedSelection() ??
+          (options.provider !== undefined && options.model !== undefined
+            ? {
+                provider: options.provider,
+                model: options.model,
+                ...(options.reasoningEffort === undefined ? {} : { reasoningEffort: options.reasoningEffort }),
+              }
+            : undefined),
+        select: vi.fn((selection: ModelSelection) => {
+          agent.session.append("model/selection", { ...selection });
+        }),
+      },
       session: {
         id: meta.id,
         header: meta,
@@ -159,17 +178,19 @@ function services(): SessionServices {
   const create = vi.fn(async (options: {
     sessionId: string;
     meta: { cwd: string };
+    agentOptions?: AgentOptions;
     setup?: (context: Context, agent: Agent) => void;
   }) => {
-    return makeHandle(header({ id: options.sessionId, cwd: options.meta.cwd }), [], options.setup);
+    return makeHandle(header({ id: options.sessionId, cwd: options.meta.cwd }), [], options.setup, options.agentOptions);
   });
   const resume = vi.fn(async (options: {
     resumeSessionId: string;
+    agentOptions?: AgentOptions;
     setup?: (context: Context, agent: Agent) => void;
   }) => {
     const inspection = inspections.get(options.resumeSessionId);
     if (inspection === undefined) throw new Error("not found");
-    return makeHandle(inspection.meta, inspection.events, options.setup);
+    return makeHandle(inspection.meta, inspection.events, options.setup, options.agentOptions);
   });
   const flush = vi.fn(async () => true);
   const drainDescendants = vi.fn(async () => undefined);
@@ -282,7 +303,6 @@ function services(): SessionServices {
     extNotification,
     sessionUpdate,
     invoke: (name, ...args) => listeners.get(name)?.at(-1)?.(...(args as never[])),
-    invokeFirst: (name, ...args) => listeners.get(name)?.at(0)?.(...(args as never[])),
     askQuestion: (request) => {
       const answerer = listeners.get("user-questions/request")?.at(-1);
       if (answerer === undefined) throw new Error("question provider is unavailable");
@@ -3224,10 +3244,10 @@ describe("sub-agent lifecycle", () => {
     releaseDispose.resolve();
     await failingClose;
 
-    const inherited = { provider: "inherited", model: "inherited" };
-    await expect(
-      state.invokeFirst("agent/request", { agent: failingChild.agent, turn: 1, step: 1 }, async () => inherited),
-    ).resolves.toEqual({ provider: "synthetic", model: "synthetic" });
+    // A child still registered under the failed root remains a valid stop target.
+    await expect(state.agent.extMethod("deepseek/session/stop", {
+      kind: "child", sessionId: String(failingRoot.agent.id), childSessionId: "child-failing-close",
+    })).resolves.toEqual({ workKept: true });
   });
 
   it("announces both pinned delegation tools as background children by default", async () => {
@@ -3363,20 +3383,6 @@ describe("sub-agent lifecycle", () => {
     expect(state.updates).toEqual([]);
   });
 
-  it("gives registered children the owning root's model selection", async () => {
-    const state = services();
-    const { root, child } = await rootWithChild(state, "child-model");
-    state.invoke("subagent/start", { runId: "run-4", provider: "spawn", id: child.agent.id, local: true });
-    const inherited = { provider: "inherited", model: "inherited", reasoningEffort: "high" };
-
-    await expect(
-      state.invokeFirst("agent/request", { agent: child.agent, turn: 1, step: 1 }, async () => inherited),
-    ).resolves.toEqual({ provider: "synthetic", model: "synthetic" });
-    await expect(
-      state.invokeFirst("agent/request", { agent: root.agent, turn: 1, step: 1 }, async () => inherited),
-    ).resolves.toEqual(inherited);
-  });
-
   it("folds delegation identity and settlement into the parent's replayed tool calls", async () => {
     const state = services();
     const meta = header({ id: "parent", cwd: "/project", createdAt: 1 });
@@ -3474,6 +3480,83 @@ describe("sub-agent lifecycle", () => {
       ["tool_call_update", { label: "Fork child", prompt: "fork prompt", mode: "background", childSessionId: "fork-child", ended: { stopReason: "completed" } }],
     ]);
   });
+
+  it("resolves named child starts through the parent catalog and keeps the exact settlement reason", async () => {
+    const state = services();
+    const meta = header({ id: "named-parent", cwd: "/project", createdAt: 1 });
+    state.headers.push(meta);
+    state.inspections.set("named-parent", {
+      meta,
+      events: [
+        {
+          type: "user/message",
+          seq: 0,
+          time: 1,
+          surfaceOp: "append",
+          data: { id: "user-named", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "delegate" }] },
+        },
+        {
+          type: "tool/call",
+          seq: 1,
+          time: 10,
+          data: { turn: 1, step: 1, callId: "call-named", name: "subagent_fork", arguments: JSON.stringify({ description: "Named child", prompt: "named prompt" }) },
+        },
+        {
+          type: "subagent/catalog",
+          seq: 2,
+          time: 11,
+          data: { version: 3, childId: "child-session", childCreatedAt: 11, name: "agent-1", mode: "continuable", label: "Named child" },
+        },
+        {
+          type: "tool/result",
+          seq: 3,
+          time: 12,
+          surfaceOp: "append",
+          sourceEventSeqs: [1],
+          data: {
+            turn: 1,
+            step: 1,
+            message: {
+              id: "result-named",
+              role: "tool",
+              source: { kind: "tool", callId: "call-named" },
+              toolCallId: "call-named",
+              content: [{ type: "text", text: "started subagent agent-1" }],
+            },
+          },
+        },
+        {
+          type: "user/message",
+          seq: 4,
+          time: 20,
+          surfaceOp: "append",
+          data: {
+            id: "notice-named",
+            role: "user",
+            source: {
+              kind: "subagent-settled",
+              form: "notice",
+              summary: "Background subagent agent-1 finished. It cannot receive follow-up messages.",
+              stopReason: "completed",
+              senderSessionId: "child-session",
+            },
+            content: [{ type: "text", text: "done" }],
+          },
+        },
+      ] as unknown as SessionEvent[],
+    });
+
+    const response = await state.agent.extMethod("deepseek/session/history", { sessionId: "named-parent" });
+    const subagents = (response.updates as SessionNotification[]).map(
+      (notification) => (notification._meta as { "sesori.ai/deepseek": { subagent?: unknown } })["sesori.ai/deepseek"].subagent,
+    );
+    expect(subagents).toEqual([
+      undefined,
+      { label: "Named child", prompt: "named prompt", mode: "background" },
+      { label: "Named child", prompt: "named prompt", mode: "background", childSessionId: "child-session" },
+      { label: "Named child", prompt: "named prompt", mode: "background", childSessionId: "child-session", ended: { stopReason: "completed" } },
+    ]);
+  });
 });
 
 describe("sub-agent lifecycle follow-ups", () => {
@@ -3513,9 +3596,10 @@ describe("sub-agent lifecycle follow-ups", () => {
     );
     state.invoke("subagent/end", { runId: "r1", provider: "spawn", id: child.agent.id, local: true, stopReason: "completed" });
 
-    await expect(
-      state.invokeFirst("agent/request", { agent: grandchild.agent, turn: 1, step: 1 }, async () => ({ provider: "x", model: "y" })),
-    ).resolves.toEqual({ provider: "synthetic", model: "synthetic" });
+    // The settled middle child stays registered while its grandchild runs.
+    await expect(state.agent.extMethod("deepseek/session/stop", {
+      kind: "child", sessionId: "mid", childSessionId: "leaf",
+    })).resolves.toEqual({ workKept: true });
     await expect.poll(() => state.extNotifications.length).toBe(3);
     const nestedEndDelivery = Promise.withResolvers<void>();
     state.extNotification.mockImplementationOnce(async (method: string, params: Record<string, unknown>) => {

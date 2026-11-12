@@ -75,12 +75,14 @@ Runtime uses DeepSeek Harness `0.2.2-rc.2`, including canonical `deepseek-flash`
 migration. A model or reasoning-effort choice is recorded in the session, so it
 survives a restart. A sub-agent keeps the route it started with; sub-agents
 started after a switch use the new route. `web_search` uses the DeepSeek Search
-API on the chat route's origin, with the chat credential. Outbound web tools do
-not expose a local web server, frontend, BFF, or additional process. Telemetry
-and hot reload remain disabled. Adapter-owned sessions, attachments, query
-indexes, storage documents, and spill files remain under supplied `--state-dir`.
-The adapter does not change the profile patch layer or credentials; an
-explicitly installed plugin controls its own behavior.
+API on the chat route's origin, with the chat credential. A custom `baseURL`
+origin must also serve `/v1/tools/search`; behind a Messages-only proxy,
+`web_search` calls fail. Outbound web tools do not expose a local web server,
+frontend, BFF, or additional process. Telemetry and hot reload remain disabled.
+Adapter-owned sessions, attachments, query indexes, storage documents, and spill
+files remain under supplied `--state-dir`. The adapter does not change the
+profile patch layer or credentials; an explicitly installed plugin controls its
+own behavior.
 
 Tagged releases contain target-specific package-directory archives with a
 pinned official Node runtime, production dependencies, CycloneDX SBOM, license

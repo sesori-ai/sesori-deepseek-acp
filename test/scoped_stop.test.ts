@@ -13,8 +13,9 @@ import { createMemorySubagentBindingStore } from "../src/subagent_bindings.ts";
 
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => {
-  vi.restoreAllMocks();
+  // Dispose while the output barrier mock is still installed; queued output then drains into it.
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
+  vi.restoreAllMocks();
 });
 
 async function harness() {
@@ -56,6 +57,11 @@ async function harness() {
     await output.promise;
     notifications.push(params);
   });
+  const started = new Map<SessionId, SessionId[]>();
+  context.on("subagent/start", ({ id }) => {
+    const parent = context.agents.get(id)?.session.header.parentSession;
+    if (parent !== undefined) started.set(parent, [...(started.get(parent) ?? []), id]);
+  });
   context.on("agent/pre-step", async ({ agent, signal }) => {
     signals.set(agent, signal);
     await beforeStep.get(agent)?.(signal);
@@ -75,23 +81,26 @@ async function harness() {
   const stop = (target: Agent, parent?: Agent) => adapter.extMethod("deepseek/session/stop", parent === undefined
     ? { kind: "session", sessionId: String(target.id) }
     : { kind: "child", sessionId: String(parent.id), childSessionId: String(target.id) });
-  const nativeScopes = new Set<Agent>();
-  const launch = (args: { parent: Agent; signal: AbortSignal; fork?: boolean }) => {
-    if (!nativeScopes.has(args.parent)) {
-      args.parent.ctx.tools.presentAs("native");
-      nativeScopes.add(args.parent);
-    }
-    return context.tools.execute({
-    agent: args.parent, signal: args.signal, callId: ToolCallId(crypto.randomUUID()),
-    name: args.fork ? "subagent_fork" : "subagent",
-    arguments: { description: "child", prompt: "wait" },
+  const launch = async (args: { parent: Agent; signal: AbortSignal; fork?: boolean }) => {
+    const batch = await context.tools.execute({
+      agent: args.parent, signal: args.signal,
+      calls: [{
+        type: "tool-call", id: ToolCallId(crypto.randomUUID()),
+        name: args.fork ? "subagent_fork" : "subagent",
+        arguments: JSON.stringify({ description: "child", prompt: "wait" }),
+      }],
     });
+    const call = batch.results[0];
+    if (call === undefined) throw new Error("the tool batch returned no result");
+    return call.result;
   };
   async function child(args: { parent: Agent; signal: AbortSignal }) {
     const result = await launch(args);
     expect(result.isError, JSON.stringify(result)).not.toBe(true);
-    const childId = (result.value as { subagentId: string }).subagentId;
-    const agent = context.agents.get(SessionId(childId))!;
+    // The tool result names the child by its local handle; the start event carries its session id.
+    const childId = started.get(args.parent.id)?.at(-1);
+    if (childId === undefined) throw new Error("the delegation started no child");
+    const agent = context.agents.get(childId)!;
     await expect.poll(() => signals.has(agent)).toBe(true);
     return agent;
   }

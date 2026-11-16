@@ -61,12 +61,6 @@ function runNpm(arguments_, options = {}) {
   return run(process.execPath, [npmCli, ...arguments_], options);
 }
 
-function runPowerShell(script, environment) {
-  run("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], {
-    env: { ...process.env, ...environment },
-  });
-}
-
 export function nodeAssetName({ nodeVersion, target }) {
   const definition = targetDefinitions[target];
   if (definition === undefined) throw new Error(`Unsupported release target: ${target}`);
@@ -123,14 +117,9 @@ async function installOfficialNode({ config, target, temporaryRoot, packageRoot 
   const extracted = join(temporaryRoot, "node-extracted");
   const windows = target.startsWith("windows-");
   await mkdir(extracted);
-  if (windows) {
-    runPowerShell("Expand-Archive -LiteralPath $env:SESORI_ARCHIVE -DestinationPath $env:SESORI_DESTINATION", {
-      SESORI_ARCHIVE: archivePath,
-      SESORI_DESTINATION: extracted,
-    });
-  } else {
-    run("tar", ["-xf", archivePath, "-C", extracted]);
-  }
+  // Windows' bundled bsdtar reads zip archives too; Expand-Archive breaks when
+  // Windows PowerShell inherits a PowerShell 7 module path on CI runners.
+  run("tar", ["-xf", archivePath, "-C", extracted]);
   const sourceRoot = join(extracted, assetName.replace(/\.(?:tar\.xz|zip)$/u, ""));
   const nodeDirectory = join(packageRoot, "node", ...(windows ? [] : ["bin"]));
   await mkdir(nodeDirectory, { recursive: true });

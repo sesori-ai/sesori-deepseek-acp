@@ -918,20 +918,24 @@ async function projectSessionEvent(args: EventProjection, event: SessionEvent): 
   if (event.type === "turn/end") {
     // Live and replayed alike, so the explanation survives a history reload under one id.
     const refusal = contentRefusalMessage(event.data.reason);
-    if (refusal !== undefined) {
-      await args.emitUpdate(
-        {
-          sessionUpdate: "agent_message_chunk",
-          messageId: refusalMessageId(args.sessionId, event.data.turn),
-          content: { type: "text", text: refusal },
-        },
-        eventTime(event),
-      );
+    try {
+      if (refusal !== undefined) {
+        await args.emitUpdate(
+          {
+            sessionUpdate: "agent_message_chunk",
+            messageId: refusalMessageId(args.sessionId, event.data.turn),
+            content: { type: "text", text: refusal },
+          },
+          eventTime(event),
+        );
+      }
+    } finally {
+      // A failed notification still ends the turn; the caller records the failure as output failure.
+      if (args.mode === "live") {
+        args.messageCreatedAt.clear();
+        args.onTurnEnd?.(event.data.turn, event.data.reason);
+      }
     }
-  }
-  if (event.type === "turn/end" && args.mode === "live") {
-    args.messageCreatedAt.clear();
-    args.onTurnEnd?.(event.data.turn, event.data.reason);
     return;
   }
   if (event.type === "llm/retry" && args.mode === "live") {

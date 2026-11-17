@@ -241,6 +241,20 @@ function commandMessageId(sessionId: string, commandId: string): string {
   return `deepseek-command-${createHash("sha256").update(`${sessionId}\0${commandId}`).digest("base64url").slice(0, 24)}`;
 }
 
+function refusalMessageId(sessionId: string, turn: number): string {
+  return `deepseek-refusal-${createHash("sha256").update(`${sessionId}\0${turn}`).digest("base64url").slice(0, 24)}`;
+}
+
+/**
+ * The provider's explanation when DeepSeek's content safety review refused the
+ * turn (`CONTENT_REFUSED`, from DeepSeek Harness 0.2.2-rc.4), otherwise undefined.
+ */
+function contentRefusalMessage(reason: unknown): string | undefined {
+  const value = reason as { kind?: unknown; error?: { code?: unknown; message?: unknown } } | undefined;
+  if (value?.kind !== "error" || value.error?.code !== "CONTENT_REFUSED") return undefined;
+  return typeof value.error.message === "string" ? value.error.message : undefined;
+}
+
 function promptMessageId(params: PromptRequest): string {
   const metadata = params._meta?.[PROMPT_METADATA_KEY];
   const value =
@@ -900,6 +914,20 @@ async function projectSessionEvent(args: EventProjection, event: SessionEvent): 
   if (event.type === "session/title") {
     await args.emitUpdate({ sessionUpdate: "session_info_update", title: event.data.title });
     return;
+  }
+  if (event.type === "turn/end") {
+    // Live and replayed alike, so the explanation survives a history reload under one id.
+    const refusal = contentRefusalMessage(event.data.reason);
+    if (refusal !== undefined) {
+      await args.emitUpdate(
+        {
+          sessionUpdate: "agent_message_chunk",
+          messageId: refusalMessageId(args.sessionId, event.data.turn),
+          content: { type: "text", text: refusal },
+        },
+        eventTime(event),
+      );
+    }
   }
   if (event.type === "turn/end" && args.mode === "live") {
     args.messageCreatedAt.clear();
@@ -2410,6 +2438,7 @@ export class DurableSessionAgent implements AcpAgent {
       }
       const reason = inflight.endReason as { kind?: string } | undefined;
       if (reason?.kind === "blocked") return inflight.completion.resolve("refusal");
+      if (contentRefusalMessage(reason) !== undefined) return inflight.completion.resolve("refusal");
       if (reason?.kind === "aborted") return inflight.completion.resolve("cancelled");
       if (reason?.kind === "max-tokens") return inflight.completion.resolve("max_tokens");
       if (reason?.kind === "error") return inflight.completion.reject(internalError("turn failed"));

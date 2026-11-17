@@ -2659,6 +2659,42 @@ describe("durable ACP sessions", () => {
     await expect(pending).resolves.toEqual({ stopReason });
   });
 
+  it("ends a content-refused turn as refusal after its explanation, live and replayed", async () => {
+    const state = services();
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const handle = state.live.get(created.sessionId)!;
+    const pending = state.agent.prompt({
+      sessionId: created.sessionId,
+      prompt: [{ type: "text", text: "question" }],
+    });
+    await expect.poll(() => vi.mocked(handle.agent.followup).mock.calls.length).toBe(1);
+    const message = "DeepSeek refused to answer under its content safety review: image 1 was blocked";
+    const turnEnd = {
+      type: "turn/end",
+      seq: 5,
+      time: 50,
+      data: { turn: 1, reason: { kind: "error", error: { code: "CONTENT_REFUSED", message } } },
+    } as unknown as SessionEvent;
+
+    state.invoke("session/event", handle.agent.session, turnEnd);
+
+    await expect(pending).resolves.toEqual({ stopReason: "refusal" });
+    const notice = {
+      sessionUpdate: "agent_message_chunk",
+      messageId: expect.stringMatching(/^deepseek-refusal-/),
+      content: { type: "text", text: message },
+    };
+    const live = state.updates.filter((item) => item.update.sessionUpdate === "agent_message_chunk");
+    expect(live).toEqual([expect.objectContaining({ sessionId: created.sessionId, update: notice })]);
+
+    const meta = header({ id: "refused", cwd: "/project" });
+    state.headers.push(meta);
+    state.inspections.set("refused", { meta, events: [turnEnd] });
+    state.updates.length = 0;
+    await state.agent.loadSession({ sessionId: "refused", cwd: "/project", mcpServers: [] });
+    expect(state.updates).toContainEqual(expect.objectContaining({ sessionId: "refused", update: notice }));
+  });
+
   it("replays tool identity and status without exposing raw arguments or results", async () => {
     const state = services();
     const meta = header({ id: "tools", cwd: "/project" });

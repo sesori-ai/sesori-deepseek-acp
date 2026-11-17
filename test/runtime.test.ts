@@ -135,6 +135,8 @@ describe("DeepSeek runtime composition", () => {
     );
   });
 
+  // The file's first full boot pays the cold import of the harness plugin tree,
+  // which exceeded the 5 s default on the macOS Intel release runner.
   it("loads a plugin bundle installed in the Sesori profile", async () => {
     const root = await tempRoot();
     const home = join(root, "home");
@@ -266,7 +268,7 @@ describe("DeepSeek runtime composition", () => {
       delete globals.__sesoriSyntheticProfilePlugin;
       await context.fiber.dispose();
     }
-  });
+  }, 30_000);
 
   it("falls back when the Sesori profile cannot be created", async () => {
     const root = await tempRoot();

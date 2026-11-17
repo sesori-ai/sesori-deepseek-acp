@@ -69,7 +69,7 @@ source files, prompts, credentials, and the network; installing one into the
 `sesori` profile grants that access. Plugins installed only in another profile,
 such as `web` or `headless`, are not loaded automatically.
 
-Runtime uses DeepSeek Harness `0.2.2-rc.3`, including canonical `deepseek-flash`
+Runtime uses DeepSeek Harness `0.2.2-rc.4`, including canonical `deepseek-flash`
 (`DeepSeek-V4.1-Flash`) catalog metadata, native model selection, outbound
 `web_search` and `web_fetch` tools, and native persisted-session format
 migration. A model or reasoning-effort choice is recorded in the session, so it

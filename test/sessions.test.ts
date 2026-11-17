@@ -2659,6 +2659,60 @@ describe("durable ACP sessions", () => {
     await expect(pending).resolves.toEqual({ stopReason });
   });
 
+  it("ends a content-refused turn as refusal after its explanation, live and replayed", async () => {
+    const state = services();
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const handle = state.live.get(created.sessionId)!;
+    const pending = state.agent.prompt({
+      sessionId: created.sessionId,
+      prompt: [{ type: "text", text: "question" }],
+    });
+    await expect.poll(() => vi.mocked(handle.agent.followup).mock.calls.length).toBe(1);
+    const message = "DeepSeek refused to answer under its content safety review: image 1 was blocked";
+    const turnEnd = {
+      type: "turn/end",
+      seq: 5,
+      time: 50,
+      data: { turn: 1, reason: { kind: "error", error: { code: "CONTENT_REFUSED", message } } },
+    } as unknown as SessionEvent;
+
+    state.invoke("session/event", handle.agent.session, turnEnd);
+
+    await expect(pending).resolves.toEqual({ stopReason: "refusal" });
+    const chunks = () => state.updates.filter((item) => item.update.sessionUpdate === "agent_message_chunk");
+    const [live] = chunks();
+    expect(chunks()).toHaveLength(1);
+    expect(live).toMatchObject({
+      sessionId: created.sessionId,
+      update: { messageId: expect.stringMatching(/^deepseek-refusal-/), content: { type: "text", text: message } },
+    });
+
+    (handle.agent.session as unknown as { events: SessionEvent[] }).events.push(turnEnd);
+    state.updates.length = 0;
+    await state.agent.loadSession({ sessionId: created.sessionId, cwd: "/project", mcpServers: [] });
+    expect(chunks()).toEqual([expect.objectContaining({ update: live?.update })]);
+  });
+
+  it("settles a content-refused prompt when its explanation cannot be sent", async () => {
+    const state = services();
+    const created = await state.agent.newSession({ cwd: "/project", mcpServers: [] });
+    const handle = state.live.get(created.sessionId)!;
+    const pending = state.agent.prompt({
+      sessionId: created.sessionId,
+      prompt: [{ type: "text", text: "question" }],
+    });
+    await expect.poll(() => vi.mocked(handle.agent.followup).mock.calls.length).toBe(1);
+    state.sessionUpdate.mockRejectedValueOnce(new Error("client went away"));
+
+    state.invoke("session/event", handle.agent.session, {
+      type: "turn/end",
+      data: { turn: 1, reason: { kind: "error", error: { code: "CONTENT_REFUSED", message: "refused" } } },
+    });
+
+    await expect(pending).rejects.toThrow();
+    expect(state.diagnostics.join("\n")).toContain("client went away");
+  });
+
   it("replays tool identity and status without exposing raw arguments or results", async () => {
     const state = services();
     const meta = header({ id: "tools", cwd: "/project" });

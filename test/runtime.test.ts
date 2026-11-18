@@ -65,7 +65,8 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
-describe("DeepSeek runtime composition", () => {
+// Composing the runtime loads the bundled harness plugins, which can exceed the 5 s default on slow macOS runners.
+describe("DeepSeek runtime composition", { timeout: 30_000 }, () => {
   it("isolates mutable state and fixes deployment policy", () => {
     const stateDir = resolve("synthetic-state");
     const workspaceRoot = resolve("synthetic-project-a");
@@ -268,7 +269,7 @@ describe("DeepSeek runtime composition", () => {
       delete globals.__sesoriSyntheticProfilePlugin;
       await context.fiber.dispose();
     }
-  }, 30_000);
+  });
 
   it("falls back when the Sesori profile cannot be created", async () => {
     const root = await tempRoot();

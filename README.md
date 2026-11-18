@@ -69,15 +69,22 @@ source files, prompts, credentials, and the network; installing one into the
 `sesori` profile grants that access. Plugins installed only in another profile,
 such as `web` or `headless`, are not loaded automatically.
 
-Runtime uses DeepSeek Harness `0.2.2-rc.4`, including canonical `deepseek-flash`
+Runtime uses DeepSeek Harness `0.2.2-rc.5`, including canonical `deepseek-flash`
 (`DeepSeek-V4.1-Flash`) catalog metadata, native model selection, outbound
 `web_search` and `web_fetch` tools, and native persisted-session format
 migration. A model or reasoning-effort choice is recorded in the session, so it
 survives a restart. A sub-agent keeps the route it started with; sub-agents
-started after a switch use the new route. `web_search` uses the DeepSeek Search
-API on the chat route's origin, with the chat credential. A custom `baseURL`
-origin must also serve `/v1/tools/search`; behind a Messages-only proxy,
-`web_search` calls fail. Outbound web tools do not expose a local web server,
+started after a switch use the new route. In a session on a DeepSeek model
+(API key or account), `web_search` runs DeepSeek Messages search: no
+per-search charge, billed as model tokens. Its endpoint does not follow the chat
+`baseURL`: it is `web-search-deepseek`'s `baseURL`, else
+`$DEEPSEEK_SEARCH_BASE_URL`, else `https://api.deepseek.com/anthropic/v1`, and
+with an API key it sends `DEEPSEEK_API_KEY`. Behind a gateway, set that
+`baseURL` in the profile patch. On any other model route, `web_search` uses the
+DeepSeek Search API on the chat route's origin, with the chat credential, so a
+custom `baseURL` origin must also serve `/v1/tools/search`. Setting
+`searchProvider` on the `web` row pins one provider for every model. Outbound
+web tools do not expose a local web server,
 frontend, BFF, or additional process. Telemetry and hot reload remain disabled.
 Adapter-owned sessions, attachments, query indexes, storage documents, and spill
 files remain under supplied `--state-dir`. The adapter does not change the

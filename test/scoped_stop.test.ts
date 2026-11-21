@@ -1,14 +1,15 @@
 import { appendFile, cp, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { AgentSideConnection } from "@agentclientprotocol/sdk";
+import type { RequestPermissionResponse } from "@agentclientprotocol/sdk/unstable";
 import type { Agent, CreateAgentOptions } from "@deepseek-ai/dsh-agent";
 import { createUserMessage, ToolCallId } from "@deepseek-ai/dsh-llm";
 import { SessionId, SessionLogOffset, SessionSeq } from "@deepseek-ai/dsh-session";
 import type {} from "@deepseek-ai/dsh-user-questions";
 import { afterEach, expect, it, vi } from "vitest";
 import { bootRuntime } from "../src/runtime.ts";
-import { DurableSessionAgent } from "../src/sessions.ts";
+import { connectDurableSessionAgent } from "../src/server.ts";
+import { DurableSessionAgent, type AcpClientConnection } from "../src/sessions.ts";
 import { createMemorySubagentBindingStore } from "../src/subagent_bindings.ts";
 
 const cleanups: (() => Promise<void>)[] = [];
@@ -41,16 +42,19 @@ async function harness() {
   const beforeStep = new Map<Agent, (signal: AbortSignal) => Promise<unknown>>();
   const requests: { method: string; id?: number | string; params: Record<string, unknown> }[] = [];
   let input!: ReadableStreamDefaultController<never>;
-  let adapter!: DurableSessionAgent;
-  const connection = new AgentSideConnection((connection) => {
-    adapter = new DurableSessionAgent({ context, connection,
-      diagnostics: { write: (message) => diagnostics.push(message) }, bindings: createMemorySubagentBindingStore() });
-    return adapter;
-  }, {
-    readable: new ReadableStream({ start(controller) { input = controller; } }),
-    writable: new WritableStream({ write(message) {
-      if ("method" in message && "params" in message) requests.push(message as typeof requests[number]);
-    } }),
+  let connection!: AcpClientConnection;
+  const { agent: adapter } = connectDurableSessionAgent({
+    createAgent: (client) => {
+      connection = client;
+      return new DurableSessionAgent({ context, connection: client,
+        diagnostics: { write: (message) => diagnostics.push(message) }, bindings: createMemorySubagentBindingStore() });
+    },
+    stream: {
+      readable: new ReadableStream({ start(controller) { input = controller; } }),
+      writable: new WritableStream({ write(message) {
+        if ("method" in message && "params" in message) requests.push(message as typeof requests[number]);
+      } }),
+    },
   });
   // Real SDK writer for interactions; controlled ACP announcement/output barrier.
   vi.spyOn(connection, "extNotification").mockImplementation(async (_method, params) => {
@@ -279,7 +283,7 @@ for (const identity of ["missing", "inherited", "own", "wrong-origin"] as const)
 it("settles pending permissions and logs unsupported input-cancel without blocking later output", async () => {
   const h = await harness();
   const root = await h.root();
-  const raw = Promise.withResolvers<Awaited<ReturnType<AgentSideConnection["requestPermission"]>>>();
+  const raw = Promise.withResolvers<RequestPermissionResponse>();
   vi.spyOn(h.connection, "requestPermission").mockReturnValue(raw.promise);
   const extension = vi.spyOn(h.connection, "extMethod").mockRejectedValue(new Error("Method not found"));
   h.beforeStep.set(root, (signal) => h.context.approval.request({

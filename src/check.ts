@@ -1,8 +1,7 @@
 import { constants } from "node:fs";
-import { access, lstat, stat } from "node:fs/promises";
-import { dirname, isAbsolute } from "node:path";
+import { access, lstat, readFile, stat } from "node:fs/promises";
+import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import acpPackage from "@agentclientprotocol/sdk/package.json" with { type: "json" };
 import deepSeekPackage from "@deepseek-ai/dsh-base/package.json" with { type: "json" };
 import invalidFixtures from "../protocol/v2/fixtures/invalid.json" with { type: "json" };
 import validFixtures from "../protocol/v2/fixtures/valid.json" with { type: "json" };
@@ -103,6 +102,32 @@ async function validateStateDirectory(args: { stateDir: string }): Promise<boole
   }
 }
 
+const ACP_SDK_PACKAGE_NAME = "@agentclientprotocol/sdk";
+
+/** The SDK no longer exports its package.json, so find it above the resolved entrypoint. */
+async function installedAcpSdkVersion(): Promise<string> {
+  let directory = dirname(fileURLToPath(import.meta.resolve(ACP_SDK_PACKAGE_NAME)));
+  for (;;) {
+    let manifest: unknown;
+    try {
+      manifest = JSON.parse(await readFile(join(directory, "package.json"), "utf8"));
+    } catch (error) {
+      if (!isMissingPathError({ error })) throw error;
+    }
+    if (typeof manifest === "object" && manifest !== null && "name" in manifest && manifest.name === ACP_SDK_PACKAGE_NAME) {
+      if ("version" in manifest && typeof manifest.version === "string") return manifest.version;
+      break;
+    }
+    const parent = dirname(directory);
+    if (parent === directory) break;
+    directory = parent;
+  }
+  throw new AdapterError({
+    code: AdapterErrorCode.Readiness,
+    message: "The installed ACP SDK package manifest is not readable",
+  });
+}
+
 function validateProtocolCorpus(): void {
   const validResults = validateFixtureCorpus({ corpus: validFixtures });
   const invalidResults = validateFixtureCorpus({ corpus: invalidFixtures });
@@ -124,10 +149,11 @@ export async function checkReadiness(args: {
       message: `Expected DeepSeek Harness ${DEEPSEEK_HARNESS_VERSION}, found ${deepSeekPackage.version}`,
     });
   }
-  if (acpPackage.version !== ACP_SDK_VERSION) {
+  const acpSdkVersion = await installedAcpSdkVersion();
+  if (acpSdkVersion !== ACP_SDK_VERSION) {
     throw new AdapterError({
       code: AdapterErrorCode.Readiness,
-      message: `Expected ACP SDK ${ACP_SDK_VERSION}, found ${acpPackage.version}`,
+      message: `Expected ACP SDK ${ACP_SDK_VERSION}, found ${acpSdkVersion}`,
     });
   }
 

@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
-import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
+import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk/unstable";
 import { Context } from "@deepseek-ai/cordis";
 import { describe, expect, it, vi } from "vitest";
 import { AdapterError, AdapterErrorCode } from "../src/errors.ts";
@@ -16,7 +16,7 @@ import { RUNTIME_READY_KEY } from "../src/runtime.ts";
 
 interface JsonRpcResponse {
   jsonrpc: "2.0";
-  id: number | string;
+  id: number | string | null;
   result?: Record<string, unknown>;
   error?: { code: number; message: string };
 }
@@ -155,6 +155,8 @@ describe("ACP server", () => {
   it("returns method-not-found without logging request payloads", async () => {
     const sentinel = "SENTINEL_PRIVATE_PROMPT_91a4";
     const harness = startHarness();
+    writeMessage({ harness, message: initializeRequest({ id: "initialize" }) });
+    await expect.poll(() => responses({ harness }).length).toBe(1);
     writeMessage({
       harness,
       message: {
@@ -164,24 +166,38 @@ describe("ACP server", () => {
         params: { prompt: sentinel },
       },
     });
-    await expect.poll(() => responses({ harness }).length).toBe(1);
+    await expect.poll(() => responses({ harness }).length).toBe(2);
 
-    expect(responses({ harness })[0]?.error?.code).toBe(-32601);
-    expect(harness.stderr()).toContain("acp_sdk: Error handling request");
+    expect(responses({ harness }).find((response) => response.id === "unknown-request")?.error?.code).toBe(-32601);
     expect(harness.stdout()).not.toContain(sentinel);
     expect(harness.stderr()).not.toContain(sentinel);
     await finish({ harness });
   });
 
-  it("drops malformed frames without leaking them and continues serving", async () => {
+  it("rejects requests before initialize", async () => {
+    const harness = startHarness();
+    writeMessage({
+      harness,
+      message: { jsonrpc: "2.0", id: "early", method: "session/list", params: {} },
+    });
+    await expect.poll(() => responses({ harness }).length).toBe(1);
+
+    expect(responses({ harness })[0]).toMatchObject({ id: "early", error: { code: -32600 } });
+    await finish({ harness });
+  });
+
+  it("answers malformed frames with a parse error without leaking them and continues serving", async () => {
     const sentinel = "SENTINEL_PRIVATE_FRAME_623b";
     const harness = startHarness();
     harness.input.write(`{"private":"${sentinel}"\n`);
     writeMessage({ harness, message: initializeRequest({ id: "after-malformed" }) });
-    await expect.poll(() => responses({ harness }).length).toBe(1);
+    await expect.poll(() => responses({ harness }).length).toBe(2);
 
-    expect(responses({ harness })[0]?.id).toBe("after-malformed");
-    expect(harness.stderr()).toContain("acp_sdk: Failed to parse JSON message:");
+    expect(responses({ harness })).toEqual([
+      expect.objectContaining({ id: null, error: expect.objectContaining({ code: -32700 }) }),
+      expect.objectContaining({ id: "after-malformed" }),
+    ]);
+    expect(harness.stdout()).not.toContain(sentinel);
     expect(harness.stderr()).not.toContain(sentinel);
     await finish({ harness });
   });

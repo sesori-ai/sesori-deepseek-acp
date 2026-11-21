@@ -1,10 +1,10 @@
-import { PROTOCOL_VERSION, type InitializeResponse } from "@agentclientprotocol/sdk";
+import { PROTOCOL_VERSION, type InitializeResponse } from "@agentclientprotocol/sdk/unstable";
 
 export const ADAPTER_NAME = "sesori-deepseek-acp";
 export const ADAPTER_TITLE = "Sesori DeepSeek";
 export const ADAPTER_VERSION = "0.2.5";
 export const DEEPSEEK_HARNESS_VERSION = "0.2.2-rc.5";
-export const ACP_SDK_VERSION = "0.25.1";
+export const ACP_SDK_VERSION = "2.8.0";
 export const EXTENSION_PROTOCOL_VERSION = 2;
 export const INITIALIZE_METADATA_KEY = "sesori.ai/deepseek";
 

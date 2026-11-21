@@ -1,4 +1,4 @@
-import type { AgentSideConnection, SessionNotification } from "@agentclientprotocol/sdk";
+import type { SessionNotification } from "@agentclientprotocol/sdk/unstable";
 import type { Context } from "@deepseek-ai/cordis";
 import type { Agent, AgentHandle, AgentOptions, ModelSelection } from "@deepseek-ai/dsh-agent";
 import { CommandId } from "@deepseek-ai/dsh-commands";
@@ -11,7 +11,7 @@ import {
   type SessionHeader,
 } from "@deepseek-ai/dsh-session";
 import { describe, expect, it, vi } from "vitest";
-import { DurableSessionAgent } from "../src/sessions.ts";
+import { DurableSessionAgent, type AcpClientConnection } from "../src/sessions.ts";
 import { createMemorySubagentBindingStore, type SubagentBindingStore } from "../src/subagent_bindings.ts";
 
 interface SessionServices {
@@ -276,7 +276,7 @@ function services(): SessionServices {
     requestPermission,
     extMethod: extensionRequest,
     extNotification,
-  } as unknown as AgentSideConnection;
+  } as unknown as AcpClientConnection;
   const diagnostics: string[] = [];
   const bindings = createMemorySubagentBindingStore();
   const agent = new DurableSessionAgent({

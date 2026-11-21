@@ -3,8 +3,6 @@ import { createHash, randomUUID } from "node:crypto";
 import { isAbsolute } from "node:path";
 import {
   RequestError,
-  type Agent as AcpAgent,
-  type AgentSideConnection,
   type AuthenticateRequest,
   type AuthenticateResponse,
   type CancelNotification,
@@ -20,6 +18,8 @@ import {
   type NewSessionResponse,
   type PromptRequest,
   type PromptResponse,
+  type RequestPermissionRequest,
+  type RequestPermissionResponse,
   type SessionInfo,
   type SessionConfigOption,
   type SessionNotification,
@@ -27,7 +27,7 @@ import {
   type SetSessionConfigOptionResponse,
   type StopReason,
   type ToolCallContent,
-} from "@agentclientprotocol/sdk";
+} from "@agentclientprotocol/sdk/unstable";
 import type { Context } from "@deepseek-ai/cordis";
 import {
   installModelSelection,
@@ -1097,9 +1097,17 @@ async function replayUpdates(args: {
   return updates;
 }
 
-export class DurableSessionAgent implements AcpAgent {
+/** Client-side ACP calls the adapter makes over its connection. */
+export interface AcpClientConnection {
+  sessionUpdate(params: SessionNotification): Promise<void>;
+  requestPermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse>;
+  extMethod(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>>;
+  extNotification(method: string, params: Record<string, unknown>): Promise<void>;
+}
+
+export class DurableSessionAgent {
   readonly #context: Context;
-  readonly #connection: AgentSideConnection;
+  readonly #connection: AcpClientConnection;
   readonly #diagnostics: { write(message: string): unknown };
   readonly #bindings: SubagentBindingStore;
   readonly #sessions = new Map<SessionId, SessionRecord>();
@@ -1115,7 +1123,7 @@ export class DurableSessionAgent implements AcpAgent {
 
   constructor(args: {
     context: Context;
-    connection: AgentSideConnection;
+    connection: AcpClientConnection;
     diagnostics: { write(message: string): unknown };
     bindings: SubagentBindingStore;
   }) {

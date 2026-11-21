@@ -1,10 +1,13 @@
 import { join } from "node:path";
 import { Readable, Writable } from "node:stream";
 import {
-  AgentSideConnection,
+  agent as acpAgent,
+  methods,
   ndJsonStream,
+  type AgentConnection,
+  type AgentContext,
   type Stream,
-} from "@agentclientprotocol/sdk";
+} from "@agentclientprotocol/sdk/unstable";
 import type { Context, Fiber } from "@deepseek-ai/cordis";
 import { formatDiagnostic } from "./errors.js";
 import {
@@ -12,7 +15,7 @@ import {
   RUNTIME_READY_KEY,
   type RuntimeProfileFallbackReporter,
 } from "./runtime.js";
-import { DurableSessionAgent } from "./sessions.js";
+import { DurableSessionAgent, type AcpClientConnection } from "./sessions.js";
 import { createFileSubagentBindingStore, type SubagentBindingStore } from "./subagent_bindings.js";
 
 export interface DiagnosticWriter {
@@ -33,10 +36,7 @@ export type RuntimeBoot = (args: {
 
 const AcpSdkDiagnostic = {
   ErrorNotification: "Error handling notification",
-  ErrorRequest: "Error handling request",
   InvalidMessage: "Invalid message",
-  MalformedJson: "Failed to parse JSON message:",
-  UnexpectedMessageError: "Unexpected error during message processing:",
   UnknownResponse: "Got response to unknown request",
 } as const;
 
@@ -59,8 +59,45 @@ function installAcpDiagnosticSanitizer(args: { diagnostics: DiagnosticWriter }):
 }
 
 export interface AcpServer {
-  connection: AgentSideConnection;
+  connection: AgentConnection;
   dispose(): Promise<void>;
+}
+
+export function acpClientConnection(client: AgentContext): AcpClientConnection {
+  return {
+    sessionUpdate: (params) => client.notify(methods.client.session.update, params),
+    requestPermission: (params) => client.request(methods.client.session.requestPermission, params),
+    extMethod: (method, params) => client.request<Record<string, unknown>>(method, params),
+    extNotification: (method, params) => client.notify(method, params),
+  };
+}
+
+/** Connects a durable session agent, created once per connection, to an ACP stream. */
+export function connectDurableSessionAgent(args: {
+  stream: Stream;
+  createAgent: (connection: AcpClientConnection) => DurableSessionAgent;
+}): { connection: AgentConnection; agent: DurableSessionAgent } {
+  let created: DurableSessionAgent | undefined;
+  const current = (): DurableSessionAgent => {
+    if (created === undefined) throw new Error("ACP agent is not connected");
+    return created;
+  };
+  const connection = acpAgent({ name: "sesori-deepseek-acp" })
+    .onConnect((active) => {
+      created = args.createAgent(acpClientConnection(active.client));
+    })
+    .onRequest(methods.agent.initialize, ({ params }) => current().initialize(params))
+    .onRequest(methods.agent.authenticate, ({ params }) => current().authenticate(params))
+    .onRequest(methods.agent.session.list, ({ params }) => current().listSessions(params))
+    .onRequest(methods.agent.session.new, ({ params }) => current().newSession(params))
+    .onRequest(methods.agent.session.load, ({ params }) => current().loadSession(params))
+    .onRequest(methods.agent.session.close, ({ params }) => current().closeSession(params))
+    .onRequest(methods.agent.session.setConfigOption, ({ params }) => current().setSessionConfigOption(params))
+    .onRequest(methods.agent.session.prompt, ({ params }) => current().prompt(params))
+    .onNotification(methods.agent.session.cancel, ({ params }) => current().cancel(params))
+    .onRequest("*", ({ method, params }) => current().extMethod(method, params as Record<string, unknown>))
+    .connect(args.stream);
+  return { connection, agent: current() };
 }
 
 class RuntimeStartupCancelledError extends Error {
@@ -135,20 +172,19 @@ export function startAcpServer(args: {
 }): AcpServer {
   const restoreDiagnostics = installAcpDiagnosticSanitizer({ diagnostics: args.diagnostics });
   try {
-    let agent: DurableSessionAgent | undefined;
-    const connection = new AgentSideConnection((activeConnection) => {
-      agent = new DurableSessionAgent({
+    const { connection, agent } = connectDurableSessionAgent({
+      stream: args.stream,
+      createAgent: (client) => new DurableSessionAgent({
         context: args.context,
-        connection: activeConnection,
+        connection: client,
         diagnostics: args.diagnostics,
         bindings: args.bindings,
-      });
-      return agent;
-    }, args.stream);
+      }),
+    });
     void connection.closed.then(restoreDiagnostics, restoreDiagnostics);
     return {
       connection,
-      dispose: () => agent?.dispose() ?? Promise.resolve(),
+      dispose: () => agent.dispose(),
     };
   } catch (error) {
     restoreDiagnostics();
@@ -179,7 +215,7 @@ async function runStdioServer(args: ServeStdioArguments): Promise<void> {
   };
   signalSource.once("SIGINT", closeInput);
   signalSource.once("SIGTERM", closeInput);
-  let connection: AgentSideConnection | undefined;
+  let connection: AgentConnection | undefined;
   let transportFiber: Fiber | undefined;
   let transportShutdown: Promise<void> | undefined;
   let operationFailure: unknown;

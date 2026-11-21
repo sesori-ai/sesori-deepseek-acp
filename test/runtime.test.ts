@@ -5,7 +5,7 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { PassThrough } from "node:stream";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { zstdCompressSync } from "node:zlib";
-import { PROTOCOL_VERSION, type AgentSideConnection, type SessionNotification } from "@agentclientprotocol/sdk";
+import { PROTOCOL_VERSION, type SessionNotification } from "@agentclientprotocol/sdk/unstable";
 import { defaultDshHome, resolveDshHome } from "@deepseek-ai/dsh-home-paths";
 import {
   SESSION_FORMAT_VERSION,
@@ -25,7 +25,7 @@ import {
   type RuntimeProfileFallback,
 } from "../src/runtime.ts";
 import { serveStdio, type SignalSource } from "../src/server.ts";
-import { DurableSessionAgent } from "../src/sessions.ts";
+import { DurableSessionAgent, type AcpClientConnection } from "../src/sessions.ts";
 import { createMemorySubagentBindingStore } from "../src/subagent_bindings.ts";
 
 const originalDshHome = process.env.DSH_HOME;
@@ -719,7 +719,7 @@ describe("DeepSeek runtime composition", { timeout: 30_000 }, () => {
       sessionUpdate: vi.fn(async () => undefined),
       extMethod: vi.fn(async () => ({})),
       extNotification: vi.fn(async () => undefined),
-    } as unknown as AgentSideConnection;
+    } as unknown as AcpClientConnection;
     const adapter = new DurableSessionAgent({
       context,
       connection,
@@ -953,7 +953,7 @@ describe("DeepSeek runtime composition", { timeout: 30_000 }, () => {
         updates.push(notification);
       }),
       extMethod: vi.fn(async () => ({})),
-    } as unknown as AgentSideConnection;
+    } as unknown as AcpClientConnection;
     const diagnostics: string[] = [];
     const agent = new DurableSessionAgent({
       context: second,
@@ -1077,7 +1077,7 @@ describe("DeepSeek runtime composition", { timeout: 30_000 }, () => {
       output,
       diagnostics,
     });
-    input.end(
+    input.write(
       `${JSON.stringify({
         jsonrpc: "2.0",
         id: "full-runtime",
@@ -1089,6 +1089,9 @@ describe("DeepSeek runtime composition", { timeout: 30_000 }, () => {
         },
       })}\n`,
     );
+    // Input EOF closes the ACP connection and drops unanswered requests.
+    await expect.poll(() => stdout.includes("\n"), { timeout: 30_000 }).toBe(true);
+    input.end();
     await completion;
 
     expect(stdout.trim().split("\n")).toHaveLength(1);

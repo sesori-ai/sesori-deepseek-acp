@@ -15,9 +15,9 @@ concurrency:
 
 jobs:
   cross-repository-conformance:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -33,7 +33,7 @@ jobs:
           protocol_source_commit=$(node -p "require('./release/config.json').protocolSourceCommit")
           git diff --exit-code "$protocol_source_commit" -- protocol/v1
 
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: sesori-ai/sesori_apps_monorepo
           ref: ${{ steps.release.outputs.consumer_commit }}
@@ -63,7 +63,7 @@ jobs:
           test -n "$DART_VERSION"
           echo "version=${DART_VERSION}" >> "$GITHUB_OUTPUT"
 
-      - uses: dart-lang/setup-dart@65eb853c7ba17dde3be364c3d2858773e7144260 # v1
+      - uses: dart-lang/setup-dart@2286a0c042b44434fe26d292bbce8d34f7ec662b # v1.8.2
         with:
           sdk: ${{ steps.dart-version.outputs.version }}
 
@@ -81,13 +81,13 @@ jobs:
       matrix:
         include:
           - target: darwin-arm64
-            runner: macos-15
+            runner: macos-26
           - target: darwin-x64
-            runner: macos-15-intel
+            runner: macos-26-intel
           - target: linux-arm64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
           - target: linux-x64
-            runner: ubuntu-24.04
+            runner: ubuntu-26.04
           - target: windows-arm64
             runner: windows-11-arm
           - target: windows-x64
@@ -95,11 +95,11 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 24.19.0
+          node-version: 26.13.1
           cache: npm
 
       - run: npm ci
@@ -111,7 +111,7 @@ jobs:
           SESORI_RELEASE_OUTPUT: release-output
         run: npm run release:package
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: package-${{ matrix.target }}
           path: release-output/
@@ -120,16 +120,16 @@ jobs:
 
   verify-release-set:
     needs: [cross-repository-conformance, package]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 24.19.0
+          node-version: 26.13.1
           cache: npm
 
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: package-*
           path: release-artifacts
@@ -139,7 +139,7 @@ jobs:
           mkdir release-checksums
           npm run release:checksums -- --input release-artifacts --output release-checksums/checksums.txt
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-checksums
           path: release-checksums/checksums.txt
@@ -149,19 +149,19 @@ jobs:
   publish:
     if: github.ref_type == 'tag'
     needs: verify-release-set
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: package-*
           path: release-assets
           merge-multiple: true
 
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release-checksums
           path: release-assets

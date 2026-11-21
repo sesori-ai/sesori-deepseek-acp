@@ -1,12 +1,12 @@
 {
-  "nodeVersion": "24.19.0",
+  "nodeVersion": "26.13.1",
   "nodeSha256": {
-    "darwin-arm64": "3f1cf157479c1480352083105e13faf9d008ede98e7e157746b6df940d197b94",
-    "darwin-x64": "d35e95230f46f6f0751df497c56622c6735e05d5e1fb1630996a005b9d328fe4",
-    "linux-arm64": "01443c1e1a29e531ccad5a46fefa6df490d2189c49f7955904aecdbb0fe86fdc",
-    "linux-x64": "14b342e71204f811bde6153be8e04b62aef63c236fef92b55f9c83154b409647",
-    "windows-arm64": "8502f4a50b458d4cc38ed8f2001556c2cd239d464920f74017926ccb1e1c157f",
-    "windows-x64": "57f71ab3652e797d84acddc79c81cc9ff1c6ddb2a1974cdb83f00fee9bff4c73"
+    "darwin-arm64": "af6202f5370a3a5209e85dc543758dfd9f44c8726626a236730cd603a67a8559",
+    "darwin-x64": "2693310b2820f9350d29524f21344e1c623875bab773457d55b2aceb9670716f",
+    "linux-arm64": "89e1853138db51e8b82d3e98ba9c0d3f2956a28e5e55ea1b7e12d25aae92d5dd",
+    "linux-x64": "5c063e46bab0fbc1c17cc445d7ff129cbdcd0471be6ed83b6ab864f8143bc864",
+    "windows-arm64": "181ebe431b90787113a9e4fc80d38ce86d37888a353a0386de44d2872e48cb97",
+    "windows-x64": "e2edda75bfb089654705cf65a13b58933bfd5f57148e8ebda916f58a2474f1f7"
   },
   "deepSeekHarnessVersion": "0.2.2-rc.5",
   "consumerRepository": "sesori-ai/sesori_apps_monorepo",

@@ -55,14 +55,17 @@
     "@deepseek-ai/dsh-user-questions": "0.2.2-rc.5",
     "ajv": "8.20.0",
     "node-addon-require-builtin": "0.1.9",
-    "resolve.exports": "2.0.3"
+    "resolve.exports": "2.0.4"
   },
   "devDependencies": {
     "@types/js-yaml": "4.0.9",
-    "@types/node": "22.19.0",
-    "oxlint": "1.79.0",
-    "spdx-license-list": "6.10.0",
-    "typescript": "6.0.3",
-    "vitest": "4.1.11"
+    "@types/node": "22.20.5",
+    "oxlint": "1.94.0",
+    "spdx-license-list": "6.12.0",
+    "typescript": "7.0.2",
+    "vitest": "5.1.1"
+  },
+  "overrides": {
+    "undici": "8.12.4"
   }
 }

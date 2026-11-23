@@ -39,6 +39,16 @@ async function harness() {
   const notifications: Record<string, unknown>[] = [];
   const output = Promise.withResolvers<void>();
   const signals = new Map<Agent, AbortSignal>();
+  // Resolves on the agent's first pre-step, whether the hook or the waiter arrives first.
+  // Awaiting the hook itself (not polling) keeps slow child startup under load off a poll budget.
+  const firstSteps = new Map<Agent, PromiseWithResolvers<AbortSignal>>();
+  const firstStep = (agent: Agent) => {
+    const existing = firstSteps.get(agent);
+    if (existing !== undefined) return existing;
+    const created = Promise.withResolvers<AbortSignal>();
+    firstSteps.set(agent, created);
+    return created;
+  };
   const beforeStep = new Map<Agent, (signal: AbortSignal) => Promise<unknown>>();
   const requests: { method: string; id?: number | string; params: Record<string, unknown> }[] = [];
   let input!: ReadableStreamDefaultController<never>;
@@ -68,6 +78,7 @@ async function harness() {
   });
   context.on("agent/pre-step", async ({ agent, signal }) => {
     signals.set(agent, signal);
+    firstStep(agent).resolve(signal);
     await beforeStep.get(agent)?.(signal);
     if (!signal.aborted) await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
     throw signal.reason;
@@ -98,14 +109,15 @@ async function harness() {
     if (call === undefined) throw new Error("the tool batch returned no result");
     return call.result;
   };
-  async function child(args: { parent: Agent; signal: AbortSignal }) {
+  async function child(args: { parent: Agent; signal: AbortSignal; fork?: boolean }) {
     const result = await launch(args);
     expect(result.isError, JSON.stringify(result)).not.toBe(true);
     // The tool result names the child by its local handle; the start event carries its session id.
     const childId = started.get(args.parent.id)?.at(-1);
     if (childId === undefined) throw new Error("the delegation started no child");
-    const agent = context.agents.get(childId)!;
-    await expect.poll(() => signals.has(agent)).toBe(true);
+    const agent = context.agents.get(childId);
+    if (agent === undefined) throw new Error("the started child is not registered");
+    await firstStep(agent).promise;
     return agent;
   }
   return { context, adapter, connection, root, stop, launch, child, signals, beforeStep, output, notifications, requests, diagnostics };
@@ -210,10 +222,8 @@ it("stops a published fork by name, independently of its launching call signal",
   const h = await harness();
   const root = await h.root();
   const caller = new AbortController();
-  const result = await h.launch({ parent: root, signal: caller.signal, fork: true });
-  expect(result.isError, JSON.stringify(result)).not.toBe(true);
-  await expect.poll(() => h.signals.size).toBe(1);
-  const child = [...h.signals.keys()][0]!;
+  const child = await h.child({ parent: root, signal: caller.signal, fork: true });
+  expect(h.signals.size).toBe(1);
   caller.abort();
   expect(h.signals.get(child)!.aborted).toBe(false);
   const stopping = h.stop(child, root);
@@ -284,14 +294,19 @@ it("settles pending permissions and logs unsupported input-cancel without blocki
   const h = await harness();
   const root = await h.root();
   const raw = Promise.withResolvers<RequestPermissionResponse>();
-  vi.spyOn(h.connection, "requestPermission").mockReturnValue(raw.promise);
+  const requested = Promise.withResolvers<void>();
+  const requestPermission = vi.spyOn(h.connection, "requestPermission").mockImplementation(() => {
+    requested.resolve();
+    return raw.promise;
+  });
   const extension = vi.spyOn(h.connection, "extMethod").mockRejectedValue(new Error("Method not found"));
   h.beforeStep.set(root, (signal) => h.context.approval.request({
     agent: root, signal, callId: ToolCallId("permission"), toolName: "edit", reason: "edit file",
   }));
   root.followup(createUserMessage({ source: { kind: "user" }, content: [{ type: "text", text: "ask" }] }));
   const activity = root.whenIdle();
-  await expect.poll(() => vi.mocked(h.connection.requestPermission).mock.calls.length).toBe(1);
+  await requested.promise;
+  expect(requestPermission).toHaveBeenCalledOnce();
   await expect(h.stop(root)).resolves.toEqual({ workKept: false });
   await activity;
   await expect.poll(() => h.diagnostics.join("\n")).toContain("Method not found");

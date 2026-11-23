@@ -26,7 +26,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@agentclientprotocol/sdk": "2.8.0",
+    "@agentclientprotocol/sdk": "2.9.1",
     "@deepseek-ai/cordis": "4.1.0",
     "@deepseek-ai/cordis-plugin-group": "1.1.0",
     "@deepseek-ai/cordis-plugin-include": "1.1.0",
@@ -54,7 +54,7 @@
     "@deepseek-ai/dsh-user-approval": "0.2.2-rc.5",
     "@deepseek-ai/dsh-user-questions": "0.2.2-rc.5",
     "ajv": "8.20.0",
-    "node-addon-require-builtin": "0.1.9",
+    "node-addon-require-builtin": "0.1.10",
     "resolve.exports": "2.0.4"
   },
   "devDependencies": {
@@ -66,6 +66,6 @@
     "vitest": "5.1.1"
   },
   "overrides": {
-    "undici": "8.12.4"
+    "undici": "8.13.1"
   }
 }
